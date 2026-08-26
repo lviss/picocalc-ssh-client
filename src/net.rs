@@ -244,7 +244,7 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
 }
 
 #[embassy_executor::task]
-async fn ssh_session_task(host: String, command: Option<String>) {
+async fn ssh_session_task(host: String, port: u16, command: Option<String>) {
     let Some(stack) = STACK.get().lock().await.as_ref().copied() else {
         print!("network is offline\r\n");
         return;
@@ -264,7 +264,7 @@ async fn ssh_session_task(host: String, command: Option<String>) {
             match tcp_socket
                 .connect(IpEndpoint {
                     addr: addrs[0],
-                    port: 22,
+                    port,
                 })
                 .await
             {
@@ -277,7 +277,7 @@ async fn ssh_session_task(host: String, command: Option<String>) {
                     });
                     let prior_proc = assign_proc(ssh_proc).await;
 
-                    print!("Connected to {host} {}:22\r\n", addrs[0]);
+                    print!("Connected to {host} {}:{port}\r\n", addrs[0]);
                     let (mut read, mut write) = tcp_socket.split();
                     let mut ssh_tx_buf = [0u8; 8192];
                     let mut ssh_rx_buf = [0u8; 8192];
@@ -446,7 +446,7 @@ async fn ssh_session_task(host: String, command: Option<String>) {
                     assign_proc(prior_proc).await;
                 }
                 Err(err) => {
-                    print!("failed to connect to port 22: {err:?}\r\n");
+                    print!("failed to connect to port {port}: {err:?}\r\n");
                 }
             }
         }
@@ -537,7 +537,16 @@ async fn prompt_for_input(prompt: &str, kind: PromptKind) -> Option<String> {
 
 pub async fn ssh_command(args: &[&str]) {
     if args.len() > 1 {
-        let hostname = args[1].to_string();
+        let (hostname, port) = match args[1].rsplit_once(':') {
+            Some((host, port_str)) => match port_str.parse::<u16>() {
+                Ok(port) => (host.to_string(), port),
+                Err(_) => {
+                    print!("invalid port `{port_str}`\r\n");
+                    return;
+                }
+            },
+            None => (args[1].to_string(), 22),
+        };
 
         let command: Option<String> = if args.len() > 2 {
             Some(args[2..].join(" "))
@@ -546,7 +555,7 @@ pub async fn ssh_command(args: &[&str]) {
         };
         let spawn_result = {
             let spawner = Spawner::for_current_executor().await;
-            spawner.spawn(ssh_session_task(hostname, command))
+            spawner.spawn(ssh_session_task(hostname, port, command))
         };
         match spawn_result {
             Ok(_) => {}
@@ -557,7 +566,7 @@ pub async fn ssh_command(args: &[&str]) {
         return;
     }
 
-    print!("Usage: ssh [hostname] [command]\r\n");
+    print!("Usage: ssh [hostname[:port]] [command]\r\n");
 }
 
 struct SshProcess {
