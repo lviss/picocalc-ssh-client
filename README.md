@@ -110,6 +110,13 @@ $ ssh mymachine
 $ ssh 192.168.1.10
 ```
 
+Connects to port 22 by default. To use a different port, append it after a
+colon:
+
+```bash
+$ ssh mymachine:2222
+```
+
 You can also save credentials to avoid typing them every time:
 
 ```bash
