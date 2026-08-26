@@ -1,5 +1,5 @@
 use crate::Irqs;
-use crate::config::CONFIG;
+use crate::config::{CONFIG, StrValue};
 use crate::keyboard::{Key, KeyReport, KeyState, Modifiers};
 use crate::net::alloc::string::ToString;
 use crate::process::{LineEditor, Process, assign_proc, assign_proc_if};
@@ -244,13 +244,14 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
 }
 
 #[embassy_executor::task]
-async fn ssh_session_task(host: String, port: u16, command: Option<String>) {
+async fn ssh_session_task(host: String, port: u16, username: Option<String>, command: Option<String>) {
     let Some(stack) = STACK.get().lock().await.as_ref().copied() else {
         print!("network is offline\r\n");
         return;
     };
 
     let command = command.as_deref();
+    let username = username.as_deref();
 
     let dns_client = DnsSocket::new(stack);
 
@@ -318,20 +319,31 @@ async fn ssh_session_task(host: String, port: u16, command: Option<String>) {
                                         }
                                     }
                                     CliEvent::Username(req) => {
-                                        match CONFIG.get().lock().await.fetch("ssh_user").await {
-                                            Ok(Some(pw)) => req.username(&pw),
-                                            _ => {
-                                                let user =
-                                                    prompt_for_input("login: ", PromptKind::Text)
-                                                        .await;
-                                                match user {
-                                                    Some(user) => req.username(&user),
-                                                    None => {
-                                                        print!("Cancelled\r\n");
-                                                        return Ok(());
+                                        match username {
+                                            Some(user) => req.username(user),
+                                            None => match CONFIG
+                                                .get()
+                                                .lock()
+                                                .await
+                                                .fetch("ssh_user")
+                                                .await
+                                            {
+                                                Ok(Some(pw)) => req.username(&pw),
+                                                _ => {
+                                                    let user = prompt_for_input(
+                                                        "login: ",
+                                                        PromptKind::Text,
+                                                    )
+                                                    .await;
+                                                    match user {
+                                                        Some(user) => req.username(&user),
+                                                        None => {
+                                                            print!("Cancelled\r\n");
+                                                            return Ok(());
+                                                        }
                                                     }
                                                 }
-                                            }
+                                            },
                                         }
                                         .expect("set user");
                                     }
@@ -535,17 +547,123 @@ async fn prompt_for_input(prompt: &str, kind: PromptKind) -> Option<String> {
     response
 }
 
+/// Builds the config key under which a host alias is stored, e.g.
+/// `alias_key("home")` -> `"host_home"`. Returns `None` if the resulting
+/// key wouldn't fit in a config key (32 characters).
+fn alias_key(alias: &str) -> Option<heapless::String<32>> {
+    let mut key = heapless::String::<32>::new();
+    key.push_str("host_").ok()?;
+    key.push_str(alias).ok()?;
+    Some(key)
+}
+
+/// Resolves `name` to a saved alias's destination, if one exists;
+/// otherwise returns `name` unchanged, to be parsed as a literal
+/// `[user@]host[:port]`.
+async fn resolve_target(name: &str) -> String {
+    if let Some(key) = alias_key(name) {
+        if let Ok(Some(value)) = CONFIG.get().lock().await.fetch(key.as_str()).await {
+            return value.as_str().to_string();
+        }
+    }
+    name.to_string()
+}
+
+async fn save_alias(alias: &str, dest: &str) {
+    if matches!(alias, "save" | "forget" | "list") {
+        print!("'{alias}' is a reserved name\r\n");
+        return;
+    }
+    let Some(key) = alias_key(alias) else {
+        print!("alias is too long\r\n");
+        return;
+    };
+    let value: StrValue = match dest.try_into() {
+        Ok(v) => v,
+        Err(err) => {
+            print!("value `{dest}`: {err:?}\r\n");
+            return;
+        }
+    };
+    let mut config = CONFIG.get().lock().await;
+    match config.store(key.as_str(), value).await {
+        Ok(()) => print!("Saved '{alias}' -> {dest}\r\n"),
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
+async fn forget_alias(alias: &str) {
+    let Some(key) = alias_key(alias) else {
+        print!("alias is too long\r\n");
+        return;
+    };
+    let mut config = CONFIG.get().lock().await;
+    match config.remove(key.as_str()).await {
+        Ok(()) => print!("Forgot '{alias}'\r\n"),
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
+async fn list_aliases() {
+    let mut config = CONFIG.get().lock().await;
+    match config.get_all().await {
+        Ok(map) => {
+            let mut any = false;
+            for (k, v) in &map {
+                if let Some(alias) = k.as_str().strip_prefix("host_") {
+                    print!("{alias} -> {v}\r\n");
+                    any = true;
+                }
+            }
+            if !any {
+                print!("No saved hosts. Use `ssh save <alias> <[user@]host[:port]>`.\r\n");
+            }
+        }
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
 pub async fn ssh_command(args: &[&str]) {
+    match args {
+        ["ssh", "save", alias, dest] => {
+            save_alias(alias, dest).await;
+            return;
+        }
+        ["ssh", "save", ..] => {
+            print!("Usage: ssh save <alias> <[user@]host[:port]>\r\n");
+            return;
+        }
+        ["ssh", "forget", alias] => {
+            forget_alias(alias).await;
+            return;
+        }
+        ["ssh", "forget", ..] => {
+            print!("Usage: ssh forget <alias>\r\n");
+            return;
+        }
+        ["ssh", "list"] => {
+            list_aliases().await;
+            return;
+        }
+        _ => {}
+    }
+
     if args.len() > 1 {
-        let (hostname, port) = match args[1].rsplit_once(':') {
-            Some((host, port_str)) => match port_str.parse::<u16>() {
+        let target = resolve_target(args[1]).await;
+        let (username, host_port) = match target.split_once('@') {
+            Some((user, rest)) => (Some(user.to_string()), rest),
+            None => (None, target.as_str()),
+        };
+        let (hostname, port) = if let Some((host, port_str)) = host_port.rsplit_once(':') {
+            match port_str.parse::<u16>() {
                 Ok(port) => (host.to_string(), port),
                 Err(_) => {
                     print!("invalid port `{port_str}`\r\n");
                     return;
                 }
-            },
-            None => (args[1].to_string(), 22),
+            }
+        } else {
+            (host_port.to_string(), 22)
         };
 
         let command: Option<String> = if args.len() > 2 {
@@ -555,7 +673,7 @@ pub async fn ssh_command(args: &[&str]) {
         };
         let spawn_result = {
             let spawner = Spawner::for_current_executor().await;
-            spawner.spawn(ssh_session_task(hostname, port, command))
+            spawner.spawn(ssh_session_task(hostname, port, username, command))
         };
         match spawn_result {
             Ok(_) => {}
@@ -566,7 +684,10 @@ pub async fn ssh_command(args: &[&str]) {
         return;
     }
 
-    print!("Usage: ssh [hostname[:port]] [command]\r\n");
+    print!("Usage: ssh [user@]hostname[:port] [command]\r\n");
+    print!("       ssh save <alias> <[user@]host[:port]>\r\n");
+    print!("       ssh forget <alias>\r\n");
+    print!("       ssh list\r\n");
 }
 
 struct SshProcess {

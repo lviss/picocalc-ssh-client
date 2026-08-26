@@ -111,10 +111,13 @@ $ ssh 192.168.1.10
 ```
 
 Connects to port 22 by default. To use a different port, append it after a
-colon:
+colon, and/or a username before an `@`, using the same syntax as regular
+`ssh`:
 
 ```bash
 $ ssh mymachine:2222
+$ ssh myuser@mymachine
+$ ssh myuser@mymachine:2222
 ```
 
 You can also save credentials to avoid typing them every time:
@@ -123,6 +126,28 @@ You can also save credentials to avoid typing them every time:
 $ config set ssh_user myuser
 $ config set ssh_pw mypassword
 ```
+
+### Remembering Hosts
+
+Rather than retyping a long hostname (and username/port) every time, save it
+under a short alias:
+
+```bash
+# Save an alias (accepts the same [user@]host[:port] syntax as `ssh`)
+$ ssh save home myuser@myserver.example.com:2222
+
+# Connect using the alias
+$ ssh home
+
+# List saved aliases
+$ ssh list
+
+# Remove one
+$ ssh forget home
+```
+
+Aliases are stored in the same flash-backed config as other settings, so
+they persist across reboots.
 
 ### SSH Key Authentication
 
