@@ -104,6 +104,18 @@ impl LineEditor {
     }
 }
 
+// Keep this list in sync with the `match arg0` arms in dispatch_command below.
+pub async fn help_command(_args: &[&str]) {
+    print!(
+        "{}\r\n",
+        [
+            "bat", "bl", "bootsel", "cls", "config", "free", "help", "keygen", "ls", "reboot",
+            "ssh", "time",
+        ]
+        .join(" ")
+    );
+}
+
 pub struct LocalShell {
     command: Mutex<LineEditor>,
 }
@@ -115,6 +127,7 @@ impl LocalShell {
         })
     }
 
+    // Keep this list in sync with the `match arg0` arms below in dispatch_command.
     async fn dispatch_command(&self, command: &str) {
         let argv: Vec<&str> = command.split(' ').collect();
         let arg0 = argv[0];
@@ -125,6 +138,7 @@ impl LocalShell {
             "cls" => crate::screen::cls_command(&argv).await,
             "config" => crate::config::config_command(&argv).await,
             "free" => crate::heap::free_command(&argv).await,
+            "help" => help_command(&argv).await,
             "keygen" => crate::sshkey::keygen_command(&argv).await,
             "ls" => ls_command(&argv).await,
             "reboot" => crate::keyboard::reboot(),
