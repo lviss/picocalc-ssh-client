@@ -1,24 +1,24 @@
 use core::fmt;
 use core::ops::{Deref, DerefMut};
+use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
+use embassy_rp::gpio::Output;
+use embassy_rp::peripherals::SPI1;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex as AsyncMutex;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::{Duration, Ticker};
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
 use embedded_graphics::text::Text;
-use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
-use embassy_rp::gpio::Output;
-use embassy_rp::peripherals::SPI1;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ILI9488Rgb565;
 
 use terminal_model::glyphs::{draw_box_char, draw_symbol_char, is_box_char, is_symbol_char};
-pub use terminal_model::screen_model::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use terminal_model::screen_model::ScreenModel;
+pub use terminal_model::screen_model::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 // Define PicoCalcDisplay here so it can be used in main.rs and here
 pub type PicoCalcDisplay<'a> = mipidsi::Display<
@@ -107,7 +107,9 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             // View start = Total lines - rows - viewport_offset
             // Current row abs index = View start + y
             let total_len = model.scrollback.len() + model.rows;
-            let view_start = total_len.saturating_sub(model.rows).saturating_sub(model.viewport_offset);
+            let view_start = total_len
+                .saturating_sub(model.rows)
+                .saturating_sub(model.viewport_offset);
             let abs_idx = view_start + y;
 
             if abs_idx < model.scrollback.len() {
@@ -129,11 +131,15 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
         }
 
         let row_y = y as u32 * cell_height as u32;
-        if row_y >= SCREEN_HEIGHT as u32 { break; }
+        if row_y >= SCREEN_HEIGHT as u32 {
+            break;
+        }
 
         for (x, (char, attr)) in line.chars.iter().zip(line.attrs.iter()).enumerate() {
             let col_x = x as u32 * cell_width;
-            if col_x >= SCREEN_WIDTH as u32 { break; }
+            if col_x >= SCREEN_WIDTH as u32 {
+                break;
+            }
 
             let mut fg = attr.fg.to_rgb565(false);
             let mut bg = attr.bg.to_rgb565(true);
@@ -144,21 +150,25 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
             if attr.bold {
                 // Brighten fg?
-                if fg == Rgb565::CSS_LIGHT_GRAY { fg = Rgb565::WHITE; }
+                if fg == Rgb565::CSS_LIGHT_GRAY {
+                    fg = Rgb565::WHITE;
+                }
             }
 
             // Draw background
-            display.fill_solid(
-                &Rectangle::new(
-                    Point::new(col_x as i32, row_y as i32),
-                    Size::new(cell_width, cell_height as u32),
-                ),
-                bg,
-            ).unwrap();
+            display
+                .fill_solid(
+                    &Rectangle::new(
+                        Point::new(col_x as i32, row_y as i32),
+                        Size::new(cell_width, cell_height as u32),
+                    ),
+                    bg,
+                )
+                .unwrap();
 
             // Draw text
             if *char != ' ' {
-                 let style = MonoTextStyleBuilder::new()
+                let style = MonoTextStyleBuilder::new()
                     .font(font)
                     .text_color(fg)
                     .background_color(bg)
@@ -169,9 +179,25 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                 let s = char.encode_utf8(&mut buf);
 
                 if is_box_char(*char) {
-                    draw_box_char(display, *char, col_x as i32, row_y as i32, cell_width, cell_height as u32, fg);
+                    draw_box_char(
+                        display,
+                        *char,
+                        col_x as i32,
+                        row_y as i32,
+                        cell_width,
+                        cell_height as u32,
+                        fg,
+                    );
                 } else if is_symbol_char(*char) {
-                    draw_symbol_char(display, *char, col_x as i32, row_y as i32, cell_width, cell_height as u32, fg);
+                    draw_symbol_char(
+                        display,
+                        *char,
+                        col_x as i32,
+                        row_y as i32,
+                        cell_width,
+                        cell_height as u32,
+                        fg,
+                    );
                 } else {
                     Text::new(
                         s,
@@ -184,13 +210,15 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             }
 
             if attr.underline {
-                 display.fill_solid(
-                    &Rectangle::new(
-                        Point::new(col_x as i32, (row_y + cell_height as u32 - 1) as i32),
-                        Size::new(cell_width, 1),
-                    ),
-                    fg,
-                ).unwrap();
+                display
+                    .fill_solid(
+                        &Rectangle::new(
+                            Point::new(col_x as i32, (row_y + cell_height as u32 - 1) as i32),
+                            Size::new(cell_width, 1),
+                        ),
+                        fg,
+                    )
+                    .unwrap();
             }
         }
         line.dirty = false;
@@ -201,13 +229,15 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     let cx = model.cursor_x as u32 * cell_width;
     let cy = model.cursor_y as u32 * cell_height as u32;
     if cx < SCREEN_WIDTH as u32 && cy < SCREEN_HEIGHT as u32 {
-         display.fill_solid(
-            &Rectangle::new(
-                Point::new(cx as i32, cy as i32),
-                Size::new(cell_width, cell_height as u32),
-            ),
-            Rgb565::WHITE,
-        ).ok();
+        display
+            .fill_solid(
+                &Rectangle::new(
+                    Point::new(cx as i32, cy as i32),
+                    Size::new(cell_width, cell_height as u32),
+                ),
+                Rgb565::WHITE,
+            )
+            .ok();
     }
 }
 

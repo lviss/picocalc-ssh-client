@@ -82,7 +82,7 @@ impl Color {
                     }
                 } else if i < 16 {
                     // brights
-                     match i {
+                    match i {
                         8 => Rgb565::new(10, 20, 10),
                         9 => Rgb565::new(31, 20, 20),
                         10 => Rgb565::new(20, 63, 20),
@@ -139,8 +139,12 @@ impl ScreenLine {
     }
 
     fn clear(&mut self) {
-        for c in self.chars.iter_mut() { *c = ' '; }
-        for a in self.attrs.iter_mut() { *a = Attrs::default(); }
+        for c in self.chars.iter_mut() {
+            *c = ' ';
+        }
+        for a in self.attrs.iter_mut() {
+            *a = Attrs::default();
+        }
         self.dirty = true;
     }
 }
@@ -162,7 +166,8 @@ pub struct ScreenModel {
 impl Default for ScreenModel {
     fn default() -> Self {
         let font = FONTS[2];
-        let cols = ((SCREEN_WIDTH as u32) / (font.character_size.width + font.character_spacing)) as usize;
+        let cols =
+            ((SCREEN_WIDTH as u32) / (font.character_size.width + font.character_spacing)) as usize;
         let rows = ((SCREEN_HEIGHT as u32) / font.character_size.height) as usize;
 
         // Initialize lines
@@ -293,17 +298,20 @@ impl Perform for ScreenModel {
     fn execute(&mut self, byte: u8) {
         self.reset_view();
         match byte {
-            b'\n' => { // LF
+            b'\n' => {
+                // LF
                 self.cursor_y += 1;
                 if self.cursor_y >= self.rows {
                     self.scroll_up();
                     self.cursor_y = self.rows - 1;
                 }
             }
-            b'\r' => { // CR
+            b'\r' => {
+                // CR
                 self.cursor_x = 0;
             }
-            b'\x08' => { // BS
+            b'\x08' => {
+                // BS
                 if self.cursor_x > 0 {
                     self.cursor_x -= 1;
                 }
@@ -312,19 +320,30 @@ impl Perform for ScreenModel {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore || !intermediates.is_empty() { return; }
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        if ignore || !intermediates.is_empty() {
+            return;
+        }
 
         match action {
-            'A' => { // Cursor Up
+            'A' => {
+                // Cursor Up
                 let n = cursor_move_count(params);
                 self.cursor_y = self.cursor_y.saturating_sub(n);
             }
-            'B' => { // Cursor Down
+            'B' => {
+                // Cursor Down
                 let n = cursor_move_count(params);
                 self.cursor_y = (self.cursor_y + n).min(self.rows - 1);
             }
-            'C' => { // Cursor Forward
+            'C' => {
+                // Cursor Forward
                 // claude-code's Ink renderer represents runs of typed spaces as bare
                 // CSI C instead of literal 0x20 bytes, betting that the skipped cells
                 // are already blank. Strict ECMA-48 CUF must not touch cell content,
@@ -345,21 +364,25 @@ impl Perform for ScreenModel {
                 }
                 self.cursor_x = (start + n).min(self.cols - 1);
             }
-            'D' => { // Cursor Backward
+            'D' => {
+                // Cursor Backward
                 let n = cursor_move_count(params);
                 self.cursor_x = self.cursor_x.saturating_sub(n);
             }
-            'H' | 'f' => { // Cursor Position
+            'H' | 'f' => {
+                // Cursor Position
                 let mut iter = params.iter();
                 let row = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
                 let col = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
                 self.cursor_y = row.min(self.rows - 1);
                 self.cursor_x = col.min(self.cols - 1);
             }
-            'J' => { // Erase in Display
+            'J' => {
+                // Erase in Display
                 let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
                 match n {
-                    0 => { // Cursor to end
+                    0 => {
+                        // Cursor to end
                         // Clear current line from cursor
                         let line = &mut self.lines[self.cursor_y];
                         for i in self.cursor_x..self.cols {
@@ -372,7 +395,8 @@ impl Perform for ScreenModel {
                             self.lines[i].clear();
                         }
                     }
-                    1 => { // Beginning to cursor
+                    1 => {
+                        // Beginning to cursor
                         // Clear lines above
                         for i in 0..self.cursor_y {
                             self.lines[i].clear();
@@ -385,29 +409,34 @@ impl Perform for ScreenModel {
                         }
                         line.dirty = true;
                     }
-                    2 => { // Entire screen
+                    2 => {
+                        // Entire screen
                         self.clear();
                     }
                     _ => {}
                 }
             }
-            'K' => { // Erase in Line
+            'K' => {
+                // Erase in Line
                 let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
                 let line = &mut self.lines[self.cursor_y];
                 match n {
-                    0 => { // Cursor to end
+                    0 => {
+                        // Cursor to end
                         for i in self.cursor_x..self.cols {
                             line.chars[i] = ' ';
                             line.attrs[i] = self.current_attrs;
                         }
                     }
-                    1 => { // Beginning to cursor
+                    1 => {
+                        // Beginning to cursor
                         for i in 0..=self.cursor_x {
                             line.chars[i] = ' ';
                             line.attrs[i] = self.current_attrs;
                         }
                     }
-                    2 => { // Entire line
+                    2 => {
+                        // Entire line
                         for i in 0..self.cols {
                             line.chars[i] = ' ';
                             line.attrs[i] = self.current_attrs;
@@ -417,7 +446,8 @@ impl Perform for ScreenModel {
                 }
                 line.dirty = true;
             }
-            'm' => { // SGR
+            'm' => {
+                // SGR
                 for param in params.iter() {
                     let p = param[0];
                     match p {
@@ -442,7 +472,8 @@ impl Perform for ScreenModel {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+    }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
@@ -475,7 +506,10 @@ mod tests {
         feed(&mut model, b"\x1b[3C");
 
         assert_eq!(&model.lines[0].chars[0..3], &[' ', ' ', ' ']);
-        assert!(model.lines[0].dirty, "line must be marked dirty so update_display repaints it");
+        assert!(
+            model.lines[0].dirty,
+            "line must be marked dirty so update_display repaints it"
+        );
         assert_eq!(model.cursor_x, 3);
     }
 

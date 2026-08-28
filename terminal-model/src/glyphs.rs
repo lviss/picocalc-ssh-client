@@ -1,7 +1,7 @@
+use embedded_graphics::Pixel;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
-use embedded_graphics::Pixel;
 
 /// Box-drawing block (U+2500-U+259F): already hand-drawn via vector primitives
 /// instead of the `profont` bitmap font, which doesn't cover this range.
@@ -29,15 +29,8 @@ pub fn is_symbol_char(c: char) -> bool {
     )
 }
 
-pub fn draw_box_char<D>(
-    display: &mut D,
-    c: char,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    color: Rgb565,
-) where
+pub fn draw_box_char<D>(display: &mut D, c: char, x: i32, y: i32, w: u32, h: u32, color: Rgb565)
+where
     D: DrawTarget<Color = Rgb565>,
 {
     let cx = x + (w / 2) as i32;
@@ -104,38 +97,41 @@ pub fn draw_box_char<D>(
         }
         // Heavy horizontal
         '\u{2501}' => {
-             Line::new(Point::new(x, cy), Point::new(x + w as i32, cy))
-            .into_styled(PrimitiveStyle::with_stroke(color, 2))
-            .draw(display)
-            .ok();
+            Line::new(Point::new(x, cy), Point::new(x + w as i32, cy))
+                .into_styled(PrimitiveStyle::with_stroke(color, 2))
+                .draw(display)
+                .ok();
         }
-         // Heavy vertical
+        // Heavy vertical
         '\u{2503}' => {
-             Line::new(Point::new(cx, y), Point::new(cx, y + h as i32))
-            .into_styled(PrimitiveStyle::with_stroke(color, 2))
-            .draw(display)
-            .ok();
+            Line::new(Point::new(cx, y), Point::new(cx, y + h as i32))
+                .into_styled(PrimitiveStyle::with_stroke(color, 2))
+                .draw(display)
+                .ok();
         }
         // Block
         '\u{2588}' => {
-            display.fill_solid(
-                &Rectangle::new(Point::new(x, y), Size::new(w, h)),
-                color
-            ).ok();
+            display
+                .fill_solid(&Rectangle::new(Point::new(x, y), Size::new(w, h)), color)
+                .ok();
         }
         // Upper half block
         '\u{2580}' => {
-            display.fill_solid(
-                &Rectangle::new(Point::new(x, y), Size::new(w, h / 2)),
-                color
-            ).ok();
+            display
+                .fill_solid(
+                    &Rectangle::new(Point::new(x, y), Size::new(w, h / 2)),
+                    color,
+                )
+                .ok();
         }
         // Lower half block
         '\u{2584}' => {
-            display.fill_solid(
-                &Rectangle::new(Point::new(x, y + (h / 2) as i32), Size::new(w, h - h / 2)),
-                color
-            ).ok();
+            display
+                .fill_solid(
+                    &Rectangle::new(Point::new(x, y + (h / 2) as i32), Size::new(w, h - h / 2)),
+                    color,
+                )
+                .ok();
         }
         // Shades
         '\u{2591}' => draw_shade(display, x, y, w, h, color, 1),
@@ -143,77 +139,167 @@ pub fn draw_box_char<D>(
         '\u{2593}' => draw_shade(display, x, y, w, h, color, 3),
 
         // Rounded corners
-        '\u{256D}' => { // Top-left
-            Arc::new(Point::new(x + w as i32 / 2, y + h as i32 / 2), w, Angle::from_degrees(180.0), Angle::from_degrees(90.0))
-                .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-                .draw(display).ok();
-             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
-             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
+        '\u{256D}' => {
+            // Top-left
+            Arc::new(
+                Point::new(x + w as i32 / 2, y + h as i32 / 2),
+                w,
+                Angle::from_degrees(180.0),
+                Angle::from_degrees(90.0),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+            line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
+            line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
-        '\u{256E}' => { // Top-right
-             Arc::new(Point::new(x - w as i32 / 2, y + h as i32 / 2), w, Angle::from_degrees(270.0), Angle::from_degrees(90.0))
-                .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-                .draw(display).ok();
-             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
-             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
+        '\u{256E}' => {
+            // Top-right
+            Arc::new(
+                Point::new(x - w as i32 / 2, y + h as i32 / 2),
+                w,
+                Angle::from_degrees(270.0),
+                Angle::from_degrees(90.0),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+            line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
+            line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
-        '\u{2570}' => { // Bottom-left
-             Arc::new(Point::new(x + w as i32 / 2, y - h as i32 / 2), w, Angle::from_degrees(90.0), Angle::from_degrees(90.0))
-                .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-                .draw(display).ok();
-             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
-             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
+        '\u{2570}' => {
+            // Bottom-left
+            Arc::new(
+                Point::new(x + w as i32 / 2, y - h as i32 / 2),
+                w,
+                Angle::from_degrees(90.0),
+                Angle::from_degrees(90.0),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+            line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
+            line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
-        '\u{256F}' => { // Bottom-right
-             Arc::new(Point::new(x - w as i32 / 2, y - h as i32 / 2), w, Angle::from_degrees(0.0), Angle::from_degrees(90.0))
-                .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-                .draw(display).ok();
-             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
-             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
+        '\u{256F}' => {
+            // Bottom-right
+            Arc::new(
+                Point::new(x - w as i32 / 2, y - h as i32 / 2),
+                w,
+                Angle::from_degrees(0.0),
+                Angle::from_degrees(90.0),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+            line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
+            line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
 
         // Double lines
-        '\u{2550}' => { // Horizontal double
+        '\u{2550}' => {
+            // Horizontal double
             Line::new(Point::new(x, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
             Line::new(Point::new(x, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
-        '\u{2551}' => { // Vertical double
+        '\u{2551}' => {
+            // Vertical double
             Line::new(Point::new(cx - 1, y), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
             Line::new(Point::new(cx + 1, y), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
         // Double corners (simplified as single heavy for now to save space/complexity, or proper implementation)
-        '\u{2554}' => { // Double down-right
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+        '\u{2554}' => {
+            // Double down-right
+            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
-        '\u{2557}' => { // Double down-left
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+        '\u{2557}' => {
+            // Double down-left
+            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
-        '\u{255A}' => { // Double up-right
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+        '\u{255A}' => {
+            // Double up-right
+            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
-        '\u{255D}' => { // Double up-left
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1)).into_styled(PrimitiveStyle::with_stroke(color, 1)).draw(display).ok();
+        '\u{255D}' => {
+            // Double up-left
+            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
+            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
+                .into_styled(PrimitiveStyle::with_stroke(color, 1))
+                .draw(display)
+                .ok();
         }
 
         _ => {
             // Fallback for unhandled box chars: draw a small rectangle
-             Rectangle::new(Point::new(x + 2, y + 2), Size::new(w - 4, h - 4))
+            Rectangle::new(Point::new(x + 2, y + 2), Size::new(w - 4, h - 4))
                 .into_styled(PrimitiveStyle::with_stroke(color, 1))
                 .draw(display)
                 .ok();
@@ -224,15 +310,8 @@ pub fn draw_box_char<D>(
 /// Vector-draws the decorative symbols `is_symbol_char` matches, the same way
 /// `draw_box_char` already hand-draws the box-drawing block, so these codepoints
 /// never fall through to `Text::draw()` and hit `profont`'s `?` fallback glyph.
-pub fn draw_symbol_char<D>(
-    display: &mut D,
-    c: char,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    color: Rgb565,
-) where
+pub fn draw_symbol_char<D>(display: &mut D, c: char, x: i32, y: i32, w: u32, h: u32, color: Rgb565)
+where
     D: DrawTarget<Color = Rgb565>,
 {
     let cx = x + (w / 2) as i32;
@@ -285,29 +364,87 @@ pub fn draw_symbol_char<D>(
             for i in 0..3i32 {
                 let dot_x = x + (w as i32 * (2 * i + 1)) / 6;
                 Pixel(Point::new(dot_x, dot_y), color).draw(display).ok();
-                Pixel(Point::new(dot_x + 1, dot_y), color).draw(display).ok();
+                Pixel(Point::new(dot_x + 1, dot_y), color)
+                    .draw(display)
+                    .ok();
             }
         }
         // ← → ↑ ↓ arrows: a shaft plus a small arrowhead
         '\u{2190}' => {
             line(display, x + w as i32 - 2, cy, x + 2, cy, 1);
-            line(display, x + 2, cy, x + 2 + w as i32 / 3, cy - h as i32 / 4, 1);
-            line(display, x + 2, cy, x + 2 + w as i32 / 3, cy + h as i32 / 4, 1);
+            line(
+                display,
+                x + 2,
+                cy,
+                x + 2 + w as i32 / 3,
+                cy - h as i32 / 4,
+                1,
+            );
+            line(
+                display,
+                x + 2,
+                cy,
+                x + 2 + w as i32 / 3,
+                cy + h as i32 / 4,
+                1,
+            );
         }
         '\u{2192}' => {
             line(display, x + 2, cy, x + w as i32 - 2, cy, 1);
-            line(display, x + w as i32 - 2, cy, x + w as i32 - 2 - w as i32 / 3, cy - h as i32 / 4, 1);
-            line(display, x + w as i32 - 2, cy, x + w as i32 - 2 - w as i32 / 3, cy + h as i32 / 4, 1);
+            line(
+                display,
+                x + w as i32 - 2,
+                cy,
+                x + w as i32 - 2 - w as i32 / 3,
+                cy - h as i32 / 4,
+                1,
+            );
+            line(
+                display,
+                x + w as i32 - 2,
+                cy,
+                x + w as i32 - 2 - w as i32 / 3,
+                cy + h as i32 / 4,
+                1,
+            );
         }
         '\u{2191}' => {
             line(display, cx, y + h as i32 - 2, cx, y + 2, 1);
-            line(display, cx, y + 2, cx - w as i32 / 4, y + 2 + h as i32 / 3, 1);
-            line(display, cx, y + 2, cx + w as i32 / 4, y + 2 + h as i32 / 3, 1);
+            line(
+                display,
+                cx,
+                y + 2,
+                cx - w as i32 / 4,
+                y + 2 + h as i32 / 3,
+                1,
+            );
+            line(
+                display,
+                cx,
+                y + 2,
+                cx + w as i32 / 4,
+                y + 2 + h as i32 / 3,
+                1,
+            );
         }
         '\u{2193}' => {
             line(display, cx, y + 2, cx, y + h as i32 - 2, 1);
-            line(display, cx, y + h as i32 - 2, cx - w as i32 / 4, y + h as i32 - 2 - h as i32 / 3, 1);
-            line(display, cx, y + h as i32 - 2, cx + w as i32 / 4, y + h as i32 - 2 - h as i32 / 3, 1);
+            line(
+                display,
+                cx,
+                y + h as i32 - 2,
+                cx - w as i32 / 4,
+                y + h as i32 - 2 - h as i32 / 3,
+                1,
+            );
+            line(
+                display,
+                cx,
+                y + h as i32 - 2,
+                cx + w as i32 / 4,
+                y + h as i32 - 2 - h as i32 / 3,
+                1,
+            );
         }
         // ✳ eight spoked asterisk: burst of lines through the center
         '\u{2733}' => {
@@ -327,13 +464,15 @@ where
     for py in 0..h {
         for px in 0..w {
             let on = match density {
-                1 => (px % 2 == 0) && (py % 2 == 0), // 25%
-                2 => (px + py) % 2 == 0, // 50%
+                1 => (px % 2 == 0) && (py % 2 == 0),    // 25%
+                2 => (px + py) % 2 == 0,                // 50%
                 3 => !((px % 2 == 0) && (py % 2 == 0)), // 75%
-                _ => false
+                _ => false,
             };
             if on {
-                Pixel(Point::new(x + px as i32, y + py as i32), color).draw(display).ok();
+                Pixel(Point::new(x + px as i32, y + py as i32), color)
+                    .draw(display)
+                    .ok();
             }
         }
     }
@@ -349,8 +488,14 @@ mod tests {
     // rendering, which is what previously produced the literal `?` fallback glyph.
     #[test]
     fn report_captured_codepoints_are_symbol_chars() {
-        for c in ['\u{276F}', '\u{2022}', '\u{2026}', '\u{2190}', '\u{25CF}', '\u{2733}'] {
-            assert!(is_symbol_char(c), "U+{:04X} should dispatch to draw_symbol_char", c as u32);
+        for c in [
+            '\u{276F}', '\u{2022}', '\u{2026}', '\u{2190}', '\u{25CF}', '\u{2733}',
+        ] {
+            assert!(
+                is_symbol_char(c),
+                "U+{:04X} should dispatch to draw_symbol_char",
+                c as u32
+            );
         }
     }
 
@@ -359,8 +504,14 @@ mod tests {
         assert!(!is_symbol_char('>'));
         assert!(!is_symbol_char('A'));
         assert!(!is_symbol_char(' '));
-        assert!(!is_symbol_char('\u{2500}'), "box-drawing chars must stay on the draw_box_char path");
-        assert!(!is_box_char('\u{276F}'), "symbol chars must not collide with the box-drawing dispatch");
+        assert!(
+            !is_symbol_char('\u{2500}'),
+            "box-drawing chars must stay on the draw_box_char path"
+        );
+        assert!(
+            !is_box_char('\u{276F}'),
+            "symbol chars must not collide with the box-drawing dispatch"
+        );
     }
 
     #[test]
@@ -369,8 +520,8 @@ mod tests {
         // must produce at least one non-background pixel when drawn, otherwise the
         // fix would silently render nothing instead of fixing the '?' fallback.
         for c in [
-            '\u{276F}', '\u{2022}', '\u{25CF}', '\u{25CB}', '\u{2026}', '\u{2190}',
-            '\u{2191}', '\u{2192}', '\u{2193}', '\u{2733}',
+            '\u{276F}', '\u{2022}', '\u{25CF}', '\u{25CB}', '\u{2026}', '\u{2190}', '\u{2191}',
+            '\u{2192}', '\u{2193}', '\u{2733}',
         ] {
             let mut display: MockDisplay<Rgb565> = MockDisplay::new();
             display.set_allow_out_of_bounds_drawing(true);
