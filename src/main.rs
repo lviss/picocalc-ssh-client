@@ -13,6 +13,7 @@ use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::Spawner;
 use embassy_rp::block::ImageDef;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::{PIO0, PIO1, SPI1, TRNG, UART0, UART1, USB};
 use embassy_rp::spi::Spi;
 use embassy_rp::uart::BufferedInterruptHandler;
@@ -129,6 +130,20 @@ fn get_max_usable_stack() -> usize {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    // A trivial, otherwise-unused core1 - required before any RP2350
+    // rom_flash_op call (used by the config store, src/config.rs) can
+    // safely pause/resume the other core around erase/program via
+    // `embassy_rp::multicore::{pause_core1, resume_core1}`. Without core1
+    // ever having been started, `pause_core1` hangs forever waiting for a
+    // response that will never come.
+    static CORE1_STACK: StaticCell<Stack<2048>> = StaticCell::new();
+    spawn_core1(p.CORE1, CORE1_STACK.init_with(Stack::new), || {
+        loop {
+            core::hint::spin_loop();
+        }
+    });
+
     crate::heap::init_heap();
 
     crate::logging::setup_logging(
@@ -224,7 +239,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(crate::screen::screen_painter(display));
     spawner.must_spawn(crate::keyboard::keyboard_reader(i2c_bus));
 
-    let flash = Flash::new(p.FLASH, p.DMA_CH3);
+    let flash = Flash::new(p.FLASH);
     CONFIG.get().lock().await.assign_flash(flash);
 
     let psram = init_psram(

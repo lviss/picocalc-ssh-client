@@ -77,7 +77,7 @@ impl<'a, const N: usize> Value<'a> for FixedString<N> {
 }
 
 impl<const N: usize> TryInto<FixedString<N>> for &str {
-    type Error = sequential_storage::Error<embassy_rp::flash::Error>;
+    type Error = sequential_storage::Error<crate::config::RomFlashError>;
 
     fn try_into(self) -> Result<FixedString<N>, Self::Error> {
         let mut result = String::<N>::new();

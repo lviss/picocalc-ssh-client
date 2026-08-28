@@ -1411,6 +1411,8 @@ dependencies = [
  "embedded-io-async",
  "embedded-nal-async",
  "embedded-sdmmc",
+ "embedded-storage",
+ "embedded-storage-async",
  "fixed",
  "getrandom",
  "heapless 0.8.0",

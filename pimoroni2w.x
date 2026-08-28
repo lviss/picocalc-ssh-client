@@ -2,9 +2,10 @@ MEMORY {
     /*
      * https://shop.pimoroni.com/products/pimoroni-pico-plus-2-w?variant=42182811942995
      * has 16MB of flash
-     * Reserve 4k for config storage.
+     * Reserve 8k for config storage (sequential_storage needs at least
+     * 2 erase-size pages; see CONFIG_SIZE in src/config.rs).
      */
-    FLASH : ORIGIN = 0x10000000, LENGTH = 16M - 4K
+    FLASH : ORIGIN = 0x10000000, LENGTH = 16M - 8K
     /*
      * RAM consists of 8 banks, SRAM0-SRAM7, with a striped mapping.
      * This is usually good for performance, as it distributes load on
