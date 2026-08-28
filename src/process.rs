@@ -104,15 +104,29 @@ impl LineEditor {
     }
 }
 
-// Keep this list in sync with the `match arg0` arms in dispatch_command below.
+// Keep this list in sync with the `match arg0` arms in dispatch_command below,
+// and keep each usage string in sync with that command's own argument parsing.
 pub async fn help_command(_args: &[&str]) {
     print!(
         "{}\r\n",
         [
-            "bat", "bl", "bootsel", "cls", "config", "free", "help", "keygen", "ls", "reboot",
-            "ssh", "time",
+            "bat",
+            "bl lcd|kbd <percent>",
+            "bootsel",
+            "cls",
+            "config get|set|list|rm|format <args>",
+            "free",
+            "help",
+            "keygen [force|show]",
+            "ls [path]",
+            "reboot",
+            "ssh [user@]hostname[:port] [command]",
+            "ssh save <alias> <[user@]host[:port]>",
+            "ssh forget <alias>",
+            "ssh list",
+            "time",
         ]
-        .join(" ")
+        .join("\r\n")
     );
 }
 
