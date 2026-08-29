@@ -137,7 +137,10 @@ pub async fn setup_wifi(
                     }
                 }
                 if let Some(err) = last_err {
-                    log::error!("join failed with status={} after {JOIN_ATTEMPTS} attempts", err.status);
+                    log::error!(
+                        "join failed with status={} after {JOIN_ATTEMPTS} attempts",
+                        err.status
+                    );
                     print!("Failed with status {}\r\n", err.status);
                 }
             }
