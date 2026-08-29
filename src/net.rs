@@ -22,7 +22,7 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::{Read, Write as _};
 use rand_core::RngCore;
 use static_cell::StaticCell;
@@ -112,15 +112,33 @@ pub async fn setup_wifi(
         (Ok(Some(ssid)), Ok(Some(wifi_pw))) => {
             if !ssid.is_empty() {
                 print!("Connecting to \u{1b}[1m{ssid}\u{1b}[0m...\r\n");
-                match control
-                    .join(&ssid, cyw43::JoinOptions::new(wifi_pw.as_bytes()))
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::error!("join failed with status={}", err.status);
-                        print!("Failed with status {}\r\n", err.status);
+                const JOIN_ATTEMPTS: u32 = 5;
+                const JOIN_RETRY_DELAY: Duration = Duration::from_millis(500);
+                let mut last_err = None;
+                for attempt in 1..=JOIN_ATTEMPTS {
+                    match control
+                        .join(&ssid, cyw43::JoinOptions::new(wifi_pw.as_bytes()))
+                        .await
+                    {
+                        Ok(_) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "join attempt {attempt}/{JOIN_ATTEMPTS} failed with status={}",
+                                err.status
+                            );
+                            last_err = Some(err);
+                            if attempt < JOIN_ATTEMPTS {
+                                Timer::after(JOIN_RETRY_DELAY).await;
+                            }
+                        }
                     }
+                }
+                if let Some(err) = last_err {
+                    log::error!("join failed with status={} after {JOIN_ATTEMPTS} attempts", err.status);
+                    print!("Failed with status {}\r\n", err.status);
                 }
             }
         }
@@ -131,8 +149,14 @@ pub async fn setup_wifi(
     WIFI_CONTROL.get().lock().await.replace(control);
 
     log::info!("waiting for TCP to be up...");
-    stack.wait_config_up().await;
-    log::info!("Stack is up!");
+    const CONFIG_UP_TIMEOUT: Duration = Duration::from_secs(30);
+    match with_timeout(CONFIG_UP_TIMEOUT, stack.wait_config_up()).await {
+        Ok(()) => log::info!("Stack is up!"),
+        Err(_) => {
+            log::error!("timed out waiting for network config to come up");
+            print!("Failed to bring up network (config timed out)\r\n");
+        }
+    }
     if let Some(v4) = stack.config_v4() {
         log::info!("{v4:?}");
         print!("IP Address {}\r\n", v4.address);
