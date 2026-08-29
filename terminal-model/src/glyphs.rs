@@ -26,6 +26,13 @@ pub fn is_symbol_char(c: char) -> bool {
             | '\u{2192}' // → right arrow
             | '\u{2193}' // ↓ down arrow
             | '\u{2733}' // ✳ eight spoked asterisk
+            | '\u{23F5}' // ⏵ black medium right-pointing triangle (auto-mode indicator)
+            | '\u{2014}' // — em dash
+            | '\u{2013}' // – en dash
+            | '\u{2722}' // ✢ four teardrop-spoked asterisk (spinner frame)
+            | '\u{2736}' // ✶ six pointed black star (spinner frame)
+            | '\u{273B}' // ✻ teardrop-spoked asterisk (spinner frame)
+            | '\u{273D}' // ✽ heavy teardrop-spoked asterisk (spinner frame)
     )
 }
 
@@ -453,6 +460,60 @@ where
             line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
             line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
         }
+        // ⏵ auto-mode triangle: small filled right-pointing triangle (play-button style)
+        '\u{23F5}' => {
+            let x0 = x + w as i32 / 4;
+            let x1 = x + (w as i32 * 3) / 4;
+            let y0 = y + h as i32 / 4;
+            let y1 = y + (h as i32 * 3) / 4;
+            Triangle::new(Point::new(x0, y0), Point::new(x0, y1), Point::new(x1, cy))
+                .into_styled(PrimitiveStyle::with_fill(color))
+                .draw(display)
+                .ok();
+        }
+        // — em dash: a long horizontal line spanning most of the cell width
+        '\u{2014}' => line(display, x + 1, cy, x + w as i32 - 1, cy, 1),
+        // – en dash: a shorter horizontal line, roughly half the cell width
+        '\u{2013}' => line(display, x + w as i32 / 4, cy, x + (w as i32 * 3) / 4, cy, 1),
+        // ✢ four teardrop-spoked asterisk: a plain cross (4 spokes, no diagonals)
+        '\u{2722}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
+        }
+        // ✶ six pointed black star: three lines through the center, spaced apart
+        '\u{2736}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(
+                display,
+                cx - w as i32 / 4,
+                y + 1,
+                cx + w as i32 / 4,
+                y + h as i32 - 1,
+                1,
+            );
+            line(
+                display,
+                cx + w as i32 / 4,
+                y + 1,
+                cx - w as i32 / 4,
+                y + h as i32 - 1,
+                1,
+            );
+        }
+        // ✻ teardrop-spoked asterisk: same burst treatment as the eight-spoked asterisk
+        '\u{273B}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
+            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
+            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
+        }
+        // ✽ heavy teardrop-spoked asterisk: the same burst, drawn with a heavier stroke
+        '\u{273D}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 2);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 2);
+            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 2);
+            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 2);
+        }
         _ => {}
     }
 }
@@ -499,6 +560,23 @@ mod tests {
         }
     }
 
+    // Codepoints live-captured for this follow-up fix: the auto-mode triangle
+    // (originally captured but never wired up), em/en dashes (never captured at
+    // all), and the spinner-frame asterisk family beyond the single U+2733 frame
+    // the original report happened to catch.
+    #[test]
+    fn followup_captured_codepoints_are_symbol_chars() {
+        for c in [
+            '\u{23F5}', '\u{2014}', '\u{2013}', '\u{2722}', '\u{2736}', '\u{273B}', '\u{273D}',
+        ] {
+            assert!(
+                is_symbol_char(c),
+                "U+{:04X} should dispatch to draw_symbol_char",
+                c as u32
+            );
+        }
+    }
+
     #[test]
     fn plain_ascii_and_box_chars_are_not_symbol_chars() {
         assert!(!is_symbol_char('>'));
@@ -521,7 +599,8 @@ mod tests {
         // fix would silently render nothing instead of fixing the '?' fallback.
         for c in [
             '\u{276F}', '\u{2022}', '\u{25CF}', '\u{25CB}', '\u{2026}', '\u{2190}', '\u{2191}',
-            '\u{2192}', '\u{2193}', '\u{2733}',
+            '\u{2192}', '\u{2193}', '\u{2733}', '\u{23F5}', '\u{2014}', '\u{2013}', '\u{2722}',
+            '\u{2736}', '\u{273B}', '\u{273D}',
         ] {
             let mut display: MockDisplay<Rgb565> = MockDisplay::new();
             display.set_allow_out_of_bounds_drawing(true);
