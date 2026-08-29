@@ -1,7 +1,7 @@
-use embedded_graphics::Pixel;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
+use embedded_graphics::Pixel;
 
 /// Box-drawing block (U+2500-U+259F): already hand-drawn via vector primitives
 /// instead of the `profont` bitmap font, which doesn't cover this range.
