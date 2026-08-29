@@ -310,11 +310,9 @@ impl Perform for ScreenModel {
                 // CR
                 self.cursor_x = 0;
             }
-            b'\x08' => {
-                // BS
-                if self.cursor_x > 0 {
-                    self.cursor_x -= 1;
-                }
+            // BS
+            b'\x08' if self.cursor_x > 0 => {
+                self.cursor_x -= 1;
             }
             _ => {}
         }
