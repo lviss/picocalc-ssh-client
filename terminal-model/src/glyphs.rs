@@ -10,9 +10,10 @@ pub fn is_box_char(c: char) -> bool {
 }
 
 /// Decorative Unicode symbols claude-code's Ink-based TUI emits for its prompt
-/// chrome (chevron, bullets, ellipsis, arrows, spinner/status glyphs). `profont`
-/// only covers ASCII + Latin-1, so these fall back to its literal `?` glyph unless
-/// hand-drawn here, the same way box-drawing characters already are.
+/// chrome (chevron, bullets, ellipsis, arrows, dashes, the auto-mode triangle,
+/// spinner/status glyphs). `profont` only covers ASCII + Latin-1, so these fall
+/// back to its literal `?` glyph unless hand-drawn here, the same way box-drawing
+/// characters already are.
 pub fn is_symbol_char(c: char) -> bool {
     matches!(
         c,
