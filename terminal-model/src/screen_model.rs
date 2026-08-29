@@ -344,25 +344,19 @@ impl Perform for ScreenModel {
             }
             'C' => {
                 // Cursor Forward
-                // claude-code's Ink renderer represents runs of typed spaces as bare
-                // CSI C instead of literal 0x20 bytes, betting that the skipped cells
-                // are already blank. Strict ECMA-48 CUF must not touch cell content,
-                // but that leaves stale glyphs on screen and the line non-dirty when
-                // that bet is wrong, so we deliberately diverge: blank every column
-                // advanced over, matching what printing that many spaces would do.
+                // Content-preserving, matching 'D' below: an earlier revision of this
+                // handler unconditionally blanked every column advanced over, to fix
+                // Ink representing runs of typed spaces as bare CSI C instead of
+                // literal 0x20 bytes. That regressed a much more common use of the
+                // same bare CSI C idiom - Ink also uses it to skip over columns whose
+                // character is unchanged from the previous frame, including real
+                // mid-word letters, as a redraw bandwidth optimization - so
+                // unconditional blanking corrupted those instead
+                // (/ai/firstmate/data/picocalc-random-blanked-chars/report.md).
+                // There's no information at this call site to tell the two uses
+                // apart, so this reverts to strict ECMA-48 semantics.
                 let n = cursor_move_count(params);
-                let start = self.cursor_x;
-                let blank_end = (start + n).min(self.cols);
-                if blank_end > start {
-                    let attrs = self.current_attrs;
-                    let line = &mut self.lines[self.cursor_y];
-                    for i in start..blank_end {
-                        line.chars[i] = ' ';
-                        line.attrs[i] = attrs;
-                    }
-                    line.dirty = true;
-                }
-                self.cursor_x = (start + n).min(self.cols - 1);
+                self.cursor_x = (self.cursor_x + n).min(self.cols - 1);
             }
             'D' => {
                 // Cursor Backward
@@ -491,44 +485,34 @@ mod tests {
         }
     }
 
-    // Reproduces the exact mechanism from the diagnosis report: claude-code's Ink
-    // renderer sometimes sends bare `CSI n C` instead of literal spaces, betting the
-    // skipped cells are already blank. This feeds a `CSI 3 C` directly to the VTE
-    // parser over cells that hold real (non-blank) prior content, bypassing the need
-    // for a real claude-code session, and asserts the skipped cells become blank and
-    // the line is marked dirty so `update_display` will actually repaint them.
+    // Reproduces the regression from /ai/firstmate/data/picocalc-random-blanked-chars/report.md:
+    // Ink uses the exact same bare `CSI C` idiom to skip over a column whose character
+    // is unchanged from the previous frame during a redraw - including a real mid-word
+    // letter - as it does for runs of typed spaces it believes are already blank. This
+    // replays the report's own live-captured byte sequence ("Captain, s" + bare CSI C
+    // skipping an already-correct 'h' + "ip" + "shape.") and asserts the skipped letter
+    // survives untouched, matching content-preserving CUF semantics.
     #[test]
-    fn cursor_forward_blanks_skipped_non_blank_cells() {
+    fn cursor_forward_over_unchanged_midword_letter_does_not_blank_it() {
         let mut model = ScreenModel::default();
-        feed(&mut model, b"XYZ\r");
-        model.lines[0].dirty = false;
+        feed(&mut model, b"Captain, shipshape.\r");
 
-        feed(&mut model, b"\x1b[3C");
+        feed(&mut model, b"Captain, s\x1b[Cip");
 
-        assert_eq!(&model.lines[0].chars[0..3], &[' ', ' ', ' ']);
-        assert!(
-            model.lines[0].dirty,
-            "line must be marked dirty so update_display repaints it"
-        );
-        assert_eq!(model.cursor_x, 3);
+        let line: alloc::string::String = model.lines[0].chars[0..19].iter().collect();
+        assert_eq!(line, "Captain, shipshape.");
     }
 
-    // The report's live captures show claude-code emitting *bare* `ESC[C` (no digit)
-    // for single-space skips, e.g. "ESC[21;6H ESC[C ESC[C y". vte always pushes a
-    // parameter (0, not absent) even for a bare CSI, so a naive `.unwrap_or(1)` on
-    // the parsed value silently computes n=0 and this handler would never fire for
-    // exactly the sequence claude-code actually sends.
+    // vte always pushes a parameter (0, not absent) even for a bare CSI, so a naive
+    // `.unwrap_or(1)` on the parsed value would silently compute n=0 for the extremely
+    // common bare `ESC[C` form (no digit) claude-code's Ink renderer actually emits.
     #[test]
     fn cursor_forward_default_count_is_one() {
         let mut model = ScreenModel::default();
         feed(&mut model, b"XYZ\r");
-        model.lines[0].dirty = false;
 
         feed(&mut model, b"\x1b[C");
 
-        assert_eq!(model.lines[0].chars[0], ' ');
-        assert_eq!(model.lines[0].chars[1], 'Y');
-        assert!(model.lines[0].dirty);
         assert_eq!(model.cursor_x, 1);
     }
 
@@ -540,22 +524,27 @@ mod tests {
         assert_eq!(model.cursor_x, cols - 1);
     }
 
-    // Cursor Backward is left at strict ECMA-48 semantics (content-preserving) since
-    // the report found no evidence Ink relies on CSI D the same way it relies on
-    // CSI C, and blindly blanking on backward movement would be more likely to erase
-    // legitimately-preserved content (e.g. cursor repositioning before a redraw).
+    // Cursor Forward and Cursor Backward are both content-preserving, strict ECMA-48
+    // semantics: CUF/CUB must move the cursor without touching cell content. See
+    // cursor_forward_over_unchanged_midword_letter_does_not_blank_it above for why an
+    // earlier revision's attempt to diverge from this for CSI C was reverted.
     #[test]
-    fn cursor_backward_does_not_touch_cell_content() {
+    fn cursor_forward_and_backward_do_not_touch_cell_content() {
         let mut model = ScreenModel::default();
         feed(&mut model, b"AB");
         model.lines[0].dirty = false;
 
         feed(&mut model, b"\x1b[2D");
-
         assert_eq!(model.lines[0].chars[0], 'A');
         assert_eq!(model.lines[0].chars[1], 'B');
         assert!(!model.lines[0].dirty);
         assert_eq!(model.cursor_x, 0);
+
+        feed(&mut model, b"\x1b[2C");
+        assert_eq!(model.lines[0].chars[0], 'A');
+        assert_eq!(model.lines[0].chars[1], 'B');
+        assert!(!model.lines[0].dirty);
+        assert_eq!(model.cursor_x, 2);
     }
 
     #[test]
