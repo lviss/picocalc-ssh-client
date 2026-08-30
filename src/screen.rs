@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::string::String;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
@@ -7,8 +10,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex as AsyncMutex;
-use embassy_time::{Duration, Ticker};
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embassy_time::{Duration, Instant, Ticker};
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
@@ -39,9 +42,13 @@ pub type PicoCalcDisplay<'a> = mipidsi::Display<
 pub static SCREEN: LazyLock<AsyncMutex<CriticalSectionRawMutex, Screen>> =
     LazyLock::new(|| AsyncMutex::new(Screen::new()));
 
+/// How long the battery overlay stays on screen before it auto-dismisses.
+const OVERLAY_DURATION: Duration = Duration::from_secs(3);
+
 pub struct Screen {
     model: ScreenModel,
     parser: vte::Parser,
+    overlay_expiry: Option<Instant>,
 }
 
 impl Deref for Screen {
@@ -62,6 +69,7 @@ impl Screen {
         Self {
             model: ScreenModel::default(),
             parser: vte::Parser::new(),
+            overlay_expiry: None,
         }
     }
 
@@ -79,7 +87,21 @@ impl Screen {
         self.model.clear();
     }
 
+    /// Show `text` as a transient overlay on top of whatever is currently on
+    /// screen; it auto-dismisses after `OVERLAY_DURATION` without corrupting the
+    /// underlying terminal buffer.
+    pub fn show_battery_overlay(&mut self, text: String) {
+        self.model.show_overlay(text);
+        self.overlay_expiry = Some(Instant::now() + OVERLAY_DURATION);
+    }
+
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
+        if let Some(expiry) = self.overlay_expiry {
+            if Instant::now() >= expiry {
+                self.overlay_expiry = None;
+                self.model.clear_overlay();
+            }
+        }
         update_display(&mut self.model, display);
     }
 }
@@ -239,6 +261,57 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             )
             .ok();
     }
+
+    // Composite the overlay (if any) on top of whatever was just painted. This
+    // never touches `model.lines`/`scrollback`, so once `overlay` goes back to
+    // `None` the forced full repaint in `ScreenModel::clear_overlay` redraws the
+    // real, possibly-changed content underneath exactly as if the overlay had
+    // never been shown.
+    if let Some(text) = &model.overlay {
+        draw_overlay(model.font, text, display);
+    }
+}
+
+fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
+    const PADDING_X: i32 = 10;
+    const PADDING_Y: i32 = 8;
+
+    let char_count = text.chars().count() as u32;
+    let text_width = char_count * (font.character_size.width + font.character_spacing);
+    let text_height = font.character_size.height;
+
+    let box_w = text_width + (PADDING_X as u32) * 2;
+    let box_h = text_height + (PADDING_Y as u32) * 2;
+
+    let x = (SCREEN_WIDTH as i32 - box_w as i32) / 2;
+    let y = (SCREEN_HEIGHT as i32 - box_h as i32) / 2;
+
+    let bg = Rgb565::CSS_DARK_SLATE_GRAY;
+    let fg = Rgb565::WHITE;
+
+    let rect = Rectangle::new(Point::new(x, y), Size::new(box_w, box_h));
+    display.fill_solid(&rect, bg).ok();
+    rect.into_styled(
+        PrimitiveStyleBuilder::new()
+            .stroke_color(fg)
+            .stroke_width(1)
+            .build(),
+    )
+    .draw(display)
+    .ok();
+
+    let style = MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(fg)
+        .background_color(bg)
+        .build();
+    Text::new(
+        text,
+        Point::new(x + PADDING_X, y + PADDING_Y + font.baseline as i32),
+        style,
+    )
+    .draw(display)
+    .ok();
 }
 
 #[embassy_executor::task]

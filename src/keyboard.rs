@@ -1,3 +1,5 @@
+extern crate alloc;
+
 use crate::process::current_proc;
 use crate::screen::SCREEN;
 use core::fmt::Formatter;
@@ -88,6 +90,7 @@ pub enum Key {
     F8,
     F9,
     F10,
+    Power,
     Char(char),
     Other(u8),
 }
@@ -136,6 +139,11 @@ impl From<u8> for Key {
             0x88 => Self::F8,
             0x89 => Self::F9,
             0x90 => Self::F10,
+            // Short press of the physical power button - reported by the keyboard
+            // co-processor's PMU as an ordinary key over the same I2C FIFO. A long
+            // press is handled entirely inside the co-processor (PMU.shutdown())
+            // and never reaches the host.
+            0x91 => Self::Power,
             _ => match char::from_u32(k as u32) {
                 Some(c) => Self::Char(c),
                 None => Self::Other(k),
@@ -356,6 +364,14 @@ pub async fn keyboard_reader(
                     }
                     Key::Down if key.modifiers == Modifiers::CTRL => {
                         SCREEN.get().lock().await.scroll_view_down(1);
+                    }
+                    Key::Power => {
+                        let bat = get_battery();
+                        SCREEN
+                            .get()
+                            .lock()
+                            .await
+                            .show_battery_overlay(alloc::format!("Battery: {bat}"));
                     }
                     _ => {
                         let proc = current_proc();
