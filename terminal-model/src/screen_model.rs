@@ -323,22 +323,22 @@ impl Perform for ScreenModel {
         match action {
             'A' => {
                 // Cursor Up
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize;
+                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 self.cursor_y = self.cursor_y.saturating_sub(n);
             }
             'B' => {
                 // Cursor Down
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize;
+                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 self.cursor_y = (self.cursor_y + n).min(self.rows - 1);
             }
             'C' => {
                 // Cursor Forward
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize;
+                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 self.cursor_x = (self.cursor_x + n).min(self.cols - 1);
             }
             'D' => {
                 // Cursor Backward
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize;
+                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
                 self.cursor_x = self.cursor_x.saturating_sub(n);
             }
             'H' | 'f' => {
