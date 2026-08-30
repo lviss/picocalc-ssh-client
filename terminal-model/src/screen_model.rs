@@ -66,36 +66,30 @@ impl Color {
             Color::DefaultFg => Rgb565::CSS_LIGHT_GRAY,
             Color::DefaultBg => Rgb565::BLACK,
             Color::Rgb(r, g, b) => Rgb888::new(r, g, b).into(),
-            Color::Indexed(i) => {
-                // Simple mapping for first 16 colors, else default
-                if i < 8 {
-                    // map to standard colors
-                    match i {
-                        0 => Rgb565::BLACK,
-                        1 => Rgb565::RED,
-                        2 => Rgb565::GREEN,
-                        3 => Rgb565::YELLOW,
-                        4 => Rgb565::BLUE,
-                        5 => Rgb565::MAGENTA,
-                        6 => Rgb565::CYAN,
-                        7 => Rgb565::CSS_LIGHT_GRAY,
-                        _ => Rgb565::WHITE,
-                    }
-                } else if i < 16 {
-                    // brights
-                    match i {
-                        8 => Rgb565::new(10, 20, 10),
-                        9 => Rgb565::new(31, 20, 20),
-                        10 => Rgb565::new(20, 63, 20),
-                        11 => Rgb565::new(31, 63, 20),
-                        12 => Rgb565::new(20, 20, 31),
-                        13 => Rgb565::new(31, 20, 31),
-                        14 => Rgb565::new(20, 63, 31),
-                        15 => Rgb565::WHITE,
-                        _ => Rgb565::WHITE,
-                    }
+            // Simple mapping for the first 16 colors (the standard ANSI palette
+            // plus its bright variants), else default. Delegates to the named
+            // variants above rather than repeating their Rgb565 values here.
+            Color::Indexed(0) => Color::Black.to_rgb565(is_bg),
+            Color::Indexed(1) => Color::Red.to_rgb565(is_bg),
+            Color::Indexed(2) => Color::Green.to_rgb565(is_bg),
+            Color::Indexed(3) => Color::Yellow.to_rgb565(is_bg),
+            Color::Indexed(4) => Color::Blue.to_rgb565(is_bg),
+            Color::Indexed(5) => Color::Magenta.to_rgb565(is_bg),
+            Color::Indexed(6) => Color::Cyan.to_rgb565(is_bg),
+            Color::Indexed(7) => Rgb565::CSS_LIGHT_GRAY,
+            Color::Indexed(8) => Color::BrightBlack.to_rgb565(is_bg),
+            Color::Indexed(9) => Color::BrightRed.to_rgb565(is_bg),
+            Color::Indexed(10) => Color::BrightGreen.to_rgb565(is_bg),
+            Color::Indexed(11) => Color::BrightYellow.to_rgb565(is_bg),
+            Color::Indexed(12) => Color::BrightBlue.to_rgb565(is_bg),
+            Color::Indexed(13) => Color::BrightMagenta.to_rgb565(is_bg),
+            Color::Indexed(14) => Color::BrightCyan.to_rgb565(is_bg),
+            Color::Indexed(15) => Color::BrightWhite.to_rgb565(is_bg),
+            Color::Indexed(_) => {
+                if is_bg {
+                    Rgb565::BLACK
                 } else {
-                    if is_bg { Rgb565::BLACK } else { Rgb565::WHITE }
+                    Rgb565::WHITE
                 }
             }
         }
