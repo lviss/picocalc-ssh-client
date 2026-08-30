@@ -60,6 +60,20 @@ where
             .ok();
     };
 
+    // Helpers for the double-line corner glyphs below: a double-stroke vertical
+    // segment spanning either the top or bottom half, and a double-stroke
+    // horizontal segment spanning either the left or right half.
+    let vert_double = |display: &mut D, down: bool| {
+        let (y0, y1) = if down { (cy, y + h as i32) } else { (y, cy) };
+        line(display, cx - 1, y0, cx - 1, y1);
+        line(display, cx + 1, y0, cx + 1, y1);
+    };
+    let horiz_double = |display: &mut D, right: bool| {
+        let (x0, x1) = if right { (cx, x + w as i32) } else { (x, cx) };
+        line(display, x0, cy - 1, x1, cy - 1);
+        line(display, x0, cy + 1, x1, cy + 1);
+    };
+
     match c {
         // Light horizontal
         '\u{2500}' => line(display, x, cy, x + w as i32, cy),
@@ -225,31 +239,23 @@ where
         // Double corners (simplified as single heavy for now to save space/complexity, or proper implementation)
         '\u{2554}' => {
             // Double down-right
-            line(display, cx - 1, cy, cx - 1, y + h as i32);
-            line(display, cx + 1, cy, cx + 1, y + h as i32);
-            line(display, cx, cy - 1, x + w as i32, cy - 1);
-            line(display, cx, cy + 1, x + w as i32, cy + 1);
+            vert_double(display, true);
+            horiz_double(display, true);
         }
         '\u{2557}' => {
             // Double down-left
-            line(display, cx - 1, cy, cx - 1, y + h as i32);
-            line(display, cx + 1, cy, cx + 1, y + h as i32);
-            line(display, x, cy - 1, cx, cy - 1);
-            line(display, x, cy + 1, cx, cy + 1);
+            vert_double(display, true);
+            horiz_double(display, false);
         }
         '\u{255A}' => {
             // Double up-right
-            line(display, cx - 1, y, cx - 1, cy);
-            line(display, cx + 1, y, cx + 1, cy);
-            line(display, cx, cy - 1, x + w as i32, cy - 1);
-            line(display, cx, cy + 1, x + w as i32, cy + 1);
+            vert_double(display, false);
+            horiz_double(display, true);
         }
         '\u{255D}' => {
             // Double up-left
-            line(display, cx - 1, y, cx - 1, cy);
-            line(display, cx + 1, y, cx + 1, cy);
-            line(display, x, cy - 1, cx, cy - 1);
-            line(display, x, cy + 1, cx, cy + 1);
+            vert_double(display, false);
+            horiz_double(display, false);
         }
 
         _ => {
