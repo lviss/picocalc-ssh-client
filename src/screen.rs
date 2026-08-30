@@ -124,6 +124,15 @@ fn text_style(
         .build()
 }
 
+fn fill_rect<'a>(
+    display: &mut PicoCalcDisplay<'a>,
+    point: Point,
+    size: Size,
+    color: Rgb565,
+) -> Result<(), <PicoCalcDisplay<'a> as DrawTarget>::Error> {
+    display.fill_solid(&Rectangle::new(point, size), color)
+}
+
 fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     if model.full_repaint {
         display.clear(Rgb565::BLACK).unwrap();
@@ -189,15 +198,13 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             }
 
             // Draw background
-            display
-                .fill_solid(
-                    &Rectangle::new(
-                        Point::new(col_x as i32, row_y as i32),
-                        Size::new(cell_width, cell_height),
-                    ),
-                    bg,
-                )
-                .unwrap();
+            fill_rect(
+                display,
+                Point::new(col_x as i32, row_y as i32),
+                Size::new(cell_width, cell_height),
+                bg,
+            )
+            .unwrap();
 
             // Draw text
             if *char != ' ' {
@@ -239,15 +246,13 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             }
 
             if attr.underline {
-                display
-                    .fill_solid(
-                        &Rectangle::new(
-                            Point::new(col_x as i32, (row_y + cell_height - 1) as i32),
-                            Size::new(cell_width, 1),
-                        ),
-                        fg,
-                    )
-                    .unwrap();
+                fill_rect(
+                    display,
+                    Point::new(col_x as i32, (row_y + cell_height - 1) as i32),
+                    Size::new(cell_width, 1),
+                    fg,
+                )
+                .unwrap();
             }
         }
         line.dirty = false;
@@ -258,15 +263,13 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     let cx = model.cursor_x as u32 * cell_width;
     let cy = model.cursor_y as u32 * cell_height;
     if cx < SCREEN_WIDTH as u32 && cy < SCREEN_HEIGHT as u32 {
-        display
-            .fill_solid(
-                &Rectangle::new(
-                    Point::new(cx as i32, cy as i32),
-                    Size::new(cell_width, cell_height),
-                ),
-                Rgb565::WHITE,
-            )
-            .ok();
+        fill_rect(
+            display,
+            Point::new(cx as i32, cy as i32),
+            Size::new(cell_width, cell_height),
+            Rgb565::WHITE,
+        )
+        .ok();
     }
 
     // Composite the overlay (if any) on top of whatever was just painted. This
