@@ -47,6 +47,11 @@ pub fn current_proc() -> ProcHandle {
     CURRENT.get().lock(|cell| Arc::clone(&*cell.borrow()))
 }
 
+/// Erase whatever single-line prompt may have been printed on the current line.
+pub fn erase_prompt_line(screen: &mut Screen) {
+    write!(screen, "\r\u{1b}[K").ok();
+}
+
 #[async_trait::async_trait(?Send)]
 pub trait Process {
     async fn key_input(&self, key: KeyReport);
@@ -174,7 +179,7 @@ impl Process for LocalShell {
     }
 
     fn un_prompt(&self, screen: &mut Screen) {
-        write!(screen, "\r\u{1b}[K").ok();
+        erase_prompt_line(screen);
     }
 
     async fn key_input(&self, key: KeyReport) {

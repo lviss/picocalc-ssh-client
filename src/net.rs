@@ -2,7 +2,7 @@ use crate::Irqs;
 use crate::config::{CONFIG, StrValue};
 use crate::keyboard::{Key, KeyReport, KeyState, Modifiers};
 use crate::net::alloc::string::ToString;
-use crate::process::{LineEditor, Process, assign_proc, assign_proc_if};
+use crate::process::{LineEditor, Process, assign_proc, assign_proc_if, erase_prompt_line};
 use crate::rng::PicoRng;
 use crate::screen::{SCREEN, SCREEN_HEIGHT, SCREEN_WIDTH, Screen};
 use alloc::boxed::Box;
@@ -525,7 +525,7 @@ async fn prompt_for_input(prompt: &str, kind: PromptKind) -> Option<String> {
         }
 
         fn un_prompt(&self, screen: &mut Screen) {
-            write!(screen, "\r\u{1b}[K").ok();
+            erase_prompt_line(screen);
         }
 
         async fn key_input(&self, key: KeyReport) {
@@ -713,7 +713,6 @@ impl Process for SshProcess {
         "ssh"
     }
     async fn render(&self) {}
-    fn un_prompt(&self, _screen: &mut Screen) {}
     async fn key_input(&self, key: KeyReport) {
         if key.state != KeyState::Pressed {
             return;
