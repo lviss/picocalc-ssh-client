@@ -1,20 +1,28 @@
 name: Build
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.3)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  build-pr:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chip: [pico2w, pimoroni2w]
 
     steps:
     - uses: actions/checkout@v4
@@ -30,19 +38,59 @@ jobs:
         cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
         make
     - name: Build
-      run: make image
+      run: make CHIP=${{ matrix.chip }} image
+    - name: Rename artifact
+      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}.uf2
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        path: "wezterm-*.uf2"
-    - name: zip for dev release
-      # Use a singular (non-version-dependent) name so that we don't need to
-      # wrange retention processing in the release
-      run: 7z a -tzip wezterm-picocalc.zip wezterm-*.uf2
-    - name: Upload Release Asset
-      uses: softprops/action-gh-release@v2
-      if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        name: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}
+        path: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}.uf2
+
+  build-release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chip: [pico2w, pimoroni2w]
+
+    steps:
+    - uses: actions/checkout@v4
       with:
-        tag_name: dev
-        files: |
-          wezterm-picocalc.zip
+        submodules: recursive
+    - name: Prepare
+      run: |
+        rustup +nightly target add thumbv8m.main-none-eabihf
+        cargo install flip-link
+        export PICO_SDK_PATH=$PWD/pico-sdk
+        mkdir -p picotool/build
+        cd picotool/build
+        cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+        make
+    - name: Build
+      run: make CHIP=${{ matrix.chip }} image
+    - name: Rename artifact
+      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}.uf2
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}
+        path: picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}.uf2
+
+  publish-release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.version }}
+        name: ${{ github.event.inputs.version }}
+        files: artifacts/**/*.uf2
