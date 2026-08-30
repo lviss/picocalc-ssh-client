@@ -735,35 +735,6 @@ impl Process for SshProcess {
     }
 }
 
-/*
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
-use heapless::{FnvIndexSet, String};
-type WifiSet = FnvIndexSet<String<32>, 16>;
-use embassy_sync::lazy_lock::LazyLock;
-use embassy_sync::mutex::Mutex as AsyncMutex;
-static NETWORKS: LazyLock<AsyncMutex<CriticalSectionRawMutex, WifiSet>> =
-    LazyLock::new(|| AsyncMutex::new(WifiSet::new()));
-
-#[embassy_executor::task]
-async fn wifi_scanner(mut control: Control<'static>) {
-    let mut scanner = control.scan(Default::default()).await;
-
-    while let Some(bss) = scanner.next().await {
-        if bss.ssid_len == 0 {
-            continue;
-        }
-        if let Ok(ssid_str) = core::str::from_utf8(&bss.ssid[0..bss.ssid_len as usize]) {
-            if let Ok(ssid) = String::try_from(ssid_str) {
-                if let Ok(true) = NETWORKS.get().lock().await.insert(ssid) {
-                    log::info!("wifi: {ssid_str} = {:x?}", bss.bssid);
-                    write!(SCREEN.get().lock().await, "wifi: {ssid_str}\r\n",).ok();
-                }
-            }
-        }
-    }
-}
-*/
-
 /// Map c to its Ctrl equivalent.
 /// This mapping translates characters to their control code equivalents.
 /// It includes standard alpha mappings (masking with 0x1f) and common
