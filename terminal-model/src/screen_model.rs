@@ -302,6 +302,12 @@ fn cursor_pos_index(param: Option<&[u16]>) -> usize {
     param.map(|p| p[0]).unwrap_or(1).max(1) as usize - 1
 }
 
+/// Reads the mode parameter shared by the Erase in Display (J) and Erase in
+/// Line (K) CSI sequences, defaulting to 0 when absent.
+fn erase_mode(params: &vte::Params) -> u16 {
+    params.iter().next().map(|p| p[0]).unwrap_or(0)
+}
+
 impl Perform for ScreenModel {
     fn print(&mut self, c: char) {
         self.reset_view();
@@ -397,7 +403,7 @@ impl Perform for ScreenModel {
             }
             'J' => {
                 // Erase in Display
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let n = erase_mode(params);
                 match n {
                     0 => {
                         // Cursor to end
@@ -428,7 +434,7 @@ impl Perform for ScreenModel {
             }
             'K' => {
                 // Erase in Line
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let n = erase_mode(params);
                 let attrs = self.current_attrs;
                 let line = &mut self.lines[self.cursor_y];
                 match n {
