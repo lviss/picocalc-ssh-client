@@ -38,22 +38,31 @@ pub async fn assign_proc_if(
 }
 
 pub async fn assign_proc(proc: ProcHandle) -> ProcHandle {
-    let prior = CURRENT
-        .get()
-        .lock(|current| core::mem::replace(&mut *current.borrow_mut(), proc.clone()));
-
-    prior.un_prompt(&mut *SCREEN.get().lock().await);
-    proc.render().await;
-    prior
+    assign_proc_if(proc, |_| true)
+        .await
+        .expect("a condition of |_| true always succeeds")
 }
 
 pub fn current_proc() -> ProcHandle {
     CURRENT.get().lock(|cell| Arc::clone(&*cell.borrow()))
 }
 
+/// Erase whatever single-line prompt may have been printed on the current line.
+pub fn erase_prompt_line(screen: &mut Screen) {
+    write!(screen, "\r\u{1b}[K").ok();
+}
+
 #[async_trait::async_trait(?Send)]
 pub trait Process {
-    async fn key_input(&self, key: KeyReport);
+    /// Handles a key event, ignoring anything but a press.
+    async fn key_input(&self, key: KeyReport) {
+        if key.state == KeyState::Pressed {
+            self.on_key_press(key).await;
+        }
+    }
+
+    /// Handles a key press. Only called for `KeyState::Pressed` events.
+    async fn on_key_press(&self, key: KeyReport);
     async fn render(&self);
 
     fn name(&self) -> &str;
@@ -178,14 +187,10 @@ impl Process for LocalShell {
     }
 
     fn un_prompt(&self, screen: &mut Screen) {
-        write!(screen, "\r\u{1b}[K").ok();
+        erase_prompt_line(screen);
     }
 
-    async fn key_input(&self, key: KeyReport) {
-        if key.state != KeyState::Pressed {
-            return;
-        }
-
+    async fn on_key_press(&self, key: KeyReport) {
         // Take care with the scoping, as the write! call
         // below can call through to un_prompt and render
         // and attempt to acquire self.command.lock()

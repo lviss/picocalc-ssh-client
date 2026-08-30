@@ -66,36 +66,30 @@ impl Color {
             Color::DefaultFg => Rgb565::CSS_LIGHT_GRAY,
             Color::DefaultBg => Rgb565::BLACK,
             Color::Rgb(r, g, b) => Rgb888::new(r, g, b).into(),
-            Color::Indexed(i) => {
-                // Simple mapping for first 16 colors, else default
-                if i < 8 {
-                    // map to standard colors
-                    match i {
-                        0 => Rgb565::BLACK,
-                        1 => Rgb565::RED,
-                        2 => Rgb565::GREEN,
-                        3 => Rgb565::YELLOW,
-                        4 => Rgb565::BLUE,
-                        5 => Rgb565::MAGENTA,
-                        6 => Rgb565::CYAN,
-                        7 => Rgb565::CSS_LIGHT_GRAY,
-                        _ => Rgb565::WHITE,
-                    }
-                } else if i < 16 {
-                    // brights
-                    match i {
-                        8 => Rgb565::new(10, 20, 10),
-                        9 => Rgb565::new(31, 20, 20),
-                        10 => Rgb565::new(20, 63, 20),
-                        11 => Rgb565::new(31, 63, 20),
-                        12 => Rgb565::new(20, 20, 31),
-                        13 => Rgb565::new(31, 20, 31),
-                        14 => Rgb565::new(20, 63, 31),
-                        15 => Rgb565::WHITE,
-                        _ => Rgb565::WHITE,
-                    }
+            // Simple mapping for the first 16 colors (the standard ANSI palette
+            // plus its bright variants), else default. Delegates to the named
+            // variants above rather than repeating their Rgb565 values here.
+            Color::Indexed(0) => Color::Black.to_rgb565(is_bg),
+            Color::Indexed(1) => Color::Red.to_rgb565(is_bg),
+            Color::Indexed(2) => Color::Green.to_rgb565(is_bg),
+            Color::Indexed(3) => Color::Yellow.to_rgb565(is_bg),
+            Color::Indexed(4) => Color::Blue.to_rgb565(is_bg),
+            Color::Indexed(5) => Color::Magenta.to_rgb565(is_bg),
+            Color::Indexed(6) => Color::Cyan.to_rgb565(is_bg),
+            Color::Indexed(7) => Rgb565::CSS_LIGHT_GRAY,
+            Color::Indexed(8) => Color::BrightBlack.to_rgb565(is_bg),
+            Color::Indexed(9) => Color::BrightRed.to_rgb565(is_bg),
+            Color::Indexed(10) => Color::BrightGreen.to_rgb565(is_bg),
+            Color::Indexed(11) => Color::BrightYellow.to_rgb565(is_bg),
+            Color::Indexed(12) => Color::BrightBlue.to_rgb565(is_bg),
+            Color::Indexed(13) => Color::BrightMagenta.to_rgb565(is_bg),
+            Color::Indexed(14) => Color::BrightCyan.to_rgb565(is_bg),
+            Color::Indexed(15) => Color::BrightWhite.to_rgb565(is_bg),
+            Color::Indexed(_) => {
+                if is_bg {
+                    Rgb565::BLACK
                 } else {
-                    if is_bg { Rgb565::BLACK } else { Rgb565::WHITE }
+                    Rgb565::WHITE
                 }
             }
         }
@@ -145,6 +139,15 @@ impl ScreenLine {
         }
         for a in self.attrs.iter_mut() {
             *a = Attrs::default();
+        }
+        self.dirty = true;
+    }
+
+    /// Blanks `[start, end)` with `attrs` and marks the line dirty.
+    fn erase(&mut self, start: usize, end: usize, attrs: Attrs) {
+        for i in start..end {
+            self.chars[i] = ' ';
+            self.attrs[i] = attrs;
         }
         self.dirty = true;
     }
@@ -238,6 +241,15 @@ impl ScreenModel {
         }
     }
 
+    /// Scrolls up by one line if the cursor has moved past the last row,
+    /// clamping it back onto the newly revealed bottom row.
+    fn scroll_if_cursor_past_bottom(&mut self) {
+        if self.cursor_y >= self.rows {
+            self.scroll_up();
+            self.cursor_y = self.rows - 1;
+        }
+    }
+
     pub fn scroll_view_up(&mut self, n: usize) {
         self.viewport_offset = (self.viewport_offset + n).min(self.scrollback.len());
         self.full_repaint = true;
@@ -293,20 +305,26 @@ fn cursor_move_count(params: &vte::Params) -> usize {
     params.iter().next().map(|p| p[0]).unwrap_or(0).max(1) as usize
 }
 
+/// Reads a 1-based CSI position parameter (defaulting to 1) and converts it
+/// to a 0-based index, as used by cursor-positioning sequences like CUP/VPA.
+fn cursor_pos_index(param: Option<&[u16]>) -> usize {
+    param.map(|p| p[0]).unwrap_or(1).max(1) as usize - 1
+}
+
+/// Reads the mode parameter shared by the Erase in Display (J) and Erase in
+/// Line (K) CSI sequences, defaulting to 0 when absent.
+fn erase_mode(params: &vte::Params) -> u16 {
+    params.iter().next().map(|p| p[0]).unwrap_or(0)
+}
+
 impl Perform for ScreenModel {
     fn print(&mut self, c: char) {
         self.reset_view();
-        if self.cursor_y >= self.rows {
-            self.scroll_up();
-            self.cursor_y = self.rows - 1;
-        }
+        self.scroll_if_cursor_past_bottom();
         if self.cursor_x >= self.cols {
             self.cursor_x = 0;
             self.cursor_y += 1;
-            if self.cursor_y >= self.rows {
-                self.scroll_up();
-                self.cursor_y = self.rows - 1;
-            }
+            self.scroll_if_cursor_past_bottom();
         }
 
         let line = &mut self.lines[self.cursor_y];
@@ -324,10 +342,7 @@ impl Perform for ScreenModel {
             b'\n' => {
                 // LF
                 self.cursor_y += 1;
-                if self.cursor_y >= self.rows {
-                    self.scroll_up();
-                    self.cursor_y = self.rows - 1;
-                }
+                self.scroll_if_cursor_past_bottom();
             }
             b'\r' => {
                 // CR
@@ -376,29 +391,25 @@ impl Perform for ScreenModel {
             'H' | 'f' => {
                 // Cursor Position
                 let mut iter = params.iter();
-                let row = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
-                let col = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
+                let row = cursor_pos_index(iter.next());
+                let col = cursor_pos_index(iter.next());
                 self.cursor_y = row.min(self.rows - 1);
                 self.cursor_x = col.min(self.cols - 1);
             }
             'd' => {
                 // Line Position Absolute (VPA): move to row Pn, column unchanged.
-                let row = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
+                let row = cursor_pos_index(params.iter().next());
                 self.cursor_y = row.min(self.rows - 1);
             }
             'J' => {
                 // Erase in Display
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let n = erase_mode(params);
                 match n {
                     0 => {
                         // Cursor to end
                         // Clear current line from cursor
-                        let line = &mut self.lines[self.cursor_y];
-                        for i in self.cursor_x..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                        line.dirty = true;
+                        let attrs = self.current_attrs;
+                        self.lines[self.cursor_y].erase(self.cursor_x, self.cols, attrs);
                         // Clear lines below
                         for i in (self.cursor_y + 1)..self.rows {
                             self.lines[i].clear();
@@ -411,12 +422,8 @@ impl Perform for ScreenModel {
                             self.lines[i].clear();
                         }
                         // Clear current line up to cursor
-                        let line = &mut self.lines[self.cursor_y];
-                        for i in 0..=self.cursor_x {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                        line.dirty = true;
+                        let attrs = self.current_attrs;
+                        self.lines[self.cursor_y].erase(0, self.cursor_x + 1, attrs);
                     }
                     2 => {
                         // Entire screen
@@ -427,30 +434,13 @@ impl Perform for ScreenModel {
             }
             'K' => {
                 // Erase in Line
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let n = erase_mode(params);
+                let attrs = self.current_attrs;
                 let line = &mut self.lines[self.cursor_y];
                 match n {
-                    0 => {
-                        // Cursor to end
-                        for i in self.cursor_x..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
-                    1 => {
-                        // Beginning to cursor
-                        for i in 0..=self.cursor_x {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
-                    2 => {
-                        // Entire line
-                        for i in 0..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
+                    0 => line.erase(self.cursor_x, self.cols, attrs), // Cursor to end
+                    1 => line.erase(0, self.cursor_x + 1, attrs),     // Beginning to cursor
+                    2 => line.erase(0, self.cols, attrs),             // Entire line
                     _ => {}
                 }
                 line.dirty = true;

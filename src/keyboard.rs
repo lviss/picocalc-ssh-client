@@ -41,7 +41,7 @@ impl From<u8> for KeyState {
             1 => Self::Pressed,
             2 => Self::Hold,
             3 => Self::Released,
-            0 | _ => Self::Idle,
+            _ => Self::Idle,
         }
     }
 }
@@ -177,6 +177,19 @@ pub struct KeyBoardState {
     modifiers: Modifiers,
 }
 
+/// Maps a modifier key to the Modifiers flag it controls, or None if
+/// the key is not a modifier.
+fn modifier_flag(key: Key) -> Option<Modifiers> {
+    match key {
+        Key::ModAlt => Some(Modifiers::ALT),
+        Key::ModControl => Some(Modifiers::CTRL),
+        Key::ModShiftLeft => Some(Modifiers::LSHIFT),
+        Key::ModShiftRight => Some(Modifiers::RSHIFT),
+        Key::ModSymbol => Some(Modifiers::SYM),
+        _ => None,
+    }
+}
+
 impl KeyBoardState {
     pub async fn process(&mut self) -> Option<KeyReport> {
         let key = read_keyboard().await.ok()?;
@@ -188,20 +201,10 @@ impl KeyBoardState {
         let (state, key) = key;
         match (state, key) {
             (KeyState::Idle, Key::None) => return None,
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModAlt) => {
-                self.modifiers.set(Modifiers::ALT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModControl) => {
-                self.modifiers.set(Modifiers::CTRL, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftLeft) => {
-                self.modifiers.set(Modifiers::LSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftRight) => {
-                self.modifiers.set(Modifiers::RSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModSymbol) => {
-                self.modifiers.set(Modifiers::SYM, s == KeyState::Hold);
+            (s @ (KeyState::Hold | KeyState::Released), key) => {
+                if let Some(flag) = modifier_flag(key) {
+                    self.modifiers.set(flag, s == KeyState::Hold);
+                }
             }
             _ => {}
         }
@@ -213,57 +216,46 @@ impl KeyBoardState {
     }
 }
 
+async fn write_reg(reg: u8, value: u8) {
+    let mut i2c_bus = I2C.get().lock().await;
+    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
+    let _ = i2c_bus
+        .write_async(KBD_ADDR, [reg | REG_WRITE, value])
+        .await;
+}
+
+async fn read_reg(reg: u8) -> Result<u8, embassy_rp::i2c::Error> {
+    let mut i2c_bus = I2C.get().lock().await;
+    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
+    let mut buf = [0u8; 2];
+    i2c_bus.write_read_async(KBD_ADDR, [reg], &mut buf).await?;
+    Ok(buf[1])
+}
+
 /// Control the lcd backlight brightness level.
 /// The firmware uses the value as a pwm signal at 10_000 Hz.
 /// https://github.com/clockworkpi/PicoCalc/blob/939b9bbad9030655a35ff07062024691abb12240/Code/picocalc_keyboard/backlight.ino#L20-L31
 pub async fn set_lcd_backlight(level: u8) {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let _ = i2c_bus
-        .write_async(KBD_ADDR, [REG_ID_BKL | REG_WRITE, level])
-        .await;
+    write_reg(REG_ID_BKL, level).await;
 }
 
 pub async fn get_lcd_backlight() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BKL], &mut buf)
-        .await?;
-    Ok(buf[1])
+    read_reg(REG_ID_BKL).await
 }
 
 /// Control the keyboard backlight brightness level.
 /// The firmware uses the value as a pwm signal at 10_000 Hz.
 /// Values < 20 turn off the keyboard backlight
 pub async fn set_keyboard_backlight(level: u8) {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let _ = i2c_bus
-        .write_async(KBD_ADDR, [REG_ID_BK2 | REG_WRITE, level])
-        .await;
+    write_reg(REG_ID_BK2, level).await;
 }
 
 pub async fn get_keyboard_backlight() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BK2], &mut buf)
-        .await?;
-    Ok(buf[1])
+    read_reg(REG_ID_BK2).await
 }
 
 async fn read_battery_pct() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BAT], &mut buf)
-        .await?;
-
-    Ok(buf[1])
+    read_reg(REG_ID_BAT).await
 }
 
 async fn read_keyboard() -> Result<(KeyState, Key), embassy_rp::i2c::Error> {
@@ -375,11 +367,12 @@ pub async fn keyboard_reader(
                     }
                     _ => {
                         let proc = current_proc();
-                        if let Err(_) = with_timeout(Duration::from_millis(100), async {
+                        if with_timeout(Duration::from_millis(100), async {
                             proc.key_input(key).await;
                             proc.render().await;
                         })
                         .await
+                        .is_err()
                         {
                             log::info!("timeout sending key to proc {}", proc.name());
                         }

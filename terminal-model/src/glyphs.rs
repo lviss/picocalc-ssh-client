@@ -53,6 +53,42 @@ where
             .ok();
     };
 
+    // Helper to draw an arc (used by the rounded-corner glyphs below)
+    let arc = |display: &mut D, arc: Arc| {
+        arc.into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+    };
+
+    // Helper to draw a heavy (stroke-2) line, used by the bold box-drawing glyphs
+    let heavy_line = |display: &mut D, x0, y0, x1, y1| {
+        Line::new(Point::new(x0, y0), Point::new(x1, y1))
+            .into_styled(PrimitiveStyle::with_stroke(color, 2))
+            .draw(display)
+            .ok();
+    };
+
+    // Half-segments from the glyph center to each edge, used by the light
+    // single-line box-drawing junction glyphs below (┌┐└┘├┤┬┴┼).
+    let left = |display: &mut D| line(display, x, cy, cx, cy);
+    let right = |display: &mut D| line(display, cx, cy, x + w as i32, cy);
+    let up = |display: &mut D| line(display, cx, y, cx, cy);
+    let down = |display: &mut D| line(display, cx, cy, cx, y + h as i32);
+
+    // Helpers for the double-line corner glyphs below: a double-stroke vertical
+    // segment spanning either the top or bottom half, and a double-stroke
+    // horizontal segment spanning either the left or right half.
+    let vert_double = |display: &mut D, down: bool| {
+        let (y0, y1) = if down { (cy, y + h as i32) } else { (y, cy) };
+        line(display, cx - 1, y0, cx - 1, y1);
+        line(display, cx + 1, y0, cx + 1, y1);
+    };
+    let horiz_double = |display: &mut D, right: bool| {
+        let (x0, x1) = if right { (cx, x + w as i32) } else { (x, cx) };
+        line(display, x0, cy - 1, x1, cy - 1);
+        line(display, x0, cy + 1, x1, cy + 1);
+    };
+
     match c {
         // Light horizontal
         '\u{2500}' => line(display, x, cy, x + w as i32, cy),
@@ -60,63 +96,59 @@ where
         '\u{2502}' => line(display, cx, y, cx, y + h as i32),
         // Light down and right
         '\u{250C}' => {
-            line(display, cx, cy, x + w as i32, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            right(display);
+            down(display);
         }
         // Light down and left
         '\u{2510}' => {
-            line(display, x, cy, cx, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            left(display);
+            down(display);
         }
         // Light up and right
         '\u{2514}' => {
-            line(display, cx, cy, x + w as i32, cy);
-            line(display, cx, y, cx, cy);
+            right(display);
+            up(display);
         }
         // Light up and left
         '\u{2518}' => {
-            line(display, x, cy, cx, cy);
-            line(display, cx, y, cx, cy);
+            left(display);
+            up(display);
         }
         // Light vertical and right
         '\u{251C}' => {
-            line(display, cx, y, cx, y + h as i32);
-            line(display, cx, cy, x + w as i32, cy);
+            up(display);
+            down(display);
+            right(display);
         }
         // Light vertical and left
         '\u{2524}' => {
-            line(display, cx, y, cx, y + h as i32);
-            line(display, x, cy, cx, cy);
+            up(display);
+            down(display);
+            left(display);
         }
         // Light horizontal and down
         '\u{252C}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            left(display);
+            right(display);
+            down(display);
         }
         // Light horizontal and up
         '\u{2534}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, y, cx, cy);
+            left(display);
+            right(display);
+            up(display);
         }
         // Light vertical and horizontal
         '\u{253C}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, y, cx, y + h as i32);
+            left(display);
+            right(display);
+            up(display);
+            down(display);
         }
         // Heavy horizontal
-        '\u{2501}' => {
-            Line::new(Point::new(x, cy), Point::new(x + w as i32, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 2))
-                .draw(display)
-                .ok();
-        }
+        '\u{2501}' => heavy_line(display, x, cy, x + w as i32, cy),
         // Heavy vertical
-        '\u{2503}' => {
-            Line::new(Point::new(cx, y), Point::new(cx, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 2))
-                .draw(display)
-                .ok();
-        }
+        '\u{2503}' => heavy_line(display, cx, y, cx, y + h as i32),
         // Block
         '\u{2588}' => {
             display
@@ -149,57 +181,57 @@ where
         // Rounded corners
         '\u{256D}' => {
             // Top-left
-            Arc::new(
-                Point::new(x + w as i32 / 2, y + h as i32 / 2),
-                w,
-                Angle::from_degrees(180.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x + w as i32 / 2, y + h as i32 / 2),
+                    w,
+                    Angle::from_degrees(180.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
         '\u{256E}' => {
             // Top-right
-            Arc::new(
-                Point::new(x - w as i32 / 2, y + h as i32 / 2),
-                w,
-                Angle::from_degrees(270.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x - w as i32 / 2, y + h as i32 / 2),
+                    w,
+                    Angle::from_degrees(270.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
         '\u{2570}' => {
             // Bottom-left
-            Arc::new(
-                Point::new(x + w as i32 / 2, y - h as i32 / 2),
-                w,
-                Angle::from_degrees(90.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x + w as i32 / 2, y - h as i32 / 2),
+                    w,
+                    Angle::from_degrees(90.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
         '\u{256F}' => {
             // Bottom-right
-            Arc::new(
-                Point::new(x - w as i32 / 2, y - h as i32 / 2),
-                w,
-                Angle::from_degrees(0.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x - w as i32 / 2, y - h as i32 / 2),
+                    w,
+                    Angle::from_degrees(0.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
@@ -207,102 +239,34 @@ where
         // Double lines
         '\u{2550}' => {
             // Horizontal double
-            Line::new(Point::new(x, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, x, cy - 1, x + w as i32, cy - 1);
+            line(display, x, cy + 1, x + w as i32, cy + 1);
         }
         '\u{2551}' => {
             // Vertical double
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, y, cx - 1, y + h as i32);
+            line(display, cx + 1, y, cx + 1, y + h as i32);
         }
         // Double corners (simplified as single heavy for now to save space/complexity, or proper implementation)
         '\u{2554}' => {
             // Double down-right
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            vert_double(display, true);
+            horiz_double(display, true);
         }
         '\u{2557}' => {
             // Double down-left
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            vert_double(display, true);
+            horiz_double(display, false);
         }
         '\u{255A}' => {
             // Double up-right
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            vert_double(display, false);
+            horiz_double(display, true);
         }
         '\u{255D}' => {
             // Double up-left
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            vert_double(display, false);
+            horiz_double(display, false);
         }
 
         _ => {
@@ -350,6 +314,43 @@ where
             .ok();
     };
 
+    // Draws a shaft from `tail` to `tip` plus a two-line arrowhead at `tip`,
+    // shared by the four directional arrow glyphs below.
+    let arrow = |display: &mut D, tail: Point, tip: Point, head1: Point, head2: Point| {
+        line(display, tail.x, tail.y, tip.x, tip.y, 1);
+        line(display, tip.x, tip.y, head1.x, head1.y, 1);
+        line(display, tip.x, tip.y, head2.x, head2.y, 1);
+    };
+
+    // Draws a plain cross (horizontal + vertical spoke), shared by the
+    // four-teardrop-spoked asterisk and as the base of the burst pattern below.
+    let cross = |display: &mut D, stroke| {
+        line(display, x + 1, cy, x + w as i32 - 1, cy, stroke);
+        line(display, cx, y + 1, cx, y + h as i32 - 1, stroke);
+    };
+
+    // Draws the 4-spoke asterisk burst (cross + diagonals) shared by the
+    // eight-spoked, teardrop-spoked, and heavy-teardrop-spoked asterisk glyphs.
+    let burst = |display: &mut D, stroke| {
+        cross(display, stroke);
+        line(
+            display,
+            x + 2,
+            y + 2,
+            x + w as i32 - 2,
+            y + h as i32 - 2,
+            stroke,
+        );
+        line(
+            display,
+            x + w as i32 - 2,
+            y + 2,
+            x + 2,
+            y + h as i32 - 2,
+            stroke,
+        );
+    };
+
     match c {
         // ❯ prompt chevron: a right-pointing angle bracket
         '\u{276F}' => {
@@ -378,89 +379,36 @@ where
             }
         }
         // ← → ↑ ↓ arrows: a shaft plus a small arrowhead
-        '\u{2190}' => {
-            line(display, x + w as i32 - 2, cy, x + 2, cy, 1);
-            line(
-                display,
-                x + 2,
-                cy,
-                x + 2 + w as i32 / 3,
-                cy - h as i32 / 4,
-                1,
-            );
-            line(
-                display,
-                x + 2,
-                cy,
-                x + 2 + w as i32 / 3,
-                cy + h as i32 / 4,
-                1,
-            );
-        }
-        '\u{2192}' => {
-            line(display, x + 2, cy, x + w as i32 - 2, cy, 1);
-            line(
-                display,
-                x + w as i32 - 2,
-                cy,
-                x + w as i32 - 2 - w as i32 / 3,
-                cy - h as i32 / 4,
-                1,
-            );
-            line(
-                display,
-                x + w as i32 - 2,
-                cy,
-                x + w as i32 - 2 - w as i32 / 3,
-                cy + h as i32 / 4,
-                1,
-            );
-        }
-        '\u{2191}' => {
-            line(display, cx, y + h as i32 - 2, cx, y + 2, 1);
-            line(
-                display,
-                cx,
-                y + 2,
-                cx - w as i32 / 4,
-                y + 2 + h as i32 / 3,
-                1,
-            );
-            line(
-                display,
-                cx,
-                y + 2,
-                cx + w as i32 / 4,
-                y + 2 + h as i32 / 3,
-                1,
-            );
-        }
-        '\u{2193}' => {
-            line(display, cx, y + 2, cx, y + h as i32 - 2, 1);
-            line(
-                display,
-                cx,
-                y + h as i32 - 2,
-                cx - w as i32 / 4,
-                y + h as i32 - 2 - h as i32 / 3,
-                1,
-            );
-            line(
-                display,
-                cx,
-                y + h as i32 - 2,
-                cx + w as i32 / 4,
-                y + h as i32 - 2 - h as i32 / 3,
-                1,
-            );
-        }
+        '\u{2190}' => arrow(
+            display,
+            Point::new(x + w as i32 - 2, cy),
+            Point::new(x + 2, cy),
+            Point::new(x + 2 + w as i32 / 3, cy - h as i32 / 4),
+            Point::new(x + 2 + w as i32 / 3, cy + h as i32 / 4),
+        ),
+        '\u{2192}' => arrow(
+            display,
+            Point::new(x + 2, cy),
+            Point::new(x + w as i32 - 2, cy),
+            Point::new(x + w as i32 - 2 - w as i32 / 3, cy - h as i32 / 4),
+            Point::new(x + w as i32 - 2 - w as i32 / 3, cy + h as i32 / 4),
+        ),
+        '\u{2191}' => arrow(
+            display,
+            Point::new(cx, y + h as i32 - 2),
+            Point::new(cx, y + 2),
+            Point::new(cx - w as i32 / 4, y + 2 + h as i32 / 3),
+            Point::new(cx + w as i32 / 4, y + 2 + h as i32 / 3),
+        ),
+        '\u{2193}' => arrow(
+            display,
+            Point::new(cx, y + 2),
+            Point::new(cx, y + h as i32 - 2),
+            Point::new(cx - w as i32 / 4, y + h as i32 - 2 - h as i32 / 3),
+            Point::new(cx + w as i32 / 4, y + h as i32 - 2 - h as i32 / 3),
+        ),
         // ✳ eight spoked asterisk: burst of lines through the center
-        '\u{2733}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
-        }
+        '\u{2733}' => burst(display, 1),
         // ⏵ auto-mode triangle: small filled right-pointing triangle (play-button style)
         '\u{23F5}' => {
             let x0 = x + w as i32 / 4;
@@ -477,10 +425,7 @@ where
         // – en dash: a shorter horizontal line, roughly half the cell width
         '\u{2013}' => line(display, x + w as i32 / 4, cy, x + (w as i32 * 3) / 4, cy, 1),
         // ✢ four teardrop-spoked asterisk: a plain cross (4 spokes, no diagonals)
-        '\u{2722}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-        }
+        '\u{2722}' => cross(display, 1),
         // ✶ six pointed black star: three lines through the center, spaced apart
         '\u{2736}' => {
             line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
@@ -502,19 +447,9 @@ where
             );
         }
         // ✻ teardrop-spoked asterisk: same burst treatment as the eight-spoked asterisk
-        '\u{273B}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
-        }
+        '\u{273B}' => burst(display, 1),
         // ✽ heavy teardrop-spoked asterisk: the same burst, drawn with a heavier stroke
-        '\u{273D}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 2);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 2);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 2);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 2);
-        }
+        '\u{273D}' => burst(display, 2),
         _ => {}
     }
 }

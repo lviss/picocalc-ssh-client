@@ -52,6 +52,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   the way through codegen; only the final link step needs `flip-link`, which may not be installed
   in every environment (`cargo install flip-link` needs network/build tools) — that's a linker
   availability gap, not a code problem, if it's the only failure.
+- On a NixOS-style agent sandbox where plain `cargo`/`rustc` aren't on `PATH`, the working
+  toolchain lives under `$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu/bin` (set
+  `RUSTUP_HOME=/home/ai/.rustup` and prepend that dir to `PATH`); building anything host-targeted
+  (build scripts, proc-macros, or the `terminal-model` host tests) also needs a C linker, which
+  isn't present by default — `nix-shell -p gcc --run '<cargo command>'` supplies one. `cargo check
+  --features <chip>` on the root package additionally needs the `embassy` git submodule checked
+  out (`git submodule update --init embassy`) because `src/net.rs` embeds cyw43 firmware blobs
+  from it via `include_bytes!`; `pico-sdk`/`picotool` are unrelated C build tooling and don't need
+  to be initialized for a Rust-only check/build.
 
 ## Maintaining this file
 

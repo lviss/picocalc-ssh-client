@@ -6,12 +6,11 @@ use core::ops::{Deref, DerefMut};
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_rp::gpio::Output;
 use embassy_rp::peripherals::SPI1;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex as AsyncMutex;
 use embassy_time::{Duration, Instant, Ticker};
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyleBuilder};
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
@@ -96,11 +95,11 @@ impl Screen {
     }
 
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
-        if let Some(expiry) = self.overlay_expiry {
-            if Instant::now() >= expiry {
-                self.overlay_expiry = None;
-                self.model.clear_overlay();
-            }
+        if let Some(expiry) = self.overlay_expiry
+            && Instant::now() >= expiry
+        {
+            self.overlay_expiry = None;
+            self.model.clear_overlay();
         }
         update_display(&mut self.model, display);
     }
@@ -111,6 +110,27 @@ impl fmt::Write for Screen {
         self.print(s);
         Ok(())
     }
+}
+
+fn text_style(
+    font: &'static MonoFont<'static>,
+    fg: Rgb565,
+    bg: Rgb565,
+) -> MonoTextStyle<'static, Rgb565> {
+    MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(fg)
+        .background_color(bg)
+        .build()
+}
+
+fn fill_rect<'a>(
+    display: &mut PicoCalcDisplay<'a>,
+    point: Point,
+    size: Size,
+    color: Rgb565,
+) -> Result<(), <PicoCalcDisplay<'a> as DrawTarget>::Error> {
+    display.fill_solid(&Rectangle::new(point, size), color)
 }
 
 fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
@@ -152,7 +172,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             continue;
         }
 
-        let row_y = y as u32 * cell_height as u32;
+        let row_y = y as u32 * cell_height;
         if row_y >= SCREEN_HEIGHT as u32 {
             break;
         }
@@ -178,23 +198,17 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             }
 
             // Draw background
-            display
-                .fill_solid(
-                    &Rectangle::new(
-                        Point::new(col_x as i32, row_y as i32),
-                        Size::new(cell_width, cell_height as u32),
-                    ),
-                    bg,
-                )
-                .unwrap();
+            fill_rect(
+                display,
+                Point::new(col_x as i32, row_y as i32),
+                Size::new(cell_width, cell_height),
+                bg,
+            )
+            .unwrap();
 
             // Draw text
             if *char != ' ' {
-                let style = MonoTextStyleBuilder::new()
-                    .font(font)
-                    .text_color(fg)
-                    .background_color(bg)
-                    .build();
+                let style = text_style(font, fg, bg);
 
                 // We need to handle char string
                 let mut buf = [0u8; 4];
@@ -207,7 +221,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                         col_x as i32,
                         row_y as i32,
                         cell_width,
-                        cell_height as u32,
+                        cell_height,
                         fg,
                     );
                 } else if is_symbol_char(*char) {
@@ -217,7 +231,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                         col_x as i32,
                         row_y as i32,
                         cell_width,
-                        cell_height as u32,
+                        cell_height,
                         fg,
                     );
                 } else {
@@ -232,15 +246,13 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             }
 
             if attr.underline {
-                display
-                    .fill_solid(
-                        &Rectangle::new(
-                            Point::new(col_x as i32, (row_y + cell_height as u32 - 1) as i32),
-                            Size::new(cell_width, 1),
-                        ),
-                        fg,
-                    )
-                    .unwrap();
+                fill_rect(
+                    display,
+                    Point::new(col_x as i32, (row_y + cell_height - 1) as i32),
+                    Size::new(cell_width, 1),
+                    fg,
+                )
+                .unwrap();
             }
         }
         line.dirty = false;
@@ -249,17 +261,15 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
     // Draw cursor
     let cx = model.cursor_x as u32 * cell_width;
-    let cy = model.cursor_y as u32 * cell_height as u32;
+    let cy = model.cursor_y as u32 * cell_height;
     if cx < SCREEN_WIDTH as u32 && cy < SCREEN_HEIGHT as u32 {
-        display
-            .fill_solid(
-                &Rectangle::new(
-                    Point::new(cx as i32, cy as i32),
-                    Size::new(cell_width, cell_height as u32),
-                ),
-                Rgb565::WHITE,
-            )
-            .ok();
+        fill_rect(
+            display,
+            Point::new(cx as i32, cy as i32),
+            Size::new(cell_width, cell_height),
+            Rgb565::WHITE,
+        )
+        .ok();
     }
 
     // Composite the overlay (if any) on top of whatever was just painted. This
@@ -272,7 +282,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     }
 }
 
-fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
+fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut PicoCalcDisplay) {
     const PADDING_X: i32 = 10;
     const PADDING_Y: i32 = 8;
 
@@ -300,11 +310,7 @@ fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
     .draw(display)
     .ok();
 
-    let style = MonoTextStyleBuilder::new()
-        .font(font)
-        .text_color(fg)
-        .background_color(bg)
-        .build();
+    let style = text_style(font, fg, bg);
     Text::new(
         text,
         Point::new(x + PADDING_X, y + PADDING_Y + font.baseline as i32),
@@ -317,9 +323,7 @@ fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
 #[embassy_executor::task]
 pub async fn screen_painter(mut display: PicoCalcDisplay<'static>) {
     display.clear(Rgb565::BLACK).unwrap();
-    if let Err(err) = display.set_vertical_scroll_region(0, 0) {
-        // log::error!("failed to set_vertical_scroll_region: {err:?}");
-    }
+    let _ = display.set_vertical_scroll_region(0, 0);
 
     let mut ticker = Ticker::every(Duration::from_millis(200));
     loop {

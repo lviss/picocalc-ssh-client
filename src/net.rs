@@ -1,8 +1,8 @@
 use crate::Irqs;
 use crate::config::{CONFIG, StrValue};
-use crate::keyboard::{Key, KeyReport, KeyState, Modifiers};
+use crate::keyboard::{Key, KeyReport, Modifiers};
 use crate::net::alloc::string::ToString;
-use crate::process::{LineEditor, Process, assign_proc, assign_proc_if};
+use crate::process::{LineEditor, Process, assign_proc, assign_proc_if, erase_prompt_line};
 use crate::rng::PicoRng;
 use crate::screen::{SCREEN, SCREEN_HEIGHT, SCREEN_WIDTH, Screen};
 use alloc::boxed::Box;
@@ -171,6 +171,13 @@ pub async fn setup_wifi(
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
+async fn send_key_bytes(channel: &mut ChanInOut<'_, '_>, bytes: &[u8]) {
+    log::info!(
+        "{:?}",
+        with_timeout(TIMEOUT_DURATION, channel.write_all(bytes)).await
+    );
+}
+
 async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS, KeyReport, 4>>) {
     log::info!("ssh_channel_task waiting for output");
 
@@ -198,48 +205,30 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
                 // Encode a key with xterm style keyboard encoding.
                 // FIXME: woefully incomplete!
 
-                if key_report.modifiers == Modifiers::CTRL {
-                    if let Key::Char(c) = key_report.key {
-                        if let Some(mapped) = ctrl_mapping(c) {
-                            log::info!(
-                                "doing mapped ctrl {} -> {}",
-                                c.escape_debug(),
-                                mapped.escape_debug()
-                            );
-                            let mut buf = [0u8; 4];
-                            log::info!(
-                                "{:?}",
-                                with_timeout(
-                                    TIMEOUT_DURATION,
-                                    channel.write_all(mapped.encode_utf8(&mut buf).as_bytes()),
-                                )
-                                .await
-                            );
-                            continue;
-                        }
-                    }
+                if key_report.modifiers == Modifiers::CTRL
+                    && let Key::Char(c) = key_report.key
+                    && let Some(mapped) = ctrl_mapping(c)
+                {
+                    log::info!(
+                        "doing mapped ctrl {} -> {}",
+                        c.escape_debug(),
+                        mapped.escape_debug()
+                    );
+                    let mut buf = [0u8; 4];
+                    send_key_bytes(&mut channel, mapped.encode_utf8(&mut buf).as_bytes()).await;
+                    continue;
                 }
 
                 if key_report.modifiers == Modifiers::ALT {
                     // Alt sends escape first
                     log::info!("ALT -> send escape first");
-                    log::info!(
-                        "{:?}",
-                        with_timeout(TIMEOUT_DURATION, channel.write_all(b"\x1b")).await
-                    );
+                    send_key_bytes(&mut channel, b"\x1b").await;
                 }
 
                 if let Key::Char(c) = key_report.key {
                     let mut buf = [0u8; 4];
                     log::info!("just sending {} as-is", c.escape_debug());
-                    log::info!(
-                        "{:?}",
-                        with_timeout(
-                            TIMEOUT_DURATION,
-                            channel.write_all(c.encode_utf8(&mut buf).as_bytes()),
-                        )
-                        .await
-                    );
+                    send_key_bytes(&mut channel, c.encode_utf8(&mut buf).as_bytes()).await;
                 } else {
                     let text = match key_report.key {
                         Key::Enter => "\r",
@@ -260,10 +249,7 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
                         }
                     };
                     log::info!("{key_report:?} -> {}", text.escape_debug());
-                    log::info!(
-                        "{:?}",
-                        with_timeout(TIMEOUT_DURATION, channel.write_all(text.as_bytes())).await
-                    );
+                    send_key_bytes(&mut channel, text.as_bytes()).await;
                 }
             }
         }
@@ -271,7 +257,12 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
 }
 
 #[embassy_executor::task]
-async fn ssh_session_task(host: String, port: u16, username: Option<String>, command: Option<String>) {
+async fn ssh_session_task(
+    host: String,
+    port: u16,
+    username: Option<String>,
+    command: Option<String>,
+) {
     let Some(stack) = STACK.get().lock().await.as_ref().copied() else {
         print!("network is offline\r\n");
         return;
@@ -421,7 +412,7 @@ async fn ssh_session_task(host: String, port: u16, username: Option<String>, com
                                         use heapless::{String, Vec};
 
                                         let mut term = String::<32>::new();
-                                        let _ = term.push_str("xterm").unwrap();
+                                        term.push_str("xterm").unwrap();
 
                                         let pty = {
                                             let screen = SCREEN.get().lock().await;
@@ -539,13 +530,10 @@ async fn prompt_for_input(prompt: &str, kind: PromptKind) -> Option<String> {
         }
 
         fn un_prompt(&self, screen: &mut Screen) {
-            write!(screen, "\r\u{1b}[K").ok();
+            erase_prompt_line(screen);
         }
 
-        async fn key_input(&self, key: KeyReport) {
-            if key.state != KeyState::Pressed {
-                return;
-            }
+        async fn on_key_press(&self, key: KeyReport) {
             use crate::keyboard::Modifiers;
             match (key.modifiers, key.key) {
                 (Modifiers::CTRL, Key::Char('c' | 'C' | 'd' | 'D')) | (_, Key::Escape) => {
@@ -588,12 +576,22 @@ fn alias_key(alias: &str) -> Option<heapless::String<32>> {
 /// otherwise returns `name` unchanged, to be parsed as a literal
 /// `[user@]host[:port]`.
 async fn resolve_target(name: &str) -> String {
-    if let Some(key) = alias_key(name) {
-        if let Ok(Some(value)) = CONFIG.get().lock().await.fetch(key.as_str()).await {
-            return value.as_str().to_string();
-        }
+    if let Some(key) = alias_key(name)
+        && let Ok(Some(value)) = CONFIG.get().lock().await.fetch(key.as_str()).await
+    {
+        return value.as_str().to_string();
     }
     name.to_string()
+}
+
+/// Like `alias_key`, but reports the "alias is too long" error itself when
+/// the alias doesn't fit, so callers only need to handle the `None` case.
+async fn alias_key_or_report(alias: &str) -> Option<heapless::String<32>> {
+    let key = alias_key(alias);
+    if key.is_none() {
+        print!("alias is too long\r\n");
+    }
+    key
 }
 
 async fn save_alias(alias: &str, dest: &str) {
@@ -601,8 +599,7 @@ async fn save_alias(alias: &str, dest: &str) {
         print!("'{alias}' is a reserved name\r\n");
         return;
     }
-    let Some(key) = alias_key(alias) else {
-        print!("alias is too long\r\n");
+    let Some(key) = alias_key_or_report(alias).await else {
         return;
     };
     let value: StrValue = match dest.try_into() {
@@ -620,8 +617,7 @@ async fn save_alias(alias: &str, dest: &str) {
 }
 
 async fn forget_alias(alias: &str) {
-    let Some(key) = alias_key(alias) else {
-        print!("alias is too long\r\n");
+    let Some(key) = alias_key_or_report(alias).await else {
         return;
     };
     let mut config = CONFIG.get().lock().await;
@@ -650,6 +646,30 @@ async fn list_aliases() {
     }
 }
 
+/// Resolves and parses a `ssh` command's `[user@]host[:port]` argument
+/// (following aliases) into its username, hostname, and port parts.
+/// Reports and returns `None` on an invalid port so callers only need to
+/// handle that one case.
+async fn parse_ssh_target(arg: &str) -> Option<(Option<String>, String, u16)> {
+    let target = resolve_target(arg).await;
+    let (username, host_port) = match target.split_once('@') {
+        Some((user, rest)) => (Some(user.to_string()), rest),
+        None => (None, target.as_str()),
+    };
+    let (hostname, port) = if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        match port_str.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => {
+                print!("invalid port `{port_str}`\r\n");
+                return None;
+            }
+        }
+    } else {
+        (host_port.to_string(), 22)
+    };
+    Some((username, hostname, port))
+}
+
 pub async fn ssh_command(args: &[&str]) {
     match args {
         ["ssh", "save", alias, dest] => {
@@ -676,21 +696,8 @@ pub async fn ssh_command(args: &[&str]) {
     }
 
     if args.len() > 1 {
-        let target = resolve_target(args[1]).await;
-        let (username, host_port) = match target.split_once('@') {
-            Some((user, rest)) => (Some(user.to_string()), rest),
-            None => (None, target.as_str()),
-        };
-        let (hostname, port) = if let Some((host, port_str)) = host_port.rsplit_once(':') {
-            match port_str.parse::<u16>() {
-                Ok(port) => (host.to_string(), port),
-                Err(_) => {
-                    print!("invalid port `{port_str}`\r\n");
-                    return;
-                }
-            }
-        } else {
-            (host_port.to_string(), 22)
+        let Some((username, hostname, port)) = parse_ssh_target(args[1]).await else {
+            return;
         };
 
         let command: Option<String> = if args.len() > 2 {
@@ -727,43 +734,10 @@ impl Process for SshProcess {
         "ssh"
     }
     async fn render(&self) {}
-    fn un_prompt(&self, _screen: &mut Screen) {}
-    async fn key_input(&self, key: KeyReport) {
-        if key.state != KeyState::Pressed {
-            return;
-        }
+    async fn on_key_press(&self, key: KeyReport) {
         self.key_sender.send(key).await;
     }
 }
-
-/*
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
-use heapless::{FnvIndexSet, String};
-type WifiSet = FnvIndexSet<String<32>, 16>;
-use embassy_sync::lazy_lock::LazyLock;
-use embassy_sync::mutex::Mutex as AsyncMutex;
-static NETWORKS: LazyLock<AsyncMutex<CriticalSectionRawMutex, WifiSet>> =
-    LazyLock::new(|| AsyncMutex::new(WifiSet::new()));
-
-#[embassy_executor::task]
-async fn wifi_scanner(mut control: Control<'static>) {
-    let mut scanner = control.scan(Default::default()).await;
-
-    while let Some(bss) = scanner.next().await {
-        if bss.ssid_len == 0 {
-            continue;
-        }
-        if let Ok(ssid_str) = core::str::from_utf8(&bss.ssid[0..bss.ssid_len as usize]) {
-            if let Ok(ssid) = String::try_from(ssid_str) {
-                if let Ok(true) = NETWORKS.get().lock().await.insert(ssid) {
-                    log::info!("wifi: {ssid_str} = {:x?}", bss.bssid);
-                    write!(SCREEN.get().lock().await, "wifi: {ssid_str}\r\n",).ok();
-                }
-            }
-        }
-    }
-}
-*/
 
 /// Map c to its Ctrl equivalent.
 /// This mapping translates characters to their control code equivalents.

@@ -48,8 +48,6 @@ macro_rules! print {
     }
 }
 
-use crate::screen::PicoCalcDisplay;
-
 mod config;
 mod fixed_str;
 mod heap;
@@ -122,7 +120,7 @@ fn get_max_usable_stack() -> usize {
         static mut _stack_start: u8;
     }
 
-    let start_ptr = &raw mut _stack_start as *mut u8 as usize;
+    let start_ptr = &raw mut _stack_start as usize;
     start_ptr - 0x20000000 /* where RAM starts in memory.x */
 }
 
@@ -265,10 +263,14 @@ async fn main(spawner: Spawner) {
     .await;
 
     // Load scrollback config
-    if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await {
-        if let Ok(val) = val_str.parse::<usize>() {
-            crate::screen::SCREEN.get().lock().await.set_max_scrollback(val);
-        }
+    if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await
+        && let Ok(val) = val_str.parse::<usize>()
+    {
+        crate::screen::SCREEN
+            .get()
+            .lock()
+            .await
+            .set_max_scrollback(val);
     }
 
     crate::net::setup_wifi(
@@ -287,7 +289,7 @@ macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
         #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
+        let x = STATIC_CELL.uninit().write($val);
         x
     }};
 }
