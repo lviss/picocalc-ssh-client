@@ -118,25 +118,17 @@ pub fn init_qmi_psram_heap(size: u32) {
     unsafe { HEAP.add_secondary(Region::new(0x11000000, size as usize)) }
 }
 
+async fn print_heap_line(name: &str, used: usize, free: usize) {
+    let total = used + free;
+    print!("{name:<10} {total:>10} {used:>10} {free:>10}\r\n");
+}
+
 pub async fn free_command(_args: &[&str]) {
     print!(
         "{:<10} {:>10} {:>10} {:>10}\r\n",
         "", "TOTAL", "USED", "FREE"
     );
 
-    let ram_used = HEAP.primary.used();
-    let ram_free = HEAP.primary.free();
-    let ram_total = ram_used + ram_free;
-    print!(
-        "{:<10} {ram_total:>10} {ram_used:>10} {ram_free:>10}\r\n",
-        "RAM"
-    );
-
-    let qmi_used = HEAP.secondary.used();
-    let qmi_free = HEAP.secondary.free();
-    let qmi_total = qmi_used + qmi_free;
-    print!(
-        "{:<10} {qmi_total:>10} {qmi_used:>10} {qmi_free:>10}\r\n",
-        "PSRAM (QMI)"
-    );
+    print_heap_line("RAM", HEAP.primary.used(), HEAP.primary.free()).await;
+    print_heap_line("PSRAM (QMI)", HEAP.secondary.used(), HEAP.secondary.free()).await;
 }
