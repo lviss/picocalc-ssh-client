@@ -85,6 +85,11 @@ impl UnixTime {
     }
 }
 
+/// Formats the current unix time as an RFC 3339 timestamp.
+pub fn current_rfc3339() -> Rfc3339 {
+    Rfc3339(UnixTime::now().as_chrono())
+}
+
 pub struct Rfc3339(pub DateTime<Utc>);
 
 impl core::fmt::Display for Rfc3339 {
@@ -214,8 +219,7 @@ pub async fn time_sync(stack: Stack<'static>) {
                         let now = Instant::now();
                         TIME.get().lock().await.update_from_ntp(now, time);
 
-                        let now_ts = UnixTime::now();
-                        let rfc3339 = Rfc3339(now_ts.as_chrono());
+                        let rfc3339 = current_rfc3339();
 
                         let offset = Duration::from_micros(time.offset.unsigned_abs());
                         if first {
@@ -252,7 +256,5 @@ pub async fn time_sync(stack: Stack<'static>) {
 }
 
 pub async fn time_command(_args: &[&str]) {
-    let now_ts = UnixTime::now();
-    let rfc3339 = Rfc3339(now_ts.as_chrono());
-    print!("The time is {rfc3339}\r\n");
+    print!("The time is {}\r\n", current_rfc3339());
 }
