@@ -301,6 +301,14 @@ where
             .ok();
     };
 
+    // Draws a shaft from `tail` to `tip` plus a two-line arrowhead at `tip`,
+    // shared by the four directional arrow glyphs below.
+    let arrow = |display: &mut D, tail: Point, tip: Point, head1: Point, head2: Point| {
+        line(display, tail.x, tail.y, tip.x, tip.y, 1);
+        line(display, tip.x, tip.y, head1.x, head1.y, 1);
+        line(display, tip.x, tip.y, head2.x, head2.y, 1);
+    };
+
     // Draws the 4-spoke asterisk burst (cross + diagonals) shared by the
     // eight-spoked, teardrop-spoked, and heavy-teardrop-spoked asterisk glyphs.
     let burst = |display: &mut D, stroke| {
@@ -352,82 +360,34 @@ where
             }
         }
         // ← → ↑ ↓ arrows: a shaft plus a small arrowhead
-        '\u{2190}' => {
-            line(display, x + w as i32 - 2, cy, x + 2, cy, 1);
-            line(
-                display,
-                x + 2,
-                cy,
-                x + 2 + w as i32 / 3,
-                cy - h as i32 / 4,
-                1,
-            );
-            line(
-                display,
-                x + 2,
-                cy,
-                x + 2 + w as i32 / 3,
-                cy + h as i32 / 4,
-                1,
-            );
-        }
-        '\u{2192}' => {
-            line(display, x + 2, cy, x + w as i32 - 2, cy, 1);
-            line(
-                display,
-                x + w as i32 - 2,
-                cy,
-                x + w as i32 - 2 - w as i32 / 3,
-                cy - h as i32 / 4,
-                1,
-            );
-            line(
-                display,
-                x + w as i32 - 2,
-                cy,
-                x + w as i32 - 2 - w as i32 / 3,
-                cy + h as i32 / 4,
-                1,
-            );
-        }
-        '\u{2191}' => {
-            line(display, cx, y + h as i32 - 2, cx, y + 2, 1);
-            line(
-                display,
-                cx,
-                y + 2,
-                cx - w as i32 / 4,
-                y + 2 + h as i32 / 3,
-                1,
-            );
-            line(
-                display,
-                cx,
-                y + 2,
-                cx + w as i32 / 4,
-                y + 2 + h as i32 / 3,
-                1,
-            );
-        }
-        '\u{2193}' => {
-            line(display, cx, y + 2, cx, y + h as i32 - 2, 1);
-            line(
-                display,
-                cx,
-                y + h as i32 - 2,
-                cx - w as i32 / 4,
-                y + h as i32 - 2 - h as i32 / 3,
-                1,
-            );
-            line(
-                display,
-                cx,
-                y + h as i32 - 2,
-                cx + w as i32 / 4,
-                y + h as i32 - 2 - h as i32 / 3,
-                1,
-            );
-        }
+        '\u{2190}' => arrow(
+            display,
+            Point::new(x + w as i32 - 2, cy),
+            Point::new(x + 2, cy),
+            Point::new(x + 2 + w as i32 / 3, cy - h as i32 / 4),
+            Point::new(x + 2 + w as i32 / 3, cy + h as i32 / 4),
+        ),
+        '\u{2192}' => arrow(
+            display,
+            Point::new(x + 2, cy),
+            Point::new(x + w as i32 - 2, cy),
+            Point::new(x + w as i32 - 2 - w as i32 / 3, cy - h as i32 / 4),
+            Point::new(x + w as i32 - 2 - w as i32 / 3, cy + h as i32 / 4),
+        ),
+        '\u{2191}' => arrow(
+            display,
+            Point::new(cx, y + h as i32 - 2),
+            Point::new(cx, y + 2),
+            Point::new(cx - w as i32 / 4, y + 2 + h as i32 / 3),
+            Point::new(cx + w as i32 / 4, y + 2 + h as i32 / 3),
+        ),
+        '\u{2193}' => arrow(
+            display,
+            Point::new(cx, y + 2),
+            Point::new(cx, y + h as i32 - 2),
+            Point::new(cx - w as i32 / 4, y + h as i32 - 2 - h as i32 / 3),
+            Point::new(cx + w as i32 / 4, y + h as i32 - 2 - h as i32 / 3),
+        ),
         // ✳ eight spoked asterisk: burst of lines through the center
         '\u{2733}' => burst(display, 1),
         // ⏵ auto-mode triangle: small filled right-pointing triangle (play-button style)
