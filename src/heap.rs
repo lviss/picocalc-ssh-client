@@ -33,6 +33,13 @@ impl Region {
             size: AtomicUsize::new(size),
         }
     }
+
+    fn load(&self) -> (usize, usize) {
+        (
+            self.start.load(Ordering::SeqCst),
+            self.size.load(Ordering::SeqCst),
+        )
+    }
 }
 
 /// This is an allocator that combines two regions of memory.
@@ -59,8 +66,7 @@ impl DualHeap {
     }
 
     unsafe fn add_primary(&self, region: Region) {
-        let start = region.start.load(Ordering::SeqCst);
-        let size = region.size.load(Ordering::SeqCst);
+        let (start, size) = region.load();
         unsafe {
             self.primary.init(start, size);
         }
@@ -69,8 +75,7 @@ impl DualHeap {
     }
 
     unsafe fn add_secondary(&self, region: Region) {
-        let start = region.start.load(Ordering::SeqCst);
-        let size = region.size.load(Ordering::SeqCst);
+        let (start, size) = region.load();
         unsafe {
             self.secondary.init(start, size);
         }
