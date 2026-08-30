@@ -9,6 +9,34 @@ pub fn is_box_char(c: char) -> bool {
     ('\u{2500}'..='\u{259F}').contains(&c)
 }
 
+/// Decorative Unicode symbols claude-code's Ink-based TUI emits for its prompt
+/// chrome (chevron, bullets, ellipsis, arrows, dashes, the auto-mode triangle,
+/// spinner/status glyphs). `profont` only covers ASCII + Latin-1, so these fall
+/// back to its literal `?` glyph unless hand-drawn here, the same way box-drawing
+/// characters already are.
+pub fn is_symbol_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{276F}' // ❯ prompt chevron
+            | '\u{2022}' // • bullet
+            | '\u{25CF}' // ● black circle
+            | '\u{25CB}' // ○ white circle
+            | '\u{2026}' // … ellipsis
+            | '\u{2190}' // ← left arrow
+            | '\u{2191}' // ↑ up arrow
+            | '\u{2192}' // → right arrow
+            | '\u{2193}' // ↓ down arrow
+            | '\u{2733}' // ✳ eight spoked asterisk
+            | '\u{23F5}' // ⏵ black medium right-pointing triangle (auto-mode indicator)
+            | '\u{2014}' // — em dash
+            | '\u{2013}' // – en dash
+            | '\u{2722}' // ✢ four teardrop-spoked asterisk (spinner frame)
+            | '\u{2736}' // ✶ six pointed black star (spinner frame)
+            | '\u{273B}' // ✻ teardrop-spoked asterisk (spinner frame)
+            | '\u{273D}' // ✽ heavy teardrop-spoked asterisk (spinner frame)
+    )
+}
+
 pub fn draw_box_char<D>(display: &mut D, c: char, x: i32, y: i32, w: u32, h: u32, color: Rgb565)
 where
     D: DrawTarget<Color = Rgb565>,
@@ -287,6 +315,210 @@ where
     }
 }
 
+/// Vector-draws the decorative symbols `is_symbol_char` matches, the same way
+/// `draw_box_char` already hand-draws the box-drawing block, so these codepoints
+/// never fall through to `Text::draw()` and hit `profont`'s `?` fallback glyph.
+pub fn draw_symbol_char<D>(display: &mut D, c: char, x: i32, y: i32, w: u32, h: u32, color: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let cx = x + (w / 2) as i32;
+    let cy = y + (h / 2) as i32;
+
+    let line = |display: &mut D, x0, y0, x1, y1, stroke| {
+        Line::new(Point::new(x0, y0), Point::new(x1, y1))
+            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+    };
+
+    let filled_circle = |display: &mut D, diameter: u32| {
+        let d = diameter.max(2);
+        let top_left = Point::new(cx - (d / 2) as i32, cy - (d / 2) as i32);
+        Circle::new(top_left, d)
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(display)
+            .ok();
+    };
+
+    let outline_circle = |display: &mut D, diameter: u32| {
+        let d = diameter.max(2);
+        let top_left = Point::new(cx - (d / 2) as i32, cy - (d / 2) as i32);
+        Circle::new(top_left, d)
+            .into_styled(PrimitiveStyle::with_stroke(color, 1))
+            .draw(display)
+            .ok();
+    };
+
+    match c {
+        // ❯ prompt chevron: a right-pointing angle bracket
+        '\u{276F}' => {
+            let x0 = x + w as i32 / 4;
+            let x1 = x + (w as i32 * 3) / 4;
+            let y0 = y + h as i32 / 4;
+            let y1 = y + (h as i32 * 3) / 4;
+            line(display, x0, y0, x1, cy, 2);
+            line(display, x1, cy, x0, y1, 2);
+        }
+        // • bullet: small filled circle
+        '\u{2022}' => filled_circle(display, h / 3),
+        // ● black circle: larger filled circle
+        '\u{25CF}' => filled_circle(display, (h * 2) / 3),
+        // ○ white circle: outline only
+        '\u{25CB}' => outline_circle(display, (h * 2) / 3),
+        // … ellipsis: three evenly spaced dots along the baseline
+        '\u{2026}' => {
+            let dot_y = y + (h as i32 * 4) / 5;
+            for i in 0..3i32 {
+                let dot_x = x + (w as i32 * (2 * i + 1)) / 6;
+                Pixel(Point::new(dot_x, dot_y), color).draw(display).ok();
+                Pixel(Point::new(dot_x + 1, dot_y), color)
+                    .draw(display)
+                    .ok();
+            }
+        }
+        // ← → ↑ ↓ arrows: a shaft plus a small arrowhead
+        '\u{2190}' => {
+            line(display, x + w as i32 - 2, cy, x + 2, cy, 1);
+            line(
+                display,
+                x + 2,
+                cy,
+                x + 2 + w as i32 / 3,
+                cy - h as i32 / 4,
+                1,
+            );
+            line(
+                display,
+                x + 2,
+                cy,
+                x + 2 + w as i32 / 3,
+                cy + h as i32 / 4,
+                1,
+            );
+        }
+        '\u{2192}' => {
+            line(display, x + 2, cy, x + w as i32 - 2, cy, 1);
+            line(
+                display,
+                x + w as i32 - 2,
+                cy,
+                x + w as i32 - 2 - w as i32 / 3,
+                cy - h as i32 / 4,
+                1,
+            );
+            line(
+                display,
+                x + w as i32 - 2,
+                cy,
+                x + w as i32 - 2 - w as i32 / 3,
+                cy + h as i32 / 4,
+                1,
+            );
+        }
+        '\u{2191}' => {
+            line(display, cx, y + h as i32 - 2, cx, y + 2, 1);
+            line(
+                display,
+                cx,
+                y + 2,
+                cx - w as i32 / 4,
+                y + 2 + h as i32 / 3,
+                1,
+            );
+            line(
+                display,
+                cx,
+                y + 2,
+                cx + w as i32 / 4,
+                y + 2 + h as i32 / 3,
+                1,
+            );
+        }
+        '\u{2193}' => {
+            line(display, cx, y + 2, cx, y + h as i32 - 2, 1);
+            line(
+                display,
+                cx,
+                y + h as i32 - 2,
+                cx - w as i32 / 4,
+                y + h as i32 - 2 - h as i32 / 3,
+                1,
+            );
+            line(
+                display,
+                cx,
+                y + h as i32 - 2,
+                cx + w as i32 / 4,
+                y + h as i32 - 2 - h as i32 / 3,
+                1,
+            );
+        }
+        // ✳ eight spoked asterisk: burst of lines through the center
+        '\u{2733}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
+            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
+            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
+        }
+        // ⏵ auto-mode triangle: small filled right-pointing triangle (play-button style)
+        '\u{23F5}' => {
+            let x0 = x + w as i32 / 4;
+            let x1 = x + (w as i32 * 3) / 4;
+            let y0 = y + h as i32 / 4;
+            let y1 = y + (h as i32 * 3) / 4;
+            Triangle::new(Point::new(x0, y0), Point::new(x0, y1), Point::new(x1, cy))
+                .into_styled(PrimitiveStyle::with_fill(color))
+                .draw(display)
+                .ok();
+        }
+        // — em dash: a long horizontal line spanning most of the cell width
+        '\u{2014}' => line(display, x + 1, cy, x + w as i32 - 1, cy, 1),
+        // – en dash: a shorter horizontal line, roughly half the cell width
+        '\u{2013}' => line(display, x + w as i32 / 4, cy, x + (w as i32 * 3) / 4, cy, 1),
+        // ✢ four teardrop-spoked asterisk: a plain cross (4 spokes, no diagonals)
+        '\u{2722}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
+        }
+        // ✶ six pointed black star: three lines through the center, spaced apart
+        '\u{2736}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(
+                display,
+                cx - w as i32 / 4,
+                y + 1,
+                cx + w as i32 / 4,
+                y + h as i32 - 1,
+                1,
+            );
+            line(
+                display,
+                cx + w as i32 / 4,
+                y + 1,
+                cx - w as i32 / 4,
+                y + h as i32 - 1,
+                1,
+            );
+        }
+        // ✻ teardrop-spoked asterisk: same burst treatment as the eight-spoked asterisk
+        '\u{273B}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
+            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
+            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
+        }
+        // ✽ heavy teardrop-spoked asterisk: the same burst, drawn with a heavier stroke
+        '\u{273D}' => {
+            line(display, x + 1, cy, x + w as i32 - 1, cy, 2);
+            line(display, cx, y + 1, cx, y + h as i32 - 1, 2);
+            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 2);
+            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 2);
+        }
+        _ => {}
+    }
+}
+
 fn draw_shade<D>(display: &mut D, x: i32, y: i32, w: u32, h: u32, color: Rgb565, density: u8)
 where
     D: DrawTarget<Color = Rgb565>,
@@ -332,6 +564,79 @@ mod tests {
             display.set_allow_out_of_bounds_drawing(true);
             display.set_allow_overdraw(true);
             draw_box_char(&mut display, c, 0, 0, 10, 20, Rgb565::WHITE);
+            assert_ne!(
+                display,
+                MockDisplay::new(),
+                "U+{:04X} produced no pixels",
+                c as u32
+            );
+        }
+    }
+
+    // Every codepoint the report captured live from claude-code must dispatch to
+    // the vector-draw path rather than falling through to Text::draw()'s profont
+    // rendering, which is what previously produced the literal `?` fallback glyph.
+    #[test]
+    fn report_captured_codepoints_are_symbol_chars() {
+        for c in [
+            '\u{276F}', '\u{2022}', '\u{2026}', '\u{2190}', '\u{25CF}', '\u{2733}',
+        ] {
+            assert!(
+                is_symbol_char(c),
+                "U+{:04X} should dispatch to draw_symbol_char",
+                c as u32
+            );
+        }
+    }
+
+    // Codepoints live-captured for this follow-up fix: the auto-mode triangle
+    // (originally captured but never wired up), em/en dashes (never captured at
+    // all), and the spinner-frame asterisk family beyond the single U+2733 frame
+    // the original report happened to catch.
+    #[test]
+    fn followup_captured_codepoints_are_symbol_chars() {
+        for c in [
+            '\u{23F5}', '\u{2014}', '\u{2013}', '\u{2722}', '\u{2736}', '\u{273B}', '\u{273D}',
+        ] {
+            assert!(
+                is_symbol_char(c),
+                "U+{:04X} should dispatch to draw_symbol_char",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn plain_ascii_and_box_chars_are_not_symbol_chars() {
+        assert!(!is_symbol_char('>'));
+        assert!(!is_symbol_char('A'));
+        assert!(!is_symbol_char(' '));
+        assert!(
+            !is_symbol_char('\u{2500}'),
+            "box-drawing chars must stay on the draw_box_char path"
+        );
+        assert!(
+            !is_box_char('\u{276F}'),
+            "symbol chars must not collide with the box-drawing dispatch"
+        );
+    }
+
+    #[test]
+    fn draw_symbol_char_actually_paints_pixels() {
+        // Regression guard for a no-op dispatch: every codepoint in is_symbol_char
+        // must produce at least one non-background pixel when drawn, otherwise the
+        // fix would silently render nothing instead of fixing the '?' fallback.
+        for c in [
+            '\u{276F}', '\u{2022}', '\u{25CF}', '\u{25CB}', '\u{2026}', '\u{2190}', '\u{2191}',
+            '\u{2192}', '\u{2193}', '\u{2733}', '\u{23F5}', '\u{2014}', '\u{2013}', '\u{2722}',
+            '\u{2736}', '\u{273B}', '\u{273D}',
+        ] {
+            let mut display: MockDisplay<Rgb565> = MockDisplay::new();
+            display.set_allow_out_of_bounds_drawing(true);
+            // Strokes intentionally cross near the glyph center (e.g. arrowheads,
+            // the asterisk spokes), which redraws some pixels more than once.
+            display.set_allow_overdraw(true);
+            draw_symbol_char(&mut display, c, 0, 0, 10, 20, Rgb565::WHITE);
             assert_ne!(
                 display,
                 MockDisplay::new(),
