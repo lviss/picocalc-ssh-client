@@ -16,7 +16,7 @@ use embedded_graphics::text::Text;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ILI9488Rgb565;
 
-use terminal_model::glyphs::{draw_box_char, is_box_char};
+use terminal_model::glyphs::{draw_box_char, draw_symbol_char, is_box_char, is_symbol_char};
 use terminal_model::screen_model::ScreenModel;
 pub use terminal_model::screen_model::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -180,6 +180,16 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
                 if is_box_char(*char) {
                     draw_box_char(
+                        display,
+                        *char,
+                        col_x as i32,
+                        row_y as i32,
+                        cell_width,
+                        cell_height as u32,
+                        fg,
+                    );
+                } else if is_symbol_char(*char) {
+                    draw_symbol_char(
                         display,
                         *char,
                         col_x as i32,
