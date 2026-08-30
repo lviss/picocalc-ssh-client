@@ -10,6 +10,36 @@ use alloc::vec::Vec;
 pub const SCREEN_HEIGHT: u16 = 320;
 pub const SCREEN_WIDTH: u16 = 320;
 
+/// Total primary heap available to the firmware (mirrors `HEAP_SIZE` in
+/// `src/heap.rs`). Duplicated here, not imported, because `terminal-model` is
+/// a host-portable crate with no dependency back on the firmware crate - keep
+/// this in sync if `HEAP_SIZE` ever changes.
+const FIRMWARE_HEAP_SIZE_BYTES: usize = 64 * 1024;
+
+/// Heap the firmware's own non-screen subsystems (WiFi/TCP stack, SSH crypto,
+/// SD card driver, flash-backed config, USB/logging, etc.) reliably need.
+/// Real-hardware-measured via the `free` command: idle with an active SSH
+/// session already uses ~32 KiB of the 64 KiB primary heap before any screen
+/// output happens. Reserved so the screen's own buffers never assume they own
+/// the whole heap - see
+/// /ai/firstmate/data/picocalc-crash-display-buffer/report.md for the
+/// investigation that measured the screen-side footprint, and the launch
+/// brief for the real-hardware `free` readings this reserve is based on.
+/// Re-check this if `HEAP_SIZE` or the boot-time subsystem set changes.
+const NON_SCREEN_HEAP_RESERVE_BYTES: usize = 32 * 1024;
+
+/// What's left in the primary heap for the screen itself (visible `lines` +
+/// `scrollback`) once `NON_SCREEN_HEAP_RESERVE_BYTES` is set aside.
+const SCREEN_HEAP_BUDGET_BYTES: usize = FIRMWARE_HEAP_SIZE_BYTES - NON_SCREEN_HEAP_RESERVE_BYTES;
+
+/// Conservative per-`ScreenLine` allowance for allocator bookkeeping. Each
+/// `ScreenLine` is 2 independent heap allocations (`chars`, `attrs`); the
+/// real embedded allocator's per-allocation overhead (alignment padding,
+/// minimum block size, fragmentation) can't be measured without hardware, so
+/// this pads the logical byte count rather than sizing the budget exactly on
+/// the edge of what the raw `size_of` math predicts.
+const PER_LINE_ALLOC_OVERHEAD_BYTES: usize = 32;
+
 static FONTS: &[&MonoFont] = &[
     &profont::PROFONT_7_POINT,
     &profont::PROFONT_9_POINT,
@@ -189,7 +219,7 @@ impl Default for ScreenModel {
             lines,
             scrollback: Vec::new(),
             viewport_offset: 0,
-            max_scrollback: 200,
+            max_scrollback: ScreenModel::safe_max_scrollback_for(cols, rows),
             cursor_x: 0,
             cursor_y: 0,
             current_attrs: Attrs::default(),
@@ -283,7 +313,12 @@ impl ScreenModel {
         }
     }
 
+    /// Sets the scrollback cap, silently clamped to [`Self::max_safe_scrollback`]
+    /// so no caller - the `scroll` config command, a stale value loaded from
+    /// flash at boot, or any future code - can push the screen's logical
+    /// memory footprint back over its heap budget.
     pub fn set_max_scrollback(&mut self, max: usize) {
+        let max = max.min(self.max_safe_scrollback());
         self.max_scrollback = max;
         if self.scrollback.len() > max {
             let remove_count = self.scrollback.len() - max;
@@ -293,6 +328,31 @@ impl ScreenModel {
                 self.viewport_offset = self.scrollback.len();
             }
         }
+    }
+
+    pub fn max_scrollback(&self) -> usize {
+        self.max_scrollback
+    }
+
+    /// The largest `max_scrollback` value that keeps the screen's total
+    /// logical footprint (visible `lines` + `scrollback`) within
+    /// [`SCREEN_HEAP_BUDGET_BYTES`] at the current screen geometry. This is
+    /// also the value `Default::default()` picks, so "the default" and "the
+    /// heap-safe maximum" are the same number by construction.
+    pub fn max_safe_scrollback(&self) -> usize {
+        Self::safe_max_scrollback_for(self.cols, self.rows)
+    }
+
+    fn bytes_per_line(cols: usize) -> usize {
+        (core::mem::size_of::<char>() + core::mem::size_of::<Attrs>()) * cols
+            + PER_LINE_ALLOC_OVERHEAD_BYTES
+    }
+
+    fn safe_max_scrollback_for(cols: usize, rows: usize) -> usize {
+        let per_line = Self::bytes_per_line(cols);
+        let visible_budget = per_line * rows;
+        let scrollback_budget = SCREEN_HEAP_BUDGET_BYTES.saturating_sub(visible_budget);
+        (scrollback_budget / per_line).max(1)
     }
 }
 
@@ -654,5 +714,99 @@ mod tests {
 
         assert!(model.overlay.is_none());
         assert!(!model.full_repaint);
+    }
+
+    // Regression test for the heap-exhaustion crash investigated in
+    // /ai/firstmate/data/picocalc-crash-display-buffer/report.md: a correctly
+    // *capped* scrollback buffer still exceeded the firmware's 64 KiB primary
+    // heap by over 2x at the old default of 200 lines (measured: 152,550
+    // bytes logical footprint). This asserts the real capped steady-state
+    // footprint - measured via actual `Vec::capacity()`, not assumed sizes -
+    // fits within `SCREEN_HEAP_BUDGET_BYTES` (64 KiB minus
+    // `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap the firmware's WiFi/TCP/SSH/SD
+    // subsystems reliably need, per the launch brief's real `free`-command
+    // readings). Re-run this after changing `HEAP_SIZE`
+    // (`src/heap.rs`), the screen geometry (font/`SCREEN_WIDTH`/
+    // `SCREEN_HEIGHT`), or `NON_SCREEN_HEAP_RESERVE_BYTES`.
+    #[test]
+    fn default_scrollback_cap_keeps_full_footprint_within_heap_budget() {
+        let mut model = ScreenModel::default();
+
+        // Heavy-output session: far more lines than any plausible scrollback
+        // cap, so scrollback reaches and stays at its capped steady state
+        // (like repeated `help`/`ls`/`cat`-over-ssh in the real crash).
+        for i in 0..2000 {
+            feed(&mut model, format!("line {i}\r\n").as_bytes());
+        }
+
+        assert_eq!(
+            model.scrollback.len(),
+            model.max_scrollback(),
+            "scrollback should be capped at steady state"
+        );
+
+        let resident_bytes: usize = model
+            .scrollback
+            .iter()
+            .chain(model.lines.iter())
+            .map(|line| {
+                line.chars.capacity() * core::mem::size_of::<char>()
+                    + line.attrs.capacity() * core::mem::size_of::<Attrs>()
+            })
+            .sum();
+
+        assert!(
+            resident_bytes <= SCREEN_HEAP_BUDGET_BYTES,
+            "capped steady-state resident bytes {resident_bytes} exceeds the \
+             {SCREEN_HEAP_BUDGET_BYTES}-byte screen heap budget \
+             (max_scrollback={}, rows={})",
+            model.max_scrollback(),
+            model.rows,
+        );
+    }
+
+    // Reproduces the real-hardware growth pattern from the crash
+    // investigation's `free`-command readings: two back-to-back ~15-line
+    // `help` calls (identical output each time) where the *second* call
+    // costs far more heap than the first. The mechanism is not a nonlinear
+    // per-line cost inside `ScreenLine` - its `chars`/`attrs` are right-sized
+    // in one allocation each via `vec![elem; width]`, not grown through
+    // repeated small `push`es (see `ScreenLine::new`). It's that `scroll_up`
+    // only allocates a brand-new `ScreenLine` (the line that scrolled off is
+    // *moved* into `scrollback`, never freed and reused) once the visible
+    // `lines` area is already full. A round of output that still fits in
+    // still-blank visible rows costs zero new allocations; once the screen is
+    // completely full, every single output line forces exactly one
+    // scroll_up, i.e. one new full-line allocation - hence the sudden jump.
+    #[test]
+    fn heavy_output_scroll_pressure_accelerates_once_visible_area_fills_up() {
+        let mut model = ScreenModel::default();
+        let rows = model.rows;
+
+        let scrolls_in_round = |model: &mut ScreenModel, lines: usize| -> usize {
+            let before = model.scrollback.len();
+            for i in 0..lines {
+                feed(model, format!("help output line {i}\r\n").as_bytes());
+            }
+            model.scrollback.len() - before
+        };
+
+        let round1 = scrolls_in_round(&mut model, 15);
+        let round2 = scrolls_in_round(&mut model, 15);
+        let round3 = scrolls_in_round(&mut model, 15);
+
+        assert!(
+            round1 < round2,
+            "round1={round1} round2={round2}: expected round 2 (visible area \
+             already full of round 1's output) to scroll - and therefore \
+             allocate - more than round 1, matching the real free-command \
+             readings where the second identical `help` call cost ~4x the first"
+        );
+        assert_eq!(
+            round3, 15,
+            "once fully in steady-state scrolling (visible area permanently \
+             full, rows={rows}), every output line should force exactly one \
+             scroll_up/allocation - no more, no less"
+        );
     }
 }

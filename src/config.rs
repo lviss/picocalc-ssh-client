@@ -179,7 +179,10 @@ pub async fn config_command(args: &[&str]) {
                 let mut config = CONFIG.get().lock().await;
                 match config.fetch(key).await {
                     Ok(Some(val)) => print!("{val}\r\n"),
-                    Ok(None) => print!("200\r\n"),
+                    Ok(None) => {
+                        let default = SCREEN.get().lock().await.max_scrollback();
+                        print!("{default}\r\n");
+                    }
                     Err(e) => print!("{e:?}\r\n"),
                 }
                 return;
@@ -190,7 +193,9 @@ pub async fn config_command(args: &[&str]) {
         }
         ["config", "rm", key] => {
             if *key == "scroll" {
-                SCREEN.get().lock().await.set_max_scrollback(200);
+                let mut screen = SCREEN.get().lock().await;
+                let default = screen.max_safe_scrollback();
+                screen.set_max_scrollback(default);
             }
             let mut config = CONFIG.get().lock().await;
             let result = config.remove(key).await;
@@ -199,10 +204,15 @@ pub async fn config_command(args: &[&str]) {
         ["config", "set", key, value] => {
             if *key == "scroll" {
                 if let Ok(val) = value.parse::<usize>() {
-                    if val <= 500 {
+                    // Heap-aware ceiling, not a flat number: keeps the screen's
+                    // logical footprint within its heap budget regardless of
+                    // screen geometry (see terminal-model's
+                    // SCREEN_HEAP_BUDGET_BYTES / max_safe_scrollback).
+                    let max_safe = SCREEN.get().lock().await.max_safe_scrollback();
+                    if val <= max_safe {
                         SCREEN.get().lock().await.set_max_scrollback(val);
                     } else {
-                        print!("scroll value must be <= 500\r\n");
+                        print!("scroll value must be <= {max_safe} (heap-budget limit)\r\n");
                         return;
                     }
                 } else {
