@@ -54,7 +54,15 @@ pub fn erase_prompt_line(screen: &mut Screen) {
 
 #[async_trait::async_trait(?Send)]
 pub trait Process {
-    async fn key_input(&self, key: KeyReport);
+    /// Handles a key event, ignoring anything but a press.
+    async fn key_input(&self, key: KeyReport) {
+        if key.state == KeyState::Pressed {
+            self.on_key_press(key).await;
+        }
+    }
+
+    /// Handles a key press. Only called for `KeyState::Pressed` events.
+    async fn on_key_press(&self, key: KeyReport);
     async fn render(&self);
 
     fn name(&self) -> &str;
@@ -182,11 +190,7 @@ impl Process for LocalShell {
         erase_prompt_line(screen);
     }
 
-    async fn key_input(&self, key: KeyReport) {
-        if key.state != KeyState::Pressed {
-            return;
-        }
-
+    async fn on_key_press(&self, key: KeyReport) {
         // Take care with the scoping, as the write! call
         // below can call through to un_prompt and render
         // and attempt to acquire self.command.lock()

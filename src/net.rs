@@ -1,6 +1,6 @@
 use crate::Irqs;
 use crate::config::{CONFIG, StrValue};
-use crate::keyboard::{Key, KeyReport, KeyState, Modifiers};
+use crate::keyboard::{Key, KeyReport, Modifiers};
 use crate::net::alloc::string::ToString;
 use crate::process::{LineEditor, Process, assign_proc, assign_proc_if, erase_prompt_line};
 use crate::rng::PicoRng;
@@ -533,10 +533,7 @@ async fn prompt_for_input(prompt: &str, kind: PromptKind) -> Option<String> {
             erase_prompt_line(screen);
         }
 
-        async fn key_input(&self, key: KeyReport) {
-            if key.state != KeyState::Pressed {
-                return;
-            }
+        async fn on_key_press(&self, key: KeyReport) {
             use crate::keyboard::Modifiers;
             match (key.modifiers, key.key) {
                 (Modifiers::CTRL, Key::Char('c' | 'C' | 'd' | 'D')) | (_, Key::Escape) => {
@@ -726,10 +723,7 @@ impl Process for SshProcess {
         "ssh"
     }
     async fn render(&self) {}
-    async fn key_input(&self, key: KeyReport) {
-        if key.state != KeyState::Pressed {
-            return;
-        }
+    async fn on_key_press(&self, key: KeyReport) {
         self.key_sender.send(key).await;
     }
 }
