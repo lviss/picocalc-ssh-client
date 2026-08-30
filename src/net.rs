@@ -587,13 +587,22 @@ async fn resolve_target(name: &str) -> String {
     name.to_string()
 }
 
+/// Like `alias_key`, but reports the "alias is too long" error itself when
+/// the alias doesn't fit, so callers only need to handle the `None` case.
+async fn alias_key_or_report(alias: &str) -> Option<heapless::String<32>> {
+    let key = alias_key(alias);
+    if key.is_none() {
+        print!("alias is too long\r\n");
+    }
+    key
+}
+
 async fn save_alias(alias: &str, dest: &str) {
     if matches!(alias, "save" | "forget" | "list") {
         print!("'{alias}' is a reserved name\r\n");
         return;
     }
-    let Some(key) = alias_key(alias) else {
-        print!("alias is too long\r\n");
+    let Some(key) = alias_key_or_report(alias).await else {
         return;
     };
     let value: StrValue = match dest.try_into() {
@@ -611,8 +620,7 @@ async fn save_alias(alias: &str, dest: &str) {
 }
 
 async fn forget_alias(alias: &str) {
-    let Some(key) = alias_key(alias) else {
-        print!("alias is too long\r\n");
+    let Some(key) = alias_key_or_report(alias).await else {
         return;
     };
     let mut config = CONFIG.get().lock().await;
