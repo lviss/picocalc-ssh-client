@@ -45,6 +45,15 @@ pub struct PsRam {
     pub size: u32,
 }
 
+/// Splits a 24-bit PSRAM address into its big-endian command bytes.
+fn addr_bytes(addr: u32) -> [u8; 3] {
+    [
+        ((addr >> 16) & 0xff) as u8,
+        ((addr >> 8) & 0xff) as u8,
+        (addr & 0xff) as u8,
+    ]
+}
+
 impl PsRam {
     pub async fn send_command(&mut self, cmd: &[u8], out: &mut [u8]) {
         if out.is_empty() {
@@ -66,14 +75,13 @@ impl PsRam {
             let to_write = data.len().min(MAX_CHUNK);
             //log::info!("writing {to_write} @ {addr}");
 
+            let [a0, a1, a2] = addr_bytes(addr);
             #[rustfmt::skip]
             let mut to_send = [
                 32 + (to_write as u8 * 8), // write address + data
                 0,                         // read 0 bits
                 PSRAM_CMD_WRITE,
-                ((addr >> 16) & 0xff) as u8,
-                ((addr >> 8) & 0xff) as u8,
-                (addr & 0xff) as u8,
+                a0, a1, a2,
                 // This sequence must be MAX_CHUNK in length
                 0, 0, 0, 0,
                 0, 0, 0, 0,
@@ -117,14 +125,15 @@ impl PsRam {
         while !out.is_empty() {
             let to_read = out.len().min(MAX_CHUNK);
             //log::info!("reading {to_read} @ {addr}");
+            let [a0, a1, a2] = addr_bytes(addr);
             self.send_command(
                 &[
                     40,                // write 40 bits
                     to_read as u8 * 8, // read n bytes
                     PSRAM_CMD_FAST_READ,
-                    ((addr >> 16) & 0xff) as u8,
-                    ((addr >> 8) & 0xff) as u8,
-                    (addr & 0xff) as u8,
+                    a0,
+                    a1,
+                    a2,
                     0, // 8 cycle delay by sending 8 bits of don't care data
                 ],
                 &mut out[0..to_read],
@@ -138,14 +147,15 @@ impl PsRam {
     #[allow(unused)]
     pub async fn write8(&mut self, addr: u32, data: u8) {
         //log::info!("write8 addr {addr} <- {data:x}");
+        let [a0, a1, a2] = addr_bytes(addr);
         self.send_command(
             &[
                 40, // write 40 bits
                 0,  // read 0 bits
                 PSRAM_CMD_WRITE,
-                ((addr >> 16) & 0xff) as u8,
-                ((addr >> 8) & 0xff) as u8,
-                (addr & 0xff) as u8,
+                a0,
+                a1,
+                a2,
                 data,
             ],
             &mut [],
@@ -156,14 +166,15 @@ impl PsRam {
     #[allow(unused)]
     pub async fn read8(&mut self, addr: u32) -> u8 {
         let mut buf = [0u8];
+        let [a0, a1, a2] = addr_bytes(addr);
         self.send_command(
             &[
                 40, // write 40 bits
                 8,  // read 8 bits
                 PSRAM_CMD_FAST_READ,
-                ((addr >> 16) & 0xff) as u8,
-                ((addr >> 8) & 0xff) as u8,
-                (addr & 0xff) as u8,
+                a0,
+                a1,
+                a2,
                 0, // 8 cycle delay
             ],
             &mut buf,
