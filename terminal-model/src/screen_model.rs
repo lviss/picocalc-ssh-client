@@ -200,6 +200,13 @@ pub struct ScreenModel {
     /// over the framebuffer each frame while set, and `clear_overlay` forces a
     /// full repaint from the untouched cell data so dismissal is invisible.
     pub overlay: Option<String>,
+    /// Counts `scroll_up` invocations directly. Test-only: with `max_scrollback`
+    /// now correctly sized to the real heap budget (including outer-container
+    /// overhead) it can be smaller than a test's total feed count, so inferring
+    /// scroll count from `scrollback.len()` deltas is unreliable once the cap
+    /// is reached mid-test - this counter isn't capped and stays exact.
+    #[cfg(test)]
+    scroll_up_calls: usize,
 }
 
 impl Default for ScreenModel {
@@ -215,11 +222,23 @@ impl Default for ScreenModel {
             lines.push(ScreenLine::new(cols));
         }
 
+        let max_scrollback = ScreenModel::safe_max_scrollback_for(cols, rows);
+        // Reserve the exact capacity `scroll_up` ever needs (it pushes, then
+        // trims back down to `max_scrollback` via `remove(0)`, so length
+        // transiently peaks at `max_scrollback + 1`) up front. Without this,
+        // Rust's amortized-growth doubling would let `scrollback`'s backing
+        // array overshoot `max_scrollback` slots - real heap `ScreenModel`
+        // container overhead the budget below has no way to account for
+        // otherwise. `set_max_scrollback` only ever lowers `max_scrollback`
+        // toward this same ceiling (`max_safe_scrollback`), so this capacity
+        // is never exceeded later.
+        let scrollback = Vec::with_capacity(max_scrollback + 1);
+
         Self {
             lines,
-            scrollback: Vec::new(),
+            scrollback,
             viewport_offset: 0,
-            max_scrollback: ScreenModel::safe_max_scrollback_for(cols, rows),
+            max_scrollback,
             cursor_x: 0,
             cursor_y: 0,
             current_attrs: Attrs::default(),
@@ -228,6 +247,8 @@ impl Default for ScreenModel {
             cols,
             full_repaint: true,
             overlay: None,
+            #[cfg(test)]
+            scroll_up_calls: 0,
         }
     }
 }
@@ -268,7 +289,19 @@ impl ScreenModel {
             }
             self.lines.push(ScreenLine::new(self.cols));
             self.full_repaint = true;
+            #[cfg(test)]
+            {
+                self.scroll_up_calls += 1;
+            }
         }
+    }
+
+    /// Test-only accessor for [`Self::scroll_up_calls`] - see its doc comment
+    /// for why tests must count scroll invocations directly instead of
+    /// inferring them from `scrollback.len()` deltas.
+    #[cfg(test)]
+    fn scroll_up_calls(&self) -> usize {
+        self.scroll_up_calls
     }
 
     /// Scrolls up by one line if the cursor has moved past the last row,
@@ -346,6 +379,7 @@ impl ScreenModel {
     fn bytes_per_line(cols: usize) -> usize {
         (core::mem::size_of::<char>() + core::mem::size_of::<Attrs>()) * cols
             + PER_LINE_ALLOC_OVERHEAD_BYTES
+            + core::mem::size_of::<ScreenLine>()
     }
 
     fn safe_max_scrollback_for(cols: usize, rows: usize) -> usize {
@@ -753,7 +787,9 @@ mod tests {
                 line.chars.capacity() * core::mem::size_of::<char>()
                     + line.attrs.capacity() * core::mem::size_of::<Attrs>()
             })
-            .sum();
+            .sum::<usize>()
+            + (model.scrollback.capacity() + model.lines.capacity())
+                * core::mem::size_of::<ScreenLine>();
 
         assert!(
             resident_bytes <= SCREEN_HEAP_BUDGET_BYTES,
@@ -784,11 +820,11 @@ mod tests {
         let rows = model.rows;
 
         let scrolls_in_round = |model: &mut ScreenModel, lines: usize| -> usize {
-            let before = model.scrollback.len();
+            let before = model.scroll_up_calls();
             for i in 0..lines {
                 feed(model, format!("help output line {i}\r\n").as_bytes());
             }
-            model.scrollback.len() - before
+            model.scroll_up_calls() - before
         };
 
         let round1 = scrolls_in_round(&mut model, 15);
