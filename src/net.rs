@@ -171,6 +171,13 @@ pub async fn setup_wifi(
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
+async fn send_key_bytes(channel: &mut ChanInOut<'_, '_>, bytes: &[u8]) {
+    log::info!(
+        "{:?}",
+        with_timeout(TIMEOUT_DURATION, channel.write_all(bytes)).await
+    );
+}
+
 async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS, KeyReport, 4>>) {
     log::info!("ssh_channel_task waiting for output");
 
@@ -208,37 +215,20 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
                         mapped.escape_debug()
                     );
                     let mut buf = [0u8; 4];
-                    log::info!(
-                        "{:?}",
-                        with_timeout(
-                            TIMEOUT_DURATION,
-                            channel.write_all(mapped.encode_utf8(&mut buf).as_bytes()),
-                        )
-                        .await
-                    );
+                    send_key_bytes(&mut channel, mapped.encode_utf8(&mut buf).as_bytes()).await;
                     continue;
                 }
 
                 if key_report.modifiers == Modifiers::ALT {
                     // Alt sends escape first
                     log::info!("ALT -> send escape first");
-                    log::info!(
-                        "{:?}",
-                        with_timeout(TIMEOUT_DURATION, channel.write_all(b"\x1b")).await
-                    );
+                    send_key_bytes(&mut channel, b"\x1b").await;
                 }
 
                 if let Key::Char(c) = key_report.key {
                     let mut buf = [0u8; 4];
                     log::info!("just sending {} as-is", c.escape_debug());
-                    log::info!(
-                        "{:?}",
-                        with_timeout(
-                            TIMEOUT_DURATION,
-                            channel.write_all(c.encode_utf8(&mut buf).as_bytes()),
-                        )
-                        .await
-                    );
+                    send_key_bytes(&mut channel, c.encode_utf8(&mut buf).as_bytes()).await;
                 } else {
                     let text = match key_report.key {
                         Key::Enter => "\r",
@@ -259,10 +249,7 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
                         }
                     };
                     log::info!("{key_report:?} -> {}", text.escape_debug());
-                    log::info!(
-                        "{:?}",
-                        with_timeout(TIMEOUT_DURATION, channel.write_all(text.as_bytes())).await
-                    );
+                    send_key_bytes(&mut channel, text.as_bytes()).await;
                 }
             }
         }
