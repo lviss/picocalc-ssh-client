@@ -646,6 +646,30 @@ async fn list_aliases() {
     }
 }
 
+/// Resolves and parses a `ssh` command's `[user@]host[:port]` argument
+/// (following aliases) into its username, hostname, and port parts.
+/// Reports and returns `None` on an invalid port so callers only need to
+/// handle that one case.
+async fn parse_ssh_target(arg: &str) -> Option<(Option<String>, String, u16)> {
+    let target = resolve_target(arg).await;
+    let (username, host_port) = match target.split_once('@') {
+        Some((user, rest)) => (Some(user.to_string()), rest),
+        None => (None, target.as_str()),
+    };
+    let (hostname, port) = if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        match port_str.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => {
+                print!("invalid port `{port_str}`\r\n");
+                return None;
+            }
+        }
+    } else {
+        (host_port.to_string(), 22)
+    };
+    Some((username, hostname, port))
+}
+
 pub async fn ssh_command(args: &[&str]) {
     match args {
         ["ssh", "save", alias, dest] => {
@@ -672,21 +696,8 @@ pub async fn ssh_command(args: &[&str]) {
     }
 
     if args.len() > 1 {
-        let target = resolve_target(args[1]).await;
-        let (username, host_port) = match target.split_once('@') {
-            Some((user, rest)) => (Some(user.to_string()), rest),
-            None => (None, target.as_str()),
-        };
-        let (hostname, port) = if let Some((host, port_str)) = host_port.rsplit_once(':') {
-            match port_str.parse::<u16>() {
-                Ok(port) => (host.to_string(), port),
-                Err(_) => {
-                    print!("invalid port `{port_str}`\r\n");
-                    return;
-                }
-            }
-        } else {
-            (host_port.to_string(), 22)
+        let Some((username, hostname, port)) = parse_ssh_target(args[1]).await else {
+            return;
         };
 
         let command: Option<String> = if args.len() > 2 {
