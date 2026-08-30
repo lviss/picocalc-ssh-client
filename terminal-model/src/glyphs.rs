@@ -53,6 +53,13 @@ where
             .ok();
     };
 
+    // Helper to draw an arc (used by the rounded-corner glyphs below)
+    let arc = |display: &mut D, arc: Arc| {
+        arc.into_styled(PrimitiveStyle::with_stroke(color, stroke))
+            .draw(display)
+            .ok();
+    };
+
     match c {
         // Light horizontal
         '\u{2500}' => line(display, x, cy, x + w as i32, cy),
@@ -149,57 +156,57 @@ where
         // Rounded corners
         '\u{256D}' => {
             // Top-left
-            Arc::new(
-                Point::new(x + w as i32 / 2, y + h as i32 / 2),
-                w,
-                Angle::from_degrees(180.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x + w as i32 / 2, y + h as i32 / 2),
+                    w,
+                    Angle::from_degrees(180.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
         '\u{256E}' => {
             // Top-right
-            Arc::new(
-                Point::new(x - w as i32 / 2, y + h as i32 / 2),
-                w,
-                Angle::from_degrees(270.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x - w as i32 / 2, y + h as i32 / 2),
+                    w,
+                    Angle::from_degrees(270.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, cy + h as i32 / 2, cx, y + h as i32); // Extend down
             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
         '\u{2570}' => {
             // Bottom-left
-            Arc::new(
-                Point::new(x + w as i32 / 2, y - h as i32 / 2),
-                w,
-                Angle::from_degrees(90.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x + w as i32 / 2, y - h as i32 / 2),
+                    w,
+                    Angle::from_degrees(90.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
             line(display, cx + w as i32 / 2, cy, x + w as i32, cy); // Extend right
         }
         '\u{256F}' => {
             // Bottom-right
-            Arc::new(
-                Point::new(x - w as i32 / 2, y - h as i32 / 2),
-                w,
-                Angle::from_degrees(0.0),
-                Angle::from_degrees(90.0),
-            )
-            .into_styled(PrimitiveStyle::with_stroke(color, stroke))
-            .draw(display)
-            .ok();
+            arc(
+                display,
+                Arc::new(
+                    Point::new(x - w as i32 / 2, y - h as i32 / 2),
+                    w,
+                    Angle::from_degrees(0.0),
+                    Angle::from_degrees(90.0),
+                ),
+            );
             line(display, cx, y, cx, cy - h as i32 / 2); // Extend up
             line(display, x, cy, cx - w as i32 / 2, cy); // Extend left
         }
