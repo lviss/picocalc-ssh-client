@@ -67,6 +67,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   line). `ScreenModel::set_max_scrollback` self-clamps to `max_safe_scrollback()`, so raising the
   user-settable `scroll` config (`src/config.rs`) can never reintroduce this crash even if
   `config.rs`'s own bound-check is ever bypassed or a stale large value is loaded from flash at boot.
+  `bytes_per_line()`'s budget counts `size_of::<ScreenLine>()` per slot (not just the two inner
+  `chars`/`attrs` allocations) to cover the outer `Vec<ScreenLine>` containers (`lines` and
+  `scrollback`) themselves; this only holds because `Default::default()` pre-reserves
+  `scrollback`'s capacity to `max_scrollback + 1` up front (`scroll_up`'s push-then-`remove(0)`
+  peak) instead of growing it via `Vec::new()` + amortized doubling, which would let its real
+  backing capacity overshoot the budgeted count. Any future change to how `scrollback` grows must
+  preserve that fixed pre-reserved capacity or the container-overhead accounting goes stale again.
   Re-run the two tests above (and re-derive the budget) if `HEAP_SIZE` (`src/heap.rs`) or the screen
   geometry (font/`SCREEN_WIDTH`/`SCREEN_HEIGHT`) ever changes.
 - On a NixOS-style agent sandbox where plain `cargo`/`rustc` aren't on `PATH`, the working

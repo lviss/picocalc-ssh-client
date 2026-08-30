@@ -14,7 +14,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Standalone SSH Client**: Connect to any SSH server directly from the device.
 *   **Robust Terminal Emulation**: Built on the `vte` crate for accurate ANSI/VT100 parsing.
 *   **Extended Character Support**: Custom rendering for box-drawing characters (lines, corners, shades) and common decorative symbols (chevrons, bullets, ellipses, arrows, circles) for TUI applications like `vim`, `gemini-cli`, `claude-code`, `mc`, `htop`, `ollama`, and `tmux`.
-*   **Scrolling**: Scroll through the command history up to 500 lines.
+*   **Scrolling**: Scroll through the command history, with a heap-budget-derived scrollback limit.
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
@@ -198,19 +198,22 @@ retrieve it over the device's USB serial log port:
 
 ### Scrolling
 
-You can scroll through the command history (up to 500 lines) using the following key combinations:
+You can scroll through the command history using the following key combinations:
 
 *   `Ctrl + UpArrow`: Scroll up
 *   `Ctrl + DownArrow`: Scroll down
 
 Typing any character or receiving new output from the server will automatically reset the view to the bottom.
 
-You can configure the number of lines in the scrollback buffer (default 200, max 500):
+You can configure the number of lines in the scrollback buffer. The maximum
+(and default) is derived from the device's available heap and current screen
+geometry rather than a fixed number, so it varies by device/font; check the
+current value with `config get scroll`:
 
 ```bash
-$ config set scroll 500
 $ config get scroll
-$ config rm scroll  # Resets to default (200)
+$ config set scroll 100  # must be <= the heap-budget limit reported on error
+$ config rm scroll  # Resets to the heap-budget default
 ```
 
 ### Battery Overlay
