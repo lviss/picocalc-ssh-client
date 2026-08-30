@@ -20,6 +20,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
   extending this crate over adding tests to the hardware-coupled root crate.
+- `.github/workflows/build.yml` has two jobs: `build-pr` (on `pull_request`, builds both
+  `pico2w`/`pimoroni2w` via `make CHIP=<chip> image`, uploads each as a workflow artifact named
+  `picocalc-ssh-client-<chip>-pr<N>`) and `build-release`/`publish-release` (manual
+  `workflow_dispatch` with a required `version` input, builds both chips, publishes one GitHub
+  Release tagged `version` with both `.uf2` assets). There is no push-to-main auto-release anymore.
+  This repo is a fork, and GitHub disables Actions by default on forks until the owner opts in from
+  the repo's web UI Settings > Actions page (the REST `actions/permissions` endpoint 403s for a
+  non-admin token, so this can't be done via `gh api`) — check `gh api
+  repos/lviss/picocalc-ssh-client/actions/runs` for a nonzero run count before assuming CI is live.
 - `vte::Params` always pushes a parameter slot on `csi_dispatch`, even for a bare sequence with no
   digits (e.g. `CSI C`) — the "no parameter" case arrives as an explicit `0`, not an absent one.
   A plain `params.iter().next().map(|p| p[0]).unwrap_or(1)` therefore silently computes `0` instead
