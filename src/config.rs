@@ -16,6 +16,7 @@ const PICO2_FLASH_SIZE: usize = 4 * 1024 * 1024;
 pub const CONFIG_SIZE: u32 = ERASE_SIZE as u32 * 2;
 pub const CONFIG_BASE: u32 = PICO2_FLASH_SIZE as u32 - CONFIG_SIZE;
 const SCRATCH_SIZE: usize = PAGE_SIZE * 2;
+const CONFIG_RANGE: core::ops::Range<u32> = CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE;
 
 pub static CONFIG: LazyLock<Mutex<CriticalSectionRawMutex, Configuration>> =
     LazyLock::new(|| Mutex::new(Configuration::default()));
@@ -48,7 +49,7 @@ impl Configuration {
         let mut buf = [0u8; SCRATCH_SIZE];
         fetch_item(
             self.flash_mut(),
-            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            CONFIG_RANGE,
             &mut NoCache::new(),
             &mut buf,
             &key,
@@ -64,7 +65,7 @@ impl Configuration {
         let mut buf = [0u8; SCRATCH_SIZE];
         remove_item(
             self.flash_mut(),
-            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            CONFIG_RANGE,
             &mut NoCache::new(),
             &mut buf,
             &key,
@@ -81,7 +82,7 @@ impl Configuration {
         let mut buf = [0u8; SCRATCH_SIZE];
         store_item(
             self.flash_mut(),
-            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            CONFIG_RANGE,
             &mut NoCache::new(),
             &mut buf,
             &key,
@@ -93,7 +94,7 @@ impl Configuration {
     pub async fn format(
         &mut self,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        erase_all(self.flash_mut(), CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE).await
+        erase_all(self.flash_mut(), CONFIG_RANGE).await
     }
 
     pub async fn get_all(
@@ -104,13 +105,9 @@ impl Configuration {
     > {
         let mut buf = [0u8; SCRATCH_SIZE];
         let mut cache = NoCache::new();
-        let mut iter = fetch_all_items::<StrKey, _, _>(
-            self.flash_mut(),
-            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
-            &mut cache,
-            &mut buf,
-        )
-        .await?;
+        let mut iter =
+            fetch_all_items::<StrKey, _, _>(self.flash_mut(), CONFIG_RANGE, &mut cache, &mut buf)
+                .await?;
 
         let mut map = FnvIndexMap::new();
 
