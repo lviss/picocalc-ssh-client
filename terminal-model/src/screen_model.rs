@@ -3,6 +3,7 @@ use embedded_graphics::pixelcolor::{Rgb565, Rgb888};
 use embedded_graphics::prelude::*;
 use vte::Perform;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -161,6 +162,11 @@ pub struct ScreenModel {
     pub rows: usize,
     cols: usize,
     pub full_repaint: bool,
+    /// Transient text shown on top of the terminal contents (e.g. the battery
+    /// overlay). Never mutates `lines`/`scrollback` - the painter composites it
+    /// over the framebuffer each frame while set, and `clear_overlay` forces a
+    /// full repaint from the untouched cell data so dismissal is invisible.
+    pub overlay: Option<String>,
 }
 
 impl Default for ScreenModel {
@@ -188,6 +194,7 @@ impl Default for ScreenModel {
             rows,
             cols,
             full_repaint: true,
+            overlay: None,
         }
     }
 }
@@ -244,6 +251,22 @@ impl ScreenModel {
     pub fn reset_view(&mut self) {
         if self.viewport_offset != 0 {
             self.viewport_offset = 0;
+            self.full_repaint = true;
+        }
+    }
+
+    /// Show `text` as an overlay. Purely a paint-time overlay flag - the cell
+    /// buffer is never touched, so any host output that lands underneath while
+    /// it's showing is preserved untouched.
+    pub fn show_overlay(&mut self, text: String) {
+        self.overlay = Some(text);
+    }
+
+    /// Hide the overlay and force a full repaint so the real, possibly-changed
+    /// cell contents underneath it are redrawn exactly as they'd look had the
+    /// overlay never been shown.
+    pub fn clear_overlay(&mut self) {
+        if self.overlay.take().is_some() {
             self.full_repaint = true;
         }
     }
@@ -586,5 +609,60 @@ mod tests {
         let row5: alloc::string::String = model.lines[5].chars[0..27].iter().collect();
         assert_eq!(row0.trim_end(), "congestion window begins");
         assert_eq!(row5.trim_end(), "unacknowledged data can be");
+    }
+
+    // The overlay (e.g. the battery readout shown on a power-button press) must
+    // never touch the cell buffer - it's a paint-time compositing flag only, so
+    // showing it can't perturb full_repaint/dirty state used by other logic.
+    #[test]
+    fn show_overlay_does_not_touch_cell_buffer_or_repaint_state() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"hello\r");
+        model.full_repaint = false;
+        model.lines[0].dirty = false;
+        let before: alloc::string::String = model.lines[0].chars[0..5].iter().collect();
+
+        model.show_overlay(alloc::string::String::from("Battery: 87%"));
+
+        assert_eq!(model.overlay.as_deref(), Some("Battery: 87%"));
+        assert!(!model.full_repaint);
+        assert!(!model.lines[0].dirty);
+        let after: alloc::string::String = model.lines[0].chars[0..5].iter().collect();
+        assert_eq!(before, after);
+    }
+
+    // Reproduces the core requirement from the battery-overlay feature: content
+    // the remote host writes while the overlay is showing must not be lost, and
+    // once the overlay is dismissed the screen must reflect that content exactly
+    // as if the overlay had never appeared - i.e. dismissal is just "repaint from
+    // the (untouched, up to date) cell buffer", not a snapshot/restore.
+    #[test]
+    fn overlay_composited_then_dismissed_reverts_to_current_host_content() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"before\r");
+
+        model.show_overlay(alloc::string::String::from("Battery: 87%"));
+
+        // Remote host output arrives while the overlay is up.
+        feed(&mut model, b"after-overlay-output\r");
+
+        assert!(model.overlay.is_some());
+        model.clear_overlay();
+
+        assert!(model.overlay.is_none());
+        assert!(model.full_repaint);
+        let row0: alloc::string::String = model.lines[0].chars[0..20].iter().collect();
+        assert_eq!(row0, "after-overlay-output");
+    }
+
+    #[test]
+    fn clear_overlay_is_a_noop_when_nothing_is_showing() {
+        let mut model = ScreenModel::default();
+        model.full_repaint = false;
+
+        model.clear_overlay();
+
+        assert!(model.overlay.is_none());
+        assert!(!model.full_repaint);
     }
 }

@@ -26,6 +26,23 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   of the ECMA-48 default of `1` for the extremely common bare-sequence form. Use
   `.unwrap_or(0).max(1)` (see `cursor_move_count` in `terminal-model/src/screen_model.rs`) for any
   CSI parameter that has a nonzero default.
+- `ScreenModel::overlay` (`terminal-model/src/screen_model.rs`) is the pattern for any transient
+  on-screen banner (currently just the battery readout on a power-button press, wired in
+  `src/keyboard.rs`'s `keyboard_reader`): it's a paint-time-only flag that never touches
+  `lines`/`scrollback`, composited on top each frame in `src/screen.rs`'s `update_display` /
+  `draw_overlay`. `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real,
+  possibly-changed cell content underneath from scratch rather than needing a save/restore buffer.
+  Auto-dismiss timing (`embassy_time::Instant`) lives on the `Screen` wrapper in `src/screen.rs`
+  (`overlay_expiry`, checked in `Screen::update_display`), not in `ScreenModel`, since
+  `terminal-model` is host-portable and has no clock.
+- Despite the caution above about the root package not building for the host target: this repo's
+  installed toolchain does carry a prebuilt `thumbv8m.main-none-eabihf` std, so
+  `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully
+  type-checks the firmware crate — useful for validating non-`terminal-model` changes without
+  hardware. `cargo build --release --features <chip>` (what `make image` runs) also compiles all
+  the way through codegen; only the final link step needs `flip-link`, which may not be installed
+  in every environment (`cargo install flip-link` needs network/build tools) — that's a linker
+  availability gap, not a code problem, if it's the only failure.
 
 ## Maintaining this file
 

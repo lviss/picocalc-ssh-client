@@ -16,6 +16,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Extended Character Support**: Custom rendering for box-drawing characters (lines, corners, shades) and common decorative symbols (chevrons, bullets, ellipses, arrows, circles) for TUI applications like `vim`, `gemini-cli`, `claude-code`, `mc`, `htop`, `ollama`, and `tmux`.
 *   **Scrolling**: Scroll through the command history up to 500 lines.
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
+*   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -211,6 +212,18 @@ $ config set scroll 500
 $ config get scroll
 $ config rm scroll  # Resets to default (200)
 ```
+
+### Battery Overlay
+
+A short press of the physical power button shows a bordered "Battery: NN%"
+box centered on screen for a few seconds, then it disappears on its own. It
+works at any time, including in the middle of an active SSH session, and
+never disturbs the underlying screen content — whatever was there (or
+arrives from the remote host while the overlay is up) is exactly what's
+shown once it clears.
+
+Holding the power button down instead powers off the device; that's handled
+entirely by the keyboard co-processor and doesn't involve this firmware.
 
 ### Local Commands
 
