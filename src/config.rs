@@ -41,12 +41,19 @@ impl Configuration {
         }
     }
 
+    fn key_and_buf(
+        key: &str,
+    ) -> Result<(StrKey, [u8; SCRATCH_SIZE]), sequential_storage::Error<embassy_rp::flash::Error>>
+    {
+        let key: StrKey = key.try_into()?;
+        Ok((key, [0u8; SCRATCH_SIZE]))
+    }
+
     pub async fn fetch(
         &mut self,
         key: &str,
     ) -> Result<Option<StrValue>, sequential_storage::Error<embassy_rp::flash::Error>> {
-        let key: StrKey = key.try_into()?;
-        let mut buf = [0u8; SCRATCH_SIZE];
+        let (key, mut buf) = Self::key_and_buf(key)?;
         fetch_item(
             self.flash_mut(),
             CONFIG_RANGE,
@@ -61,8 +68,7 @@ impl Configuration {
         &mut self,
         key: &str,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        let key: StrKey = key.try_into()?;
-        let mut buf = [0u8; SCRATCH_SIZE];
+        let (key, mut buf) = Self::key_and_buf(key)?;
         remove_item(
             self.flash_mut(),
             CONFIG_RANGE,
@@ -78,8 +84,7 @@ impl Configuration {
         key: &str,
         value: StrValue,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        let key: StrKey = key.try_into()?;
-        let mut buf = [0u8; SCRATCH_SIZE];
+        let (key, mut buf) = Self::key_and_buf(key)?;
         store_item(
             self.flash_mut(),
             CONFIG_RANGE,
