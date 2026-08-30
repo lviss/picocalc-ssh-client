@@ -148,6 +148,15 @@ impl ScreenLine {
         }
         self.dirty = true;
     }
+
+    /// Blanks `[start, end)` with `attrs` and marks the line dirty.
+    fn erase(&mut self, start: usize, end: usize, attrs: Attrs) {
+        for i in start..end {
+            self.chars[i] = ' ';
+            self.attrs[i] = attrs;
+        }
+        self.dirty = true;
+    }
 }
 
 pub struct ScreenModel {
@@ -393,12 +402,8 @@ impl Perform for ScreenModel {
                     0 => {
                         // Cursor to end
                         // Clear current line from cursor
-                        let line = &mut self.lines[self.cursor_y];
-                        for i in self.cursor_x..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                        line.dirty = true;
+                        let attrs = self.current_attrs;
+                        self.lines[self.cursor_y].erase(self.cursor_x, self.cols, attrs);
                         // Clear lines below
                         for i in (self.cursor_y + 1)..self.rows {
                             self.lines[i].clear();
@@ -411,12 +416,8 @@ impl Perform for ScreenModel {
                             self.lines[i].clear();
                         }
                         // Clear current line up to cursor
-                        let line = &mut self.lines[self.cursor_y];
-                        for i in 0..=self.cursor_x {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                        line.dirty = true;
+                        let attrs = self.current_attrs;
+                        self.lines[self.cursor_y].erase(0, self.cursor_x + 1, attrs);
                     }
                     2 => {
                         // Entire screen
@@ -428,29 +429,12 @@ impl Perform for ScreenModel {
             'K' => {
                 // Erase in Line
                 let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let attrs = self.current_attrs;
                 let line = &mut self.lines[self.cursor_y];
                 match n {
-                    0 => {
-                        // Cursor to end
-                        for i in self.cursor_x..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
-                    1 => {
-                        // Beginning to cursor
-                        for i in 0..=self.cursor_x {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
-                    2 => {
-                        // Entire line
-                        for i in 0..self.cols {
-                            line.chars[i] = ' ';
-                            line.attrs[i] = self.current_attrs;
-                        }
-                    }
+                    0 => line.erase(self.cursor_x, self.cols, attrs), // Cursor to end
+                    1 => line.erase(0, self.cursor_x + 1, attrs),     // Beginning to cursor
+                    2 => line.erase(0, self.cols, attrs),             // Entire line
                     _ => {}
                 }
                 line.dirty = true;
