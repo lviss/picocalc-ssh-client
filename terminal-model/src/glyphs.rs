@@ -68,6 +68,13 @@ where
             .ok();
     };
 
+    // Half-segments from the glyph center to each edge, used by the light
+    // single-line box-drawing junction glyphs below (┌┐└┘├┤┬┴┼).
+    let left = |display: &mut D| line(display, x, cy, cx, cy);
+    let right = |display: &mut D| line(display, cx, cy, x + w as i32, cy);
+    let up = |display: &mut D| line(display, cx, y, cx, cy);
+    let down = |display: &mut D| line(display, cx, cy, cx, y + h as i32);
+
     // Helpers for the double-line corner glyphs below: a double-stroke vertical
     // segment spanning either the top or bottom half, and a double-stroke
     // horizontal segment spanning either the left or right half.
@@ -89,48 +96,54 @@ where
         '\u{2502}' => line(display, cx, y, cx, y + h as i32),
         // Light down and right
         '\u{250C}' => {
-            line(display, cx, cy, x + w as i32, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            right(display);
+            down(display);
         }
         // Light down and left
         '\u{2510}' => {
-            line(display, x, cy, cx, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            left(display);
+            down(display);
         }
         // Light up and right
         '\u{2514}' => {
-            line(display, cx, cy, x + w as i32, cy);
-            line(display, cx, y, cx, cy);
+            right(display);
+            up(display);
         }
         // Light up and left
         '\u{2518}' => {
-            line(display, x, cy, cx, cy);
-            line(display, cx, y, cx, cy);
+            left(display);
+            up(display);
         }
         // Light vertical and right
         '\u{251C}' => {
-            line(display, cx, y, cx, y + h as i32);
-            line(display, cx, cy, x + w as i32, cy);
+            up(display);
+            down(display);
+            right(display);
         }
         // Light vertical and left
         '\u{2524}' => {
-            line(display, cx, y, cx, y + h as i32);
-            line(display, x, cy, cx, cy);
+            up(display);
+            down(display);
+            left(display);
         }
         // Light horizontal and down
         '\u{252C}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, cy, cx, y + h as i32);
+            left(display);
+            right(display);
+            down(display);
         }
         // Light horizontal and up
         '\u{2534}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, y, cx, cy);
+            left(display);
+            right(display);
+            up(display);
         }
         // Light vertical and horizontal
         '\u{253C}' => {
-            line(display, x, cy, x + w as i32, cy);
-            line(display, cx, y, cx, y + h as i32);
+            left(display);
+            right(display);
+            up(display);
+            down(display);
         }
         // Heavy horizontal
         '\u{2501}' => heavy_line(display, x, cy, x + w as i32, cy),
