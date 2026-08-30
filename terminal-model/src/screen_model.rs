@@ -349,6 +349,11 @@ impl Perform for ScreenModel {
                 self.cursor_y = row.min(self.rows - 1);
                 self.cursor_x = col.min(self.cols - 1);
             }
+            'd' => {
+                // Line Position Absolute (VPA): move to row Pn, column unchanged.
+                let row = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
+                self.cursor_y = row.min(self.rows - 1);
+            }
             'J' => {
                 // Erase in Display
                 let n = params.iter().next().map(|p| p[0]).unwrap_or(0);
@@ -533,5 +538,27 @@ mod tests {
 
         assert!(model.lines[0].chars.iter().all(|&c| c == ' '));
         assert!(model.lines[0].dirty);
+    }
+
+    // Reproduces the regression from
+    // /ai/firstmate/data/picocalc-overlapping-text-corruption/report.md: a terminal
+    // multiplexer's "CUP-then-cheap-VPA-restore" idiom - an absolute cursor position
+    // (e.g. for its own status-line redraw) immediately followed by a bare `CSI Pn d`
+    // (Line Position Absolute) to restore just the row, leaving the column as the
+    // multiplexer's own redraw left it - previously left cursor_y stale since VPA fell
+    // through the catch-all. That caused the next print() to land on the wrong row,
+    // smashing unrelated content together mid-word.
+    #[test]
+    fn vpa_line_position_absolute_restores_cursor_row() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"cong"); // row 0: live line so far
+        feed(&mut model, b"\x1b[6;1Hunacknowledged data can be"); // row 5: unrelated content
+        feed(&mut model, b"\x1b[6;5H\x1b[1d"); // CUP then VPA-restore idiom
+        feed(&mut model, b"estion window begins"); // should land on row 0
+
+        let row0: alloc::string::String = model.lines[0].chars[0..25].iter().collect();
+        let row5: alloc::string::String = model.lines[5].chars[0..27].iter().collect();
+        assert_eq!(row0.trim_end(), "congestion window begins");
+        assert_eq!(row5.trim_end(), "unacknowledged data can be");
     }
 }
