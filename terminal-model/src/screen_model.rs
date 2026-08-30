@@ -506,6 +506,23 @@ mod tests {
         assert_eq!(model.cursor_x, cols - 1);
     }
 
+    // An explicit zero parameter ("\x1b[0C"/"\x1b[0D") must leave the cursor in place,
+    // matching main's pre-refactor `unwrap_or(1)` (no `.max(1)` clamp) verbatim: this PR
+    // is a pure move with zero behavioral changes, so bare-CSI parameter parsing for
+    // explicit zero is reproduced as-is rather than "fixed" here.
+    #[test]
+    fn cursor_forward_and_backward_do_not_move_on_explicit_zero_param() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"AB");
+        assert_eq!(model.cursor_x, 2);
+
+        feed(&mut model, b"\x1b[0C");
+        assert_eq!(model.cursor_x, 2);
+
+        feed(&mut model, b"\x1b[0D");
+        assert_eq!(model.cursor_x, 2);
+    }
+
     #[test]
     fn erase_in_line_still_blanks_and_marks_dirty() {
         let mut model = ScreenModel::default();
