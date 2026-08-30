@@ -261,6 +261,15 @@ impl ScreenModel {
     }
 }
 
+// vte always pushes a parameter slot on CSI dispatch, even when the sequence had no
+// digits (e.g. bare `CSI C`) - the missing parameter comes through as an explicit 0,
+// not an absent one. ECMA-48 treats both "absent" and "0" as "use the default value",
+// so `.unwrap_or(1)` alone never fires for the common bare-sequence case; this maps
+// both cases to the default of 1.
+fn cursor_move_count(params: &vte::Params) -> usize {
+    params.iter().next().map(|p| p[0]).unwrap_or(0).max(1) as usize
+}
+
 impl Perform for ScreenModel {
     fn print(&mut self, c: char) {
         self.reset_view();
@@ -323,22 +332,22 @@ impl Perform for ScreenModel {
         match action {
             'A' => {
                 // Cursor Up
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
+                let n = cursor_move_count(params);
                 self.cursor_y = self.cursor_y.saturating_sub(n);
             }
             'B' => {
                 // Cursor Down
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
+                let n = cursor_move_count(params);
                 self.cursor_y = (self.cursor_y + n).min(self.rows - 1);
             }
             'C' => {
                 // Cursor Forward
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
+                let n = cursor_move_count(params);
                 self.cursor_x = (self.cursor_x + n).min(self.cols - 1);
             }
             'D' => {
                 // Cursor Backward
-                let n = params.iter().next().map(|p| p[0]).unwrap_or(1) as usize;
+                let n = cursor_move_count(params);
                 self.cursor_x = self.cursor_x.saturating_sub(n);
             }
             'H' | 'f' => {
@@ -489,18 +498,36 @@ mod tests {
         assert_eq!(model.cursor_x, 2);
     }
 
-    // Uses an explicit count ("\x1b[1C") rather than the bare `ESC[C` form here: with
-    // an explicit digit, vte reports the parameter as-typed, so this exercises pure
-    // content-preservation independent of how a parameter-less form parses.
+    // Reproduces the regression from /ai/firstmate/data/picocalc-random-blanked-chars/report.md:
+    // Ink uses the exact same bare `CSI C` idiom to skip over a column whose character
+    // is unchanged from the previous frame during a redraw - including a real mid-word
+    // letter - as it does for runs of typed spaces it believes are already blank. This
+    // replays the report's own live-captured byte sequence ("Captain, s" + bare CSI C
+    // skipping an already-correct 'h' + "ip" + "shape.") and asserts the skipped letter
+    // survives untouched, matching content-preserving CUF semantics. Relies on
+    // cursor_move_count treating the bare form as count 1, not 0.
     #[test]
     fn cursor_forward_over_unchanged_midword_letter_does_not_blank_it() {
         let mut model = ScreenModel::default();
         feed(&mut model, b"Captain, shipshape.\r");
 
-        feed(&mut model, b"Captain, s\x1b[1Cip");
+        feed(&mut model, b"Captain, s\x1b[Cip");
 
         let line: alloc::string::String = model.lines[0].chars[0..19].iter().collect();
         assert_eq!(line, "Captain, shipshape.");
+    }
+
+    // vte always pushes a parameter (0, not absent) even for a bare CSI, so a naive
+    // `.unwrap_or(1)` on the parsed value would silently compute n=0 for the extremely
+    // common bare `ESC[C` form (no digit) claude-code's Ink renderer actually emits.
+    #[test]
+    fn cursor_forward_default_count_is_one() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"XYZ\r");
+
+        feed(&mut model, b"\x1b[C");
+
+        assert_eq!(model.cursor_x, 1);
     }
 
     #[test]
@@ -511,20 +538,19 @@ mod tests {
         assert_eq!(model.cursor_x, cols - 1);
     }
 
-    // An explicit zero parameter ("\x1b[0C"/"\x1b[0D") must leave the cursor in place,
-    // matching main's pre-refactor `unwrap_or(1)` (no `.max(1)` clamp) verbatim: this PR
-    // is a pure move with zero behavioral changes, so bare-CSI parameter parsing for
-    // explicit zero is reproduced as-is rather than "fixed" here.
+    // ECMA-48 treats "0" and "absent" as the same "use the default value" case, so an
+    // explicit zero parameter ("\x1b[0C"/"\x1b[0D") must move by 1, exactly like the
+    // bare form - cursor_move_count handles both the same way.
     #[test]
-    fn cursor_forward_and_backward_do_not_move_on_explicit_zero_param() {
+    fn cursor_forward_and_backward_move_by_one_on_explicit_zero_param() {
         let mut model = ScreenModel::default();
         feed(&mut model, b"AB");
         assert_eq!(model.cursor_x, 2);
 
-        feed(&mut model, b"\x1b[0C");
-        assert_eq!(model.cursor_x, 2);
-
         feed(&mut model, b"\x1b[0D");
+        assert_eq!(model.cursor_x, 1);
+
+        feed(&mut model, b"\x1b[0C");
         assert_eq!(model.cursor_x, 2);
     }
 

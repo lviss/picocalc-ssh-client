@@ -20,6 +20,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
   extending this crate over adding tests to the hardware-coupled root crate.
+- `vte::Params` always pushes a parameter slot on `csi_dispatch`, even for a bare sequence with no
+  digits (e.g. `CSI C`) — the "no parameter" case arrives as an explicit `0`, not an absent one.
+  A plain `params.iter().next().map(|p| p[0]).unwrap_or(1)` therefore silently computes `0` instead
+  of the ECMA-48 default of `1` for the extremely common bare-sequence form. Use
+  `.unwrap_or(0).max(1)` (see `cursor_move_count` in `terminal-model/src/screen_model.rs`) for any
+  CSI parameter that has a nonzero default.
 
 ## Maintaining this file
 
