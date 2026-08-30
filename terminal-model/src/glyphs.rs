@@ -60,6 +60,14 @@ where
             .ok();
     };
 
+    // Helper to draw a heavy (stroke-2) line, used by the bold box-drawing glyphs
+    let heavy_line = |display: &mut D, x0, y0, x1, y1| {
+        Line::new(Point::new(x0, y0), Point::new(x1, y1))
+            .into_styled(PrimitiveStyle::with_stroke(color, 2))
+            .draw(display)
+            .ok();
+    };
+
     // Helpers for the double-line corner glyphs below: a double-stroke vertical
     // segment spanning either the top or bottom half, and a double-stroke
     // horizontal segment spanning either the left or right half.
@@ -125,19 +133,9 @@ where
             line(display, cx, y, cx, y + h as i32);
         }
         // Heavy horizontal
-        '\u{2501}' => {
-            Line::new(Point::new(x, cy), Point::new(x + w as i32, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 2))
-                .draw(display)
-                .ok();
-        }
+        '\u{2501}' => heavy_line(display, x, cy, x + w as i32, cy),
         // Heavy vertical
-        '\u{2503}' => {
-            Line::new(Point::new(cx, y), Point::new(cx, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 2))
-                .draw(display)
-                .ok();
-        }
+        '\u{2503}' => heavy_line(display, cx, y, cx, y + h as i32),
         // Block
         '\u{2588}' => {
             display
