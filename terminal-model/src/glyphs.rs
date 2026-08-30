@@ -207,102 +207,42 @@ where
         // Double lines
         '\u{2550}' => {
             // Horizontal double
-            Line::new(Point::new(x, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, x, cy - 1, x + w as i32, cy - 1);
+            line(display, x, cy + 1, x + w as i32, cy + 1);
         }
         '\u{2551}' => {
             // Vertical double
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, y, cx - 1, y + h as i32);
+            line(display, cx + 1, y, cx + 1, y + h as i32);
         }
         // Double corners (simplified as single heavy for now to save space/complexity, or proper implementation)
         '\u{2554}' => {
             // Double down-right
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, cy, cx - 1, y + h as i32);
+            line(display, cx + 1, cy, cx + 1, y + h as i32);
+            line(display, cx, cy - 1, x + w as i32, cy - 1);
+            line(display, cx, cy + 1, x + w as i32, cy + 1);
         }
         '\u{2557}' => {
             // Double down-left
-            Line::new(Point::new(cx - 1, cy), Point::new(cx - 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, cy), Point::new(cx + 1, y + h as i32))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, cy, cx - 1, y + h as i32);
+            line(display, cx + 1, cy, cx + 1, y + h as i32);
+            line(display, x, cy - 1, cx, cy - 1);
+            line(display, x, cy + 1, cx, cy + 1);
         }
         '\u{255A}' => {
             // Double up-right
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy - 1), Point::new(x + w as i32, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx, cy + 1), Point::new(x + w as i32, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, y, cx - 1, cy);
+            line(display, cx + 1, y, cx + 1, cy);
+            line(display, cx, cy - 1, x + w as i32, cy - 1);
+            line(display, cx, cy + 1, x + w as i32, cy + 1);
         }
         '\u{255D}' => {
             // Double up-left
-            Line::new(Point::new(cx - 1, y), Point::new(cx - 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(cx + 1, y), Point::new(cx + 1, cy))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy - 1), Point::new(cx, cy - 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
-            Line::new(Point::new(x, cy + 1), Point::new(cx, cy + 1))
-                .into_styled(PrimitiveStyle::with_stroke(color, 1))
-                .draw(display)
-                .ok();
+            line(display, cx - 1, y, cx - 1, cy);
+            line(display, cx + 1, y, cx + 1, cy);
+            line(display, x, cy - 1, cx, cy - 1);
+            line(display, x, cy + 1, cx, cy + 1);
         }
 
         _ => {
