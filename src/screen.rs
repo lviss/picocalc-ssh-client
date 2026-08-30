@@ -96,11 +96,11 @@ impl Screen {
     }
 
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
-        if let Some(expiry) = self.overlay_expiry {
-            if Instant::now() >= expiry {
-                self.overlay_expiry = None;
-                self.model.clear_overlay();
-            }
+        if let Some(expiry) = self.overlay_expiry
+            && Instant::now() >= expiry
+        {
+            self.overlay_expiry = None;
+            self.model.clear_overlay();
         }
         update_display(&mut self.model, display);
     }
@@ -152,7 +152,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
             continue;
         }
 
-        let row_y = y as u32 * cell_height as u32;
+        let row_y = y as u32 * cell_height;
         if row_y >= SCREEN_HEIGHT as u32 {
             break;
         }
@@ -182,7 +182,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                 .fill_solid(
                     &Rectangle::new(
                         Point::new(col_x as i32, row_y as i32),
-                        Size::new(cell_width, cell_height as u32),
+                        Size::new(cell_width, cell_height),
                     ),
                     bg,
                 )
@@ -207,7 +207,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                         col_x as i32,
                         row_y as i32,
                         cell_width,
-                        cell_height as u32,
+                        cell_height,
                         fg,
                     );
                 } else if is_symbol_char(*char) {
@@ -217,7 +217,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                         col_x as i32,
                         row_y as i32,
                         cell_width,
-                        cell_height as u32,
+                        cell_height,
                         fg,
                     );
                 } else {
@@ -235,7 +235,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
                 display
                     .fill_solid(
                         &Rectangle::new(
-                            Point::new(col_x as i32, (row_y + cell_height as u32 - 1) as i32),
+                            Point::new(col_x as i32, (row_y + cell_height - 1) as i32),
                             Size::new(cell_width, 1),
                         ),
                         fg,
@@ -249,13 +249,13 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
     // Draw cursor
     let cx = model.cursor_x as u32 * cell_width;
-    let cy = model.cursor_y as u32 * cell_height as u32;
+    let cy = model.cursor_y as u32 * cell_height;
     if cx < SCREEN_WIDTH as u32 && cy < SCREEN_HEIGHT as u32 {
         display
             .fill_solid(
                 &Rectangle::new(
                     Point::new(cx as i32, cy as i32),
-                    Size::new(cell_width, cell_height as u32),
+                    Size::new(cell_width, cell_height),
                 ),
                 Rgb565::WHITE,
             )
@@ -317,9 +317,7 @@ fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
 #[embassy_executor::task]
 pub async fn screen_painter(mut display: PicoCalcDisplay<'static>) {
     display.clear(Rgb565::BLACK).unwrap();
-    if let Err(err) = display.set_vertical_scroll_region(0, 0) {
-        // log::error!("failed to set_vertical_scroll_region: {err:?}");
-    }
+    let _ = display.set_vertical_scroll_region(0, 0);
 
     let mut ticker = Ticker::every(Duration::from_millis(200));
     loop {

@@ -60,7 +60,7 @@ impl UnixTime {
             Ok(time) => {
                 let elapsed = time.instant.elapsed();
 
-                let mut seconds = time.unix.seconds.saturating_add(elapsed.as_secs() as u64);
+                let mut seconds = time.unix.seconds.saturating_add(elapsed.as_secs());
                 let remainder = elapsed - Duration::from_secs(elapsed.as_secs());
                 let mut useconds = time
                     .unix
@@ -217,7 +217,7 @@ pub async fn time_sync(stack: Stack<'static>) {
                         let now_ts = UnixTime::now();
                         let rfc3339 = Rfc3339(now_ts.as_chrono());
 
-                        let offset = Duration::from_micros(time.offset.abs() as u64);
+                        let offset = Duration::from_micros(time.offset.unsigned_abs());
                         if first {
                             first = false;
                             print!("The time is {rfc3339}\r\n");

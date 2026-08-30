@@ -41,7 +41,7 @@ impl From<u8> for KeyState {
             1 => Self::Pressed,
             2 => Self::Hold,
             3 => Self::Released,
-            0 | _ => Self::Idle,
+            _ => Self::Idle,
         }
     }
 }
@@ -375,11 +375,12 @@ pub async fn keyboard_reader(
                     }
                     _ => {
                         let proc = current_proc();
-                        if let Err(_) = with_timeout(Duration::from_millis(100), async {
+                        if with_timeout(Duration::from_millis(100), async {
                             proc.key_input(key).await;
                             proc.render().await;
                         })
                         .await
+                        .is_err()
                         {
                             log::info!("timeout sending key to proc {}", proc.name());
                         }

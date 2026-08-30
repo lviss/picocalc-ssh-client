@@ -198,26 +198,25 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
                 // Encode a key with xterm style keyboard encoding.
                 // FIXME: woefully incomplete!
 
-                if key_report.modifiers == Modifiers::CTRL {
-                    if let Key::Char(c) = key_report.key {
-                        if let Some(mapped) = ctrl_mapping(c) {
-                            log::info!(
-                                "doing mapped ctrl {} -> {}",
-                                c.escape_debug(),
-                                mapped.escape_debug()
-                            );
-                            let mut buf = [0u8; 4];
-                            log::info!(
-                                "{:?}",
-                                with_timeout(
-                                    TIMEOUT_DURATION,
-                                    channel.write_all(mapped.encode_utf8(&mut buf).as_bytes()),
-                                )
-                                .await
-                            );
-                            continue;
-                        }
-                    }
+                if key_report.modifiers == Modifiers::CTRL
+                    && let Key::Char(c) = key_report.key
+                    && let Some(mapped) = ctrl_mapping(c)
+                {
+                    log::info!(
+                        "doing mapped ctrl {} -> {}",
+                        c.escape_debug(),
+                        mapped.escape_debug()
+                    );
+                    let mut buf = [0u8; 4];
+                    log::info!(
+                        "{:?}",
+                        with_timeout(
+                            TIMEOUT_DURATION,
+                            channel.write_all(mapped.encode_utf8(&mut buf).as_bytes()),
+                        )
+                        .await
+                    );
+                    continue;
                 }
 
                 if key_report.modifiers == Modifiers::ALT {
@@ -421,7 +420,7 @@ async fn ssh_session_task(host: String, port: u16, username: Option<String>, com
                                         use heapless::{String, Vec};
 
                                         let mut term = String::<32>::new();
-                                        let _ = term.push_str("xterm").unwrap();
+                                        term.push_str("xterm").unwrap();
 
                                         let pty = {
                                             let screen = SCREEN.get().lock().await;
@@ -588,10 +587,10 @@ fn alias_key(alias: &str) -> Option<heapless::String<32>> {
 /// otherwise returns `name` unchanged, to be parsed as a literal
 /// `[user@]host[:port]`.
 async fn resolve_target(name: &str) -> String {
-    if let Some(key) = alias_key(name) {
-        if let Ok(Some(value)) = CONFIG.get().lock().await.fetch(key.as_str()).await {
-            return value.as_str().to_string();
-        }
+    if let Some(key) = alias_key(name)
+        && let Ok(Some(value)) = CONFIG.get().lock().await.fetch(key.as_str()).await
+    {
+        return value.as_str().to_string();
     }
     name.to_string()
 }

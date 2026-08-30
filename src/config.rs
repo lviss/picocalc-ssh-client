@@ -7,7 +7,6 @@ use embassy_rp::peripherals::{DMA_CH3, FLASH};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex;
-use embedded_io::ErrorKind;
 use heapless::FnvIndexMap;
 use sequential_storage::cache::NoCache;
 use sequential_storage::erase_all;
@@ -178,26 +177,6 @@ impl Flash {
     #[allow(unused)]
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), FlashError> {
         self.flash.read(offset, bytes).await
-    }
-}
-
-#[derive(Debug)]
-pub struct EmbeddedFlashError(FlashError);
-
-impl From<FlashError> for EmbeddedFlashError {
-    fn from(err: FlashError) -> Self {
-        Self(err)
-    }
-}
-
-impl embedded_io::Error for EmbeddedFlashError {
-    fn kind(&self) -> ErrorKind {
-        match self.0 {
-            FlashError::OutOfBounds => ErrorKind::InvalidInput,
-            FlashError::Unaligned => ErrorKind::InvalidInput,
-            FlashError::InvalidCore => ErrorKind::InvalidInput,
-            FlashError::Other => ErrorKind::Other,
-        }
     }
 }
 

@@ -62,7 +62,7 @@ impl PsRam {
     pub async fn write(&mut self, mut addr: u32, mut data: &[u8]) {
         // I haven't seen this work reliably over 24 bytes
         const MAX_CHUNK: usize = 24;
-        while data.len() > 0 {
+        while !data.is_empty() {
             let to_write = data.len().min(MAX_CHUNK);
             //log::info!("writing {to_write} @ {addr}");
 
@@ -114,7 +114,7 @@ impl PsRam {
         // Cannot get reliable reads above 4 bytes at a time.
         // out[4] will always have a bit error
         const MAX_CHUNK: usize = 4;
-        while out.len() > 0 {
+        while !out.is_empty() {
             let to_read = out.len().min(MAX_CHUNK);
             //log::info!("reading {to_read} @ {addr}");
             self.send_command(
@@ -282,7 +282,7 @@ done:
         psram.write8(i as u32, i).await;
     }
     for i in 0..10u32 {
-        let n = psram.read8(i as u32).await;
+        let n = psram.read8(i).await;
         if n as u32 != i {
             log::error!("error @ {i}, expected {i}, but got {n}");
         }
@@ -376,14 +376,13 @@ async fn test_psram(psram: &mut PsRam) -> bool {
         let addr = i * BLOCK_SIZE as u32;
         let data = expect(addr);
         psram.write(addr, &data).await;
-        if addr > 0 && addr % REPORT_CHUNK == 0 {
-            if start.elapsed() > Duration::from_secs(5) {
-                log::info!(
-                    "writing, addr={addr:x}, elapsed={}s, {}/s",
-                    start.elapsed().as_secs(),
-                    addr as u64 / start.elapsed().as_secs().max(1)
-                );
-            }
+        if addr > 0 && addr.is_multiple_of(REPORT_CHUNK) && start.elapsed() > Duration::from_secs(5)
+        {
+            log::info!(
+                "writing, addr={addr:x}, elapsed={}s, {}/s",
+                start.elapsed().as_secs(),
+                addr as u64 / start.elapsed().as_secs().max(1)
+            );
         }
         // Yield so that the watchdog doesn't kick in
         yield_now().await;
@@ -410,14 +409,13 @@ async fn test_psram(psram: &mut PsRam) -> bool {
                 log::info!("bad read @{addr:x} got {data:x?} vs {expect:x?}",);
             }
         }
-        if addr > 0 && addr % REPORT_CHUNK == 0 {
-            if start.elapsed() > Duration::from_secs(5) {
-                log::info!(
-                    "reading, bad={bad_count}, addr={addr:x}, elapsed={}s, {}/s",
-                    start.elapsed().as_secs(),
-                    addr as u64 / start.elapsed().as_secs().max(1)
-                );
-            }
+        if addr > 0 && addr.is_multiple_of(REPORT_CHUNK) && start.elapsed() > Duration::from_secs(5)
+        {
+            log::info!(
+                "reading, bad={bad_count}, addr={addr:x}, elapsed={}s, {}/s",
+                start.elapsed().as_secs(),
+                addr as u64 / start.elapsed().as_secs().max(1)
+            );
         }
 
         // Yield so that the watchdog doesn't kick in
@@ -572,7 +570,7 @@ pub fn init_psram_qmi(
 
     let clock_hz = clk_peri_freq();
 
-    let mut divisor: u32 = (clock_hz + MAX_PSRAM_FREQ - 1) / MAX_PSRAM_FREQ;
+    let mut divisor: u32 = clock_hz.div_ceil(MAX_PSRAM_FREQ);
     if divisor == 1 && clock_hz > 100_000_000 {
         divisor = 2;
     }
@@ -585,8 +583,8 @@ pub fn init_psram_qmi(
     // - Min deselect must be >= 18ns.  The value is given in system clock cycles - ceil(divisor / 2).
     let clock_period_fs: u64 = 1_000_000_000_000_000_u64 / u64::from(clock_hz);
     let max_select: u8 = ((125 * 1_000_000) / clock_period_fs) as u8;
-    let min_deselect: u32 = ((18 * 1_000_000 + (clock_period_fs - 1)) / clock_period_fs
-        - u64::from(divisor + 1) / 2) as u32;
+    let min_deselect: u32 =
+        ((18 * 1_000_000u64).div_ceil(clock_period_fs) - u64::from(divisor + 1) / 2) as u32;
 
     log::info!(
         "clock_period_fs={clock_period_fs} max_select={max_select} min_deselect={min_deselect}"
