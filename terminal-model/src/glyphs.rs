@@ -309,11 +309,17 @@ where
         line(display, tip.x, tip.y, head2.x, head2.y, 1);
     };
 
+    // Draws a plain cross (horizontal + vertical spoke), shared by the
+    // four-teardrop-spoked asterisk and as the base of the burst pattern below.
+    let cross = |display: &mut D, stroke| {
+        line(display, x + 1, cy, x + w as i32 - 1, cy, stroke);
+        line(display, cx, y + 1, cx, y + h as i32 - 1, stroke);
+    };
+
     // Draws the 4-spoke asterisk burst (cross + diagonals) shared by the
     // eight-spoked, teardrop-spoked, and heavy-teardrop-spoked asterisk glyphs.
     let burst = |display: &mut D, stroke| {
-        line(display, x + 1, cy, x + w as i32 - 1, cy, stroke);
-        line(display, cx, y + 1, cx, y + h as i32 - 1, stroke);
+        cross(display, stroke);
         line(
             display,
             x + 2,
@@ -406,10 +412,7 @@ where
         // – en dash: a shorter horizontal line, roughly half the cell width
         '\u{2013}' => line(display, x + w as i32 / 4, cy, x + (w as i32 * 3) / 4, cy, 1),
         // ✢ four teardrop-spoked asterisk: a plain cross (4 spokes, no diagonals)
-        '\u{2722}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-        }
+        '\u{2722}' => cross(display, 1),
         // ✶ six pointed black star: three lines through the center, spaced apart
         '\u{2736}' => {
             line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
