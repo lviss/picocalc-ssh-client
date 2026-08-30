@@ -52,6 +52,30 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   the way through codegen; only the final link step needs `flip-link`, which may not be installed
   in every environment (`cargo install flip-link` needs network/build tools) — that's a linker
   availability gap, not a code problem, if it's the only failure.
+- `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
+  computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
+  (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and
+  other boot-time subsystems reliably need per real-hardware `free`-command readings). A correctly
+  *capped* scrollback buffer can still exceed the primary heap by 2x+ if the cap is a flat number
+  disconnected from actual heap size - see `/ai/firstmate/data/picocalc-crash-display-buffer/report.md`
+  and the two host tests next to `safe_max_scrollback_for` in `terminal-model/src/screen_model.rs`
+  (`default_scrollback_cap_keeps_full_footprint_within_heap_budget`,
+  `heavy_output_scroll_pressure_accelerates_once_visible_area_fills_up` - the latter documents why
+  memory pressure from heavy output *accelerates* rather than growing linearly: `scroll_up()` only
+  allocates a new `ScreenLine` once the visible `lines` area is already full, so output that still
+  fits on-screen is nearly free while output that has to scroll costs one full line-allocation per
+  line). `ScreenModel::set_max_scrollback` self-clamps to `max_safe_scrollback()`, so raising the
+  user-settable `scroll` config (`src/config.rs`) can never reintroduce this crash even if
+  `config.rs`'s own bound-check is ever bypassed or a stale large value is loaded from flash at boot.
+  `bytes_per_line()`'s budget counts `size_of::<ScreenLine>()` per slot (not just the two inner
+  `chars`/`attrs` allocations) to cover the outer `Vec<ScreenLine>` containers (`lines` and
+  `scrollback`) themselves; this only holds because `Default::default()` pre-reserves
+  `scrollback`'s capacity to `max_scrollback + 1` up front (`scroll_up`'s push-then-`remove(0)`
+  peak) instead of growing it via `Vec::new()` + amortized doubling, which would let its real
+  backing capacity overshoot the budgeted count. Any future change to how `scrollback` grows must
+  preserve that fixed pre-reserved capacity or the container-overhead accounting goes stale again.
+  Re-run the two tests above (and re-derive the budget) if `HEAP_SIZE` (`src/heap.rs`) or the screen
+  geometry (font/`SCREEN_WIDTH`/`SCREEN_HEIGHT`) ever changes.
 - On a NixOS-style agent sandbox where plain `cargo`/`rustc` aren't on `PATH`, the working
   toolchain lives under `$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu/bin` (set
   `RUSTUP_HOME=/home/ai/.rustup` and prepend that dir to `PATH`); building anything host-targeted
