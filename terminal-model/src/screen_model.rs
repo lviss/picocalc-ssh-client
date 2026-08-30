@@ -241,6 +241,15 @@ impl ScreenModel {
         }
     }
 
+    /// Scrolls up by one line if the cursor has moved past the last row,
+    /// clamping it back onto the newly revealed bottom row.
+    fn scroll_if_cursor_past_bottom(&mut self) {
+        if self.cursor_y >= self.rows {
+            self.scroll_up();
+            self.cursor_y = self.rows - 1;
+        }
+    }
+
     pub fn scroll_view_up(&mut self, n: usize) {
         self.viewport_offset = (self.viewport_offset + n).min(self.scrollback.len());
         self.full_repaint = true;
@@ -311,17 +320,11 @@ fn erase_mode(params: &vte::Params) -> u16 {
 impl Perform for ScreenModel {
     fn print(&mut self, c: char) {
         self.reset_view();
-        if self.cursor_y >= self.rows {
-            self.scroll_up();
-            self.cursor_y = self.rows - 1;
-        }
+        self.scroll_if_cursor_past_bottom();
         if self.cursor_x >= self.cols {
             self.cursor_x = 0;
             self.cursor_y += 1;
-            if self.cursor_y >= self.rows {
-                self.scroll_up();
-                self.cursor_y = self.rows - 1;
-            }
+            self.scroll_if_cursor_past_bottom();
         }
 
         let line = &mut self.lines[self.cursor_y];
@@ -339,10 +342,7 @@ impl Perform for ScreenModel {
             b'\n' => {
                 // LF
                 self.cursor_y += 1;
-                if self.cursor_y >= self.rows {
-                    self.scroll_up();
-                    self.cursor_y = self.rows - 1;
-                }
+                self.scroll_if_cursor_past_bottom();
             }
             b'\r' => {
                 // CR
