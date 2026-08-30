@@ -10,7 +10,7 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex as AsyncMutex;
 use embassy_time::{Duration, Instant, Ticker};
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyleBuilder};
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
@@ -112,6 +112,18 @@ impl fmt::Write for Screen {
     }
 }
 
+fn text_style(
+    font: &'static MonoFont<'static>,
+    fg: Rgb565,
+    bg: Rgb565,
+) -> MonoTextStyle<'static, Rgb565> {
+    MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(fg)
+        .background_color(bg)
+        .build()
+}
+
 fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     if model.full_repaint {
         display.clear(Rgb565::BLACK).unwrap();
@@ -189,11 +201,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
             // Draw text
             if *char != ' ' {
-                let style = MonoTextStyleBuilder::new()
-                    .font(font)
-                    .text_color(fg)
-                    .background_color(bg)
-                    .build();
+                let style = text_style(font, fg, bg);
 
                 // We need to handle char string
                 let mut buf = [0u8; 4];
@@ -271,7 +279,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     }
 }
 
-fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
+fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut PicoCalcDisplay) {
     const PADDING_X: i32 = 10;
     const PADDING_Y: i32 = 8;
 
@@ -299,11 +307,7 @@ fn draw_overlay(font: &MonoFont, text: &str, display: &mut PicoCalcDisplay) {
     .draw(display)
     .ok();
 
-    let style = MonoTextStyleBuilder::new()
-        .font(font)
-        .text_color(fg)
-        .background_color(bg)
-        .build();
+    let style = text_style(font, fg, bg);
     Text::new(
         text,
         Point::new(x + PADDING_X, y + PADDING_Y + font.baseline as i32),
