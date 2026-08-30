@@ -296,6 +296,12 @@ fn cursor_move_count(params: &vte::Params) -> usize {
     params.iter().next().map(|p| p[0]).unwrap_or(0).max(1) as usize
 }
 
+/// Reads a 1-based CSI position parameter (defaulting to 1) and converts it
+/// to a 0-based index, as used by cursor-positioning sequences like CUP/VPA.
+fn cursor_pos_index(param: Option<&[u16]>) -> usize {
+    param.map(|p| p[0]).unwrap_or(1).max(1) as usize - 1
+}
+
 impl Perform for ScreenModel {
     fn print(&mut self, c: char) {
         self.reset_view();
@@ -379,14 +385,14 @@ impl Perform for ScreenModel {
             'H' | 'f' => {
                 // Cursor Position
                 let mut iter = params.iter();
-                let row = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
-                let col = iter.next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
+                let row = cursor_pos_index(iter.next());
+                let col = cursor_pos_index(iter.next());
                 self.cursor_y = row.min(self.rows - 1);
                 self.cursor_x = col.min(self.cols - 1);
             }
             'd' => {
                 // Line Position Absolute (VPA): move to row Pn, column unchanged.
-                let row = params.iter().next().map(|p| p[0]).unwrap_or(1).max(1) as usize - 1;
+                let row = cursor_pos_index(params.iter().next());
                 self.cursor_y = row.min(self.rows - 1);
             }
             'J' => {
