@@ -177,6 +177,19 @@ pub struct KeyBoardState {
     modifiers: Modifiers,
 }
 
+/// Maps a modifier key to the Modifiers flag it controls, or None if
+/// the key is not a modifier.
+fn modifier_flag(key: Key) -> Option<Modifiers> {
+    match key {
+        Key::ModAlt => Some(Modifiers::ALT),
+        Key::ModControl => Some(Modifiers::CTRL),
+        Key::ModShiftLeft => Some(Modifiers::LSHIFT),
+        Key::ModShiftRight => Some(Modifiers::RSHIFT),
+        Key::ModSymbol => Some(Modifiers::SYM),
+        _ => None,
+    }
+}
+
 impl KeyBoardState {
     pub async fn process(&mut self) -> Option<KeyReport> {
         let key = read_keyboard().await.ok()?;
@@ -188,20 +201,10 @@ impl KeyBoardState {
         let (state, key) = key;
         match (state, key) {
             (KeyState::Idle, Key::None) => return None,
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModAlt) => {
-                self.modifiers.set(Modifiers::ALT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModControl) => {
-                self.modifiers.set(Modifiers::CTRL, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftLeft) => {
-                self.modifiers.set(Modifiers::LSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftRight) => {
-                self.modifiers.set(Modifiers::RSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModSymbol) => {
-                self.modifiers.set(Modifiers::SYM, s == KeyState::Hold);
+            (s @ (KeyState::Hold | KeyState::Released), key) => {
+                if let Some(flag) = modifier_flag(key) {
+                    self.modifiers.set(flag, s == KeyState::Hold);
+                }
             }
             _ => {}
         }
