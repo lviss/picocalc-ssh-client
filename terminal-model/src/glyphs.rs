@@ -297,6 +297,29 @@ where
             .ok();
     };
 
+    // Draws the 4-spoke asterisk burst (cross + diagonals) shared by the
+    // eight-spoked, teardrop-spoked, and heavy-teardrop-spoked asterisk glyphs.
+    let burst = |display: &mut D, stroke| {
+        line(display, x + 1, cy, x + w as i32 - 1, cy, stroke);
+        line(display, cx, y + 1, cx, y + h as i32 - 1, stroke);
+        line(
+            display,
+            x + 2,
+            y + 2,
+            x + w as i32 - 2,
+            y + h as i32 - 2,
+            stroke,
+        );
+        line(
+            display,
+            x + w as i32 - 2,
+            y + 2,
+            x + 2,
+            y + h as i32 - 2,
+            stroke,
+        );
+    };
+
     match c {
         // ❯ prompt chevron: a right-pointing angle bracket
         '\u{276F}' => {
@@ -402,12 +425,7 @@ where
             );
         }
         // ✳ eight spoked asterisk: burst of lines through the center
-        '\u{2733}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
-        }
+        '\u{2733}' => burst(display, 1),
         // ⏵ auto-mode triangle: small filled right-pointing triangle (play-button style)
         '\u{23F5}' => {
             let x0 = x + w as i32 / 4;
@@ -449,19 +467,9 @@ where
             );
         }
         // ✻ teardrop-spoked asterisk: same burst treatment as the eight-spoked asterisk
-        '\u{273B}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 1);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 1);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 1);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 1);
-        }
+        '\u{273B}' => burst(display, 1),
         // ✽ heavy teardrop-spoked asterisk: the same burst, drawn with a heavier stroke
-        '\u{273D}' => {
-            line(display, x + 1, cy, x + w as i32 - 1, cy, 2);
-            line(display, cx, y + 1, cx, y + h as i32 - 1, 2);
-            line(display, x + 2, y + 2, x + w as i32 - 2, y + h as i32 - 2, 2);
-            line(display, x + w as i32 - 2, y + 2, x + 2, y + h as i32 - 2, 2);
-        }
+        '\u{273D}' => burst(display, 2),
         _ => {}
     }
 }

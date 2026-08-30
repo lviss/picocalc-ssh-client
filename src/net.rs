@@ -257,7 +257,12 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
 }
 
 #[embassy_executor::task]
-async fn ssh_session_task(host: String, port: u16, username: Option<String>, command: Option<String>) {
+async fn ssh_session_task(
+    host: String,
+    port: u16,
+    username: Option<String>,
+    command: Option<String>,
+) {
     let Some(stack) = STACK.get().lock().await.as_ref().copied() else {
         print!("network is offline\r\n");
         return;

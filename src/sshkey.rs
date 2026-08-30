@@ -84,8 +84,7 @@ fn pubkey_blob(pubkey: &[u8; 32]) -> [u8; 51] {
     blob
 }
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(input: &[u8]) -> heapless::String<96> {
     let mut out = heapless::String::new();

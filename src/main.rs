@@ -266,7 +266,11 @@ async fn main(spawner: Spawner) {
     if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await
         && let Ok(val) = val_str.parse::<usize>()
     {
-        crate::screen::SCREEN.get().lock().await.set_max_scrollback(val);
+        crate::screen::SCREEN
+            .get()
+            .lock()
+            .await
+            .set_max_scrollback(val);
     }
 
     crate::net::setup_wifi(
