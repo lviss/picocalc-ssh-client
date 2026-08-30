@@ -38,13 +38,9 @@ pub async fn assign_proc_if(
 }
 
 pub async fn assign_proc(proc: ProcHandle) -> ProcHandle {
-    let prior = CURRENT
-        .get()
-        .lock(|current| core::mem::replace(&mut *current.borrow_mut(), proc.clone()));
-
-    prior.un_prompt(&mut *SCREEN.get().lock().await);
-    proc.render().await;
-    prior
+    assign_proc_if(proc, |_| true)
+        .await
+        .expect("a condition of |_| true always succeeds")
 }
 
 pub fn current_proc() -> ProcHandle {
