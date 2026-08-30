@@ -33,50 +33,43 @@ impl Configuration {
         self.flash.replace(flash);
     }
 
+    fn flash_mut(&mut self) -> &mut RpFlash<'static, FLASH, Async, PICO2_FLASH_SIZE> {
+        match &mut self.flash {
+            Some(flash) => &mut flash.flash,
+            None => todo!(),
+        }
+    }
+
     pub async fn fetch(
         &mut self,
         key: &str,
     ) -> Result<Option<StrValue>, sequential_storage::Error<embassy_rp::flash::Error>> {
-        match &mut self.flash {
-            Some(flash) => {
-                let key: StrKey = key.try_into()?;
-                let mut buf = [0u8; SCRATCH_SIZE];
-                fetch_item(
-                    &mut flash.flash,
-                    CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
-                    &mut NoCache::new(),
-                    &mut buf,
-                    &key,
-                )
-                .await
-            }
-            None => {
-                todo!();
-            }
-        }
+        let key: StrKey = key.try_into()?;
+        let mut buf = [0u8; SCRATCH_SIZE];
+        fetch_item(
+            self.flash_mut(),
+            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            &mut NoCache::new(),
+            &mut buf,
+            &key,
+        )
+        .await
     }
 
     pub async fn remove(
         &mut self,
         key: &str,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        match &mut self.flash {
-            Some(flash) => {
-                let key: StrKey = key.try_into()?;
-                let mut buf = [0u8; SCRATCH_SIZE];
-                remove_item(
-                    &mut flash.flash,
-                    CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
-                    &mut NoCache::new(),
-                    &mut buf,
-                    &key,
-                )
-                .await
-            }
-            None => {
-                todo!();
-            }
-        }
+        let key: StrKey = key.try_into()?;
+        let mut buf = [0u8; SCRATCH_SIZE];
+        remove_item(
+            self.flash_mut(),
+            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            &mut NoCache::new(),
+            &mut buf,
+            &key,
+        )
+        .await
     }
 
     pub async fn store(
@@ -84,37 +77,23 @@ impl Configuration {
         key: &str,
         value: StrValue,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        match &mut self.flash {
-            Some(flash) => {
-                let key: StrKey = key.try_into()?;
-                let mut buf = [0u8; SCRATCH_SIZE];
-                store_item(
-                    &mut flash.flash,
-                    CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
-                    &mut NoCache::new(),
-                    &mut buf,
-                    &key,
-                    &value,
-                )
-                .await
-            }
-            None => {
-                todo!();
-            }
-        }
+        let key: StrKey = key.try_into()?;
+        let mut buf = [0u8; SCRATCH_SIZE];
+        store_item(
+            self.flash_mut(),
+            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            &mut NoCache::new(),
+            &mut buf,
+            &key,
+            &value,
+        )
+        .await
     }
 
     pub async fn format(
         &mut self,
     ) -> Result<(), sequential_storage::Error<embassy_rp::flash::Error>> {
-        match &mut self.flash {
-            Some(flash) => {
-                erase_all(&mut flash.flash, CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE).await
-            }
-            None => {
-                todo!();
-            }
-        }
+        erase_all(self.flash_mut(), CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE).await
     }
 
     pub async fn get_all(
@@ -123,32 +102,25 @@ impl Configuration {
         FnvIndexMap<StrKey, StrValue, 32>,
         sequential_storage::Error<embassy_rp::flash::Error>,
     > {
-        match &mut self.flash {
-            Some(flash) => {
-                let mut buf = [0u8; SCRATCH_SIZE];
-                let mut cache = NoCache::new();
-                let mut iter = fetch_all_items::<StrKey, _, _>(
-                    &mut flash.flash,
-                    CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
-                    &mut cache,
-                    &mut buf,
-                )
-                .await?;
+        let mut buf = [0u8; SCRATCH_SIZE];
+        let mut cache = NoCache::new();
+        let mut iter = fetch_all_items::<StrKey, _, _>(
+            self.flash_mut(),
+            CONFIG_BASE..CONFIG_BASE + CONFIG_SIZE,
+            &mut cache,
+            &mut buf,
+        )
+        .await?;
 
-                let mut map = FnvIndexMap::new();
+        let mut map = FnvIndexMap::new();
 
-                while let Some((key, value)) = iter.next::<StrKey, StrValue>(&mut buf).await? {
-                    if let Err((k, v)) = map.insert(key, value) {
-                        print!("Configuration::get_all: too many keys. Ignoring {k} -> {v}\r\n");
-                    }
-                }
-
-                Ok(map)
-            }
-            None => {
-                todo!();
+        while let Some((key, value)) = iter.next::<StrKey, StrValue>(&mut buf).await? {
+            if let Err((k, v)) = map.insert(key, value) {
+                print!("Configuration::get_all: too many keys. Ignoring {k} -> {v}\r\n");
             }
         }
+
+        Ok(map)
     }
 }
 
