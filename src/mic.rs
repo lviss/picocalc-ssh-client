@@ -26,7 +26,9 @@ use embassy_rp::PeripheralRef;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::{DMA_CH4, PIN_16, PIN_17, PIN_18, PIO2};
 use embassy_rp::pio::program::pio_asm;
-use embassy_rp::pio::{Config, Direction, FifoJoin, Pio, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::pio::{
+    Config, Direction, FifoJoin, Pio, ShiftConfig, ShiftDirection, StateMachine,
+};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
@@ -116,7 +118,10 @@ impl Mic {
     }
 
     async fn capture(&mut self, buf: &mut [u32]) {
-        self.sm.rx().dma_pull(self.dma_ch.reborrow(), buf, false).await;
+        self.sm
+            .rx()
+            .dma_pull(self.dma_ch.reborrow(), buf, false)
+            .await;
     }
 }
 
@@ -124,7 +129,14 @@ impl Mic {
 /// PSRAM) and the pins freed by dropping SD card support, and spawns the
 /// capture and network-upload tasks. `bclk`/`ws`/`sd` must be
 /// `PIN_16`/`PIN_17`/`PIN_18` per AGENTS.md's pin contract.
-pub fn init_mic(spawner: &Spawner, pio2: PIO2, bclk: PIN_16, ws: PIN_17, sd: PIN_18, dma_ch4: DMA_CH4) {
+pub fn init_mic(
+    spawner: &Spawner,
+    pio2: PIO2,
+    bclk: PIN_16,
+    ws: PIN_17,
+    sd: PIN_18,
+    dma_ch4: DMA_CH4,
+) {
     let mut pio = Pio::new(pio2, Irqs);
 
     // Mirror of PioI2sOutProgram's pio_asm! block: same word/bit-clock
@@ -219,7 +231,10 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
 /// completion first) so the small `STREAM` channel keeps draining — and
 /// `capture_task`'s DMA pulls / I2S clock keep running — for the whole
 /// DNS+connect window instead of only after it.
-async fn connect_for_upload<'a>(tx_buf: &'a mut [u8], rx_buf: &'a mut [u8]) -> Option<TcpSocket<'a>> {
+async fn connect_for_upload<'a>(
+    tx_buf: &'a mut [u8],
+    rx_buf: &'a mut [u8],
+) -> Option<TcpSocket<'a>> {
     let Some(stack) = stack().await else {
         print!("ptt: network is offline, dropping recording\r\n");
         return None;
@@ -227,7 +242,10 @@ async fn connect_for_upload<'a>(tx_buf: &'a mut [u8], rx_buf: &'a mut [u8]) -> O
 
     let (host, port) = {
         let mut config = CONFIG.get().lock().await;
-        (config.fetch("ptt_host").await, config.fetch("ptt_port").await)
+        (
+            config.fetch("ptt_host").await,
+            config.fetch("ptt_port").await,
+        )
     };
     let (Ok(Some(host)), Ok(Some(port))) = (host, port) else {
         print!("ptt: set ptt_host and ptt_port to stream recordings\r\n");
