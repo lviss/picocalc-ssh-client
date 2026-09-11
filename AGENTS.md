@@ -49,9 +49,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully
   type-checks the firmware crate — useful for validating non-`terminal-model` changes without
   hardware. `cargo build --release --features <chip>` (what `make image` runs) also compiles all
-  the way through codegen; only the final link step needs `flip-link`, which may not be installed
-  in every environment (`cargo install flip-link` needs network/build tools) — that's a linker
-  availability gap, not a code problem, if it's the only failure.
+  the way through codegen and linking with `flip-link` on `PATH` (in this sandbox it's already
+  installed at `/home/ai/.cargo/bin/flip-link`, just not on `PATH` by default — `cargo install
+  flip-link` is a no-op confirming this; add `/home/ai/.cargo/bin` to `PATH` rather than
+  reinstalling). If `flip-link` is genuinely absent and can't be installed (no network/build
+  tools), that's a linker availability gap, not a code problem, if it's the only failure.
 - `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
   computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
   (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and
@@ -85,6 +87,40 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   out (`git submodule update --init embassy`) because `src/net.rs` embeds cyw43 firmware blobs
   from it via `include_bytes!`; `pico-sdk`/`picotool` are unrelated C build tooling and don't need
   to be initialized for a Rust-only check/build.
+
+- The `embassy/` git submodule is reference material only, NOT what actually gets compiled: every
+  `embassy-*` line in `Cargo.toml` is a bare `version = "*"` with no `path`/`git` override, so
+  Cargo resolves them from crates.io (check `Cargo.lock` — e.g. `embassy-rp` resolves to a released
+  `0.4.0`, which can be well behind the submodule's pinned commit). The two can have materially
+  different APIs (e.g. `0.4.0` uses the older `embassy_rp::{Peripheral, PeripheralRef, into_ref!}`
+  peripheral-ownership style throughout its `pio` module, while the submodule's HEAD has moved to a
+  newer `Peri<'d, T>` style) — always check the actual installed crate source
+  (`~/.cargo/registry/src/*/embassy-rp-<version>/`, fetch it with `cargo fetch` first if absent)
+  before writing code against any embassy-rp API, rather than trusting the submodule's source.
+  `src/psram.rs` is the up-to-date, actually-building example of this project's real PIO/DMA idiom
+  (`PeripheralRef`, `into_ref!`/`PeripheralRef::new`, `pio_asm!` via
+  `embassy_rp::pio::program::pio_asm`) to copy from.
+- Push-to-talk voice capture (`src/mic.rs`) captures mic audio on a held button and streams it to a
+  network host; the receiving/transcribing side is a separate, not-yet-built process outside this
+  repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is PSRAM) for a hand-written I2S RX
+  PIO program (embassy-rp ships no I2S RX driver, only the TX-only `pio_programs::i2s`; `mic.rs`'s
+  program is the mirror image of that driver's `pio_asm!` block, `in pins, 1` instead of
+  `out pins, 1`, unverified on real hardware) and the pins freed by removing SD card support (see
+  below): `GP16`/`GP17`/`GP18` = I2S `BCLK`/`WS`/`SD` (`GP19`/`GP22` spare). Capture is 16 kHz/16-bit
+  mono in ~25ms chunks, buffered through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>`
+  payloads land in the `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget
+  entry above) — deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`.
+  Button binding is `Key::ButtonLeft2` (`src/keyboard.rs`, one `match` arm to change for a different
+  physical button) and destination is `config set ptt_host`/`config set ptt_port` (plain
+  `sequential_storage` keys, no special-casing needed in `config.rs`). Wire format (needed by
+  anything implementing the receiving side): one TCP connection per utterance, opened on button
+  press and closed on release; each frame is a 4-byte little-endian `u32` byte count followed by
+  that many bytes of raw signed 16-bit little-endian mono PCM. No handshake, no other framing.
+- SD card support (`storage.rs`, the `ls` command, `README-DEVICE.md`'s old "TF Card reader"
+  section) was removed to free `GP16`/`GP17`/`GP18`/`GP19`/`GP22` for the mic above — it was an
+  undocumented, listing-only (no file content, no README.md feature mention), SPI0-only local
+  command with no interaction with the SSH/terminal workflow this project exists for. If it's ever
+  needed again, `git log` for its removal commit has the full original implementation to revert.
 
 ## Maintaining this file
 
