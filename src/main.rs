@@ -6,14 +6,13 @@ use crate::config::{CONFIG, Flash};
 use crate::heap::{HEAP, init_qmi_psram_heap};
 use crate::psram::{init_psram, init_psram_qmi};
 use crate::screen::SCREEN;
-use crate::storage::init_storage;
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::Spawner;
 use embassy_rp::block::ImageDef;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{PIO0, PIO1, SPI1, TRNG, UART0, UART1, USB};
+use embassy_rp::peripherals::{PIO0, PIO1, PIO2, SPI1, TRNG, UART0, UART1, USB};
 use embassy_rp::spi::Spi;
 use embassy_rp::uart::BufferedInterruptHandler;
 use embassy_rp::watchdog::Watchdog;
@@ -53,13 +52,13 @@ mod fixed_str;
 mod heap;
 mod keyboard;
 mod logging;
+mod mic;
 mod net;
 mod process;
 mod psram;
 mod rng;
 mod screen;
 mod sshkey;
-mod storage;
 mod time;
 
 const MAX_SPI_FREQ: u32 = 62_500_000;
@@ -85,6 +84,7 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    PIO2_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO2>;
     I2C1_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C1>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
@@ -257,10 +257,7 @@ async fn main(spawner: Spawner) {
         );
     }
 
-    init_storage(
-        &spawner, p.PIN_16, p.PIN_17, p.PIN_18, p.PIN_19, p.PIN_22, p.SPI0,
-    )
-    .await;
+    crate::mic::init_mic(&spawner, p.PIO2, p.PIN_16, p.PIN_17, p.PIN_18, p.DMA_CH4);
 
     // Load scrollback config
     if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await

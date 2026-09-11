@@ -18,12 +18,16 @@
 ## Audio
 GP26/GP27 - `PWM_L`/`PWM_R` on picocalc audio circuitry
 
-## TF Card reader
-* `GP16` - `SPI0_RX`
-* `GP17` - `SPI0_CS`
-* `GP18` - `SPI0_SCK`
-* `GP19` - `SPI0_TX`
-* `GP22` - `SD_DET`
+## Microphone (I2S, push-to-talk)
+* `GP16` - I2S `BCLK` (bit clock, firmware drives this)
+* `GP17` - I2S `WS`/`LRCLK` (word select, firmware drives this)
+* `GP18` - I2S `SD` (serial data, mic drives this - the only actual input line)
+* `GP19` - spare (unused, or wire as a mic enable/mute line)
+* `GP22` - spare (unused)
+
+These are the pins formerly used by the (now removed) SD card reader; see
+AGENTS.md for why they were repurposed and the pull-request that made the
+change.
 
 ## PSRAM
 * `GP2`  - `RAM_TX`

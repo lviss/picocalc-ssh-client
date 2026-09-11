@@ -169,6 +169,13 @@ pub async fn setup_wifi(
     STACK.get().lock().await.replace(stack);
 }
 
+/// Returns the network stack, if WiFi has finished bringing it up.
+/// Used by other subsystems (e.g. `crate::mic`'s push-to-talk uploader)
+/// that need a second, independent socket alongside the SSH one.
+pub async fn stack() -> Option<Stack<'static>> {
+    STACK.get().lock().await.as_ref().copied()
+}
+
 const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
 async fn send_key_bytes(channel: &mut ChanInOut<'_, '_>, bytes: &[u8]) {

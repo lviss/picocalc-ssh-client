@@ -1,7 +1,6 @@
 use crate::SCREEN;
 use crate::keyboard::{Key, KeyReport, KeyState};
 use crate::screen::Screen;
-use crate::storage::ls_command;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -129,7 +128,6 @@ pub async fn help_command(_args: &[&str]) {
             "keygen [force|show]",
             "keygen save [force]",
             "keygen load [force]",
-            "ls [path]",
             "reboot",
             "ssh [user@]hostname[:port] [command]",
             "ssh save <alias> <[user@]host[:port]>",
@@ -165,7 +163,6 @@ impl LocalShell {
             "free" => crate::heap::free_command(&argv).await,
             "help" => help_command(&argv).await,
             "keygen" => crate::sshkey::keygen_command(&argv).await,
-            "ls" => ls_command(&argv).await,
             "reboot" => crate::keyboard::reboot(),
             "ssh" => crate::net::ssh_command(&argv).await,
             "time" => crate::time::time_command(&argv).await,

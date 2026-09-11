@@ -18,6 +18,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
+*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a configurable network host (see below) for off-device transcription.
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -291,6 +292,30 @@ shown once it clears.
 
 Holding the power button down instead powers off the device; that's handled
 entirely by the keyboard co-processor and doesn't involve this firmware.
+
+### Push-to-Talk Voice Capture
+
+Hold `ButtonLeft2` (one of the device's shoulder buttons; see `src/keyboard.rs`
+if you want to rebind it to a different physical button) to capture
+microphone audio and stream it to a network host of your choice — for
+example, a companion process on your SSH server that runs speech-to-text and
+injects the resulting text into your session. Configure the destination
+before using it:
+
+```bash
+$ config set ptt_host mymachine.example.com
+$ config set ptt_port 9000
+```
+
+A small "recording..." overlay is shown while the button is held.
+Transcription itself is not implemented by this firmware — it only captures
+and streams raw audio; see AGENTS.md for the wire format a receiving process
+needs to speak, and for the mic's I2S pin wiring.
+
+> [!NOTE]
+> This requires a digital I2S microphone wired to the pins documented in
+> README-DEVICE.md. It streams audio unencrypted over a plain TCP
+> connection; only use it on a network you trust.
 
 ### Local Commands
 
