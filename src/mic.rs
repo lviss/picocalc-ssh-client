@@ -15,8 +15,10 @@ use crate::screen::SCREEN;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::IpEndpoint;
 use embassy_net::dns::{DnsQueryType, DnsSocket};
 use embassy_net::tcp::TcpSocket;
@@ -206,12 +208,11 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
 }
 
 /// Resolves and connects to the configured `ptt_host`/`ptt_port`, returning
-/// `None` (after logging why) on any failure. Run concurrently with the
-/// first chunks of capture (triggered by `UPLOAD_START_SIGNAL` rather than
-/// by the arrival of the first `STREAM` chunk) so that, in the common case,
-/// the connection is already up by the time there's audio to send — the
-/// small `STREAM` channel then only has to absorb ordinary scheduling
-/// jitter instead of full DNS+connect latency.
+/// `None` (after logging why) on any failure. `ptt_upload_task` races this
+/// against continued `STREAM.receive()` calls (rather than awaiting it to
+/// completion first) so the small `STREAM` channel keeps draining — and
+/// `capture_task`'s DMA pulls / I2S clock keep running — for the whole
+/// DNS+connect window instead of only after it.
 async fn connect_for_upload<'a>(tx_buf: &'a mut [u8], rx_buf: &'a mut [u8]) -> Option<TcpSocket<'a>> {
     let Some(stack) = stack().await else {
         print!("ptt: network is offline, dropping recording\r\n");
@@ -255,17 +256,49 @@ async fn ptt_upload_task() {
 
         let mut tx_buf = [0u8; 2048];
         let mut rx_buf = [0u8; 256];
-        let mut socket = connect_for_upload(&mut tx_buf, &mut rx_buf).await;
 
-        // Dropping `socket` once this loop exits on `StreamMsg::End` closes
-        // the TCP connection, which is this wire format's end-of-utterance
-        // signal to the receiver.
-        while let StreamMsg::Chunk(chunk) = STREAM.receive().await {
+        // Chunks that arrive on `STREAM` while `connect_for_upload` is
+        // still resolving DNS + TCP connect below: buffered here (instead
+        // of leaving them queued on the bounded `STREAM` channel) so
+        // `capture_task` never blocks on a full channel during connection
+        // setup. Sent once the socket is ready, in the same order.
+        let mut pending: Vec<PcmChunk> = Vec::new();
+        let mut ended = false;
+
+        let mut socket = {
+            let mut connect_fut = pin!(connect_for_upload(&mut tx_buf, &mut rx_buf));
+            loop {
+                match select(&mut connect_fut, STREAM.receive()).await {
+                    Either::First(socket) => break socket,
+                    Either::Second(StreamMsg::Chunk(chunk)) => pending.push(chunk),
+                    Either::Second(StreamMsg::End) => {
+                        ended = true;
+                        break None;
+                    }
+                }
+            }
+        };
+
+        for chunk in pending {
             if let Some(sock) = socket.as_mut()
                 && !send_chunk(sock, chunk.as_slice()).await
             {
                 print!("ptt: send failed, dropping rest of recording\r\n");
                 socket = None;
+            }
+        }
+
+        // Dropping `socket` once this loop exits on `StreamMsg::End` closes
+        // the TCP connection, which is this wire format's end-of-utterance
+        // signal to the receiver.
+        if !ended {
+            while let StreamMsg::Chunk(chunk) = STREAM.receive().await {
+                if let Some(sock) = socket.as_mut()
+                    && !send_chunk(sock, chunk.as_slice()).await
+                {
+                    print!("ptt: send failed, dropping rest of recording\r\n");
+                    socket = None;
+                }
             }
         }
     }
