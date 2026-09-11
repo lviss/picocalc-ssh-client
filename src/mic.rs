@@ -61,6 +61,13 @@ static STREAM: Channel<CriticalSectionRawMutex, StreamMsg, 4> = Channel::new();
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Separate from `START_SIGNAL` (each `Signal` has exactly one waiter:
+/// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` waits on this
+/// one) so the network connection can be dialed concurrently with the very
+/// first captured chunks instead of only after `ptt_upload_task` observes
+/// one on `STREAM` — see AGENTS.md's note on `STREAM`'s capacity being
+/// smaller than realistic connection-setup latency.
+static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Begins push-to-talk capture; a no-op if already recording. Called from
 /// `keyboard.rs` on `(KeyState::Pressed, Key::ButtonLeft2)`.
@@ -72,6 +79,7 @@ pub async fn start_recording() {
             .await
             .show_overlay(String::from("recording..."));
         START_SIGNAL.signal(());
+        UPLOAD_START_SIGNAL.signal(());
     }
 }
 
@@ -188,18 +196,6 @@ async fn capture_task(mut mic: Mic) {
     }
 }
 
-/// Drains chunks until (and including) the next `StreamMsg::End`, without
-/// sending them anywhere. Used when a recording can't be uploaded (network
-/// down, misconfigured, connect failure) so the capture task never blocks
-/// on a full `STREAM` channel.
-async fn drain_utterance() {
-    loop {
-        if matches!(STREAM.receive().await, StreamMsg::End) {
-            return;
-        }
-    }
-}
-
 async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     let mut bytes = Vec::with_capacity(4 + chunk.len() * 2);
     bytes.extend_from_slice(&(chunk.len() as u32 * 2).to_le_bytes());
@@ -209,67 +205,68 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     socket.write_all(&bytes).await.is_ok()
 }
 
+/// Resolves and connects to the configured `ptt_host`/`ptt_port`, returning
+/// `None` (after logging why) on any failure. Run concurrently with the
+/// first chunks of capture (triggered by `UPLOAD_START_SIGNAL` rather than
+/// by the arrival of the first `STREAM` chunk) so that, in the common case,
+/// the connection is already up by the time there's audio to send — the
+/// small `STREAM` channel then only has to absorb ordinary scheduling
+/// jitter instead of full DNS+connect latency.
+async fn connect_for_upload<'a>(tx_buf: &'a mut [u8], rx_buf: &'a mut [u8]) -> Option<TcpSocket<'a>> {
+    let Some(stack) = stack().await else {
+        print!("ptt: network is offline, dropping recording\r\n");
+        return None;
+    };
+
+    let (host, port) = {
+        let mut config = CONFIG.get().lock().await;
+        (config.fetch("ptt_host").await, config.fetch("ptt_port").await)
+    };
+    let (Ok(Some(host)), Ok(Some(port))) = (host, port) else {
+        print!("ptt: set ptt_host and ptt_port to stream recordings\r\n");
+        return None;
+    };
+    let Ok(port) = port.as_str().parse::<u16>() else {
+        print!("ptt: invalid ptt_port `{port}`\r\n");
+        return None;
+    };
+
+    let dns_client = DnsSocket::new(stack);
+    let addr = match dns_client.query(host.as_str(), DnsQueryType::A).await {
+        Ok(addrs) if !addrs.is_empty() => addrs[0],
+        _ => {
+            print!("ptt: failed to resolve {host}\r\n");
+            return None;
+        }
+    };
+
+    let mut socket = TcpSocket::new(stack, tx_buf, rx_buf);
+    if let Err(err) = socket.connect(IpEndpoint { addr, port }).await {
+        print!("ptt: failed to connect to {host}:{port}: {err:?}\r\n");
+        return None;
+    }
+    Some(socket)
+}
+
 #[embassy_executor::task]
 async fn ptt_upload_task() {
     loop {
-        let first = match STREAM.receive().await {
-            StreamMsg::Chunk(chunk) => chunk,
-            StreamMsg::End => continue,
-        };
-
-        let Some(stack) = stack().await else {
-            print!("ptt: network is offline, dropping recording\r\n");
-            drain_utterance().await;
-            continue;
-        };
-
-        let (host, port) = {
-            let mut config = CONFIG.get().lock().await;
-            (config.fetch("ptt_host").await, config.fetch("ptt_port").await)
-        };
-        let (Ok(Some(host)), Ok(Some(port))) = (host, port) else {
-            print!("ptt: set ptt_host and ptt_port to stream recordings\r\n");
-            drain_utterance().await;
-            continue;
-        };
-        let Ok(port) = port.as_str().parse::<u16>() else {
-            print!("ptt: invalid ptt_port `{port}`\r\n");
-            drain_utterance().await;
-            continue;
-        };
-
-        let dns_client = DnsSocket::new(stack);
-        let addr = match dns_client.query(host.as_str(), DnsQueryType::A).await {
-            Ok(addrs) if !addrs.is_empty() => addrs[0],
-            _ => {
-                print!("ptt: failed to resolve {host}\r\n");
-                drain_utterance().await;
-                continue;
-            }
-        };
+        UPLOAD_START_SIGNAL.wait().await;
 
         let mut tx_buf = [0u8; 2048];
         let mut rx_buf = [0u8; 256];
-        let mut socket = TcpSocket::new(stack, &mut tx_buf, &mut rx_buf);
-        if let Err(err) = socket.connect(IpEndpoint { addr, port }).await {
-            print!("ptt: failed to connect to {host}:{port}: {err:?}\r\n");
-            drain_utterance().await;
-            continue;
-        }
+        let mut socket = connect_for_upload(&mut tx_buf, &mut rx_buf).await;
 
-        if !send_chunk(&mut socket, first.as_slice()).await {
-            print!("ptt: send failed, dropping rest of recording\r\n");
-            drain_utterance().await;
-            continue;
-        }
+        // Dropping `socket` once this loop exits on `StreamMsg::End` closes
+        // the TCP connection, which is this wire format's end-of-utterance
+        // signal to the receiver.
         while let StreamMsg::Chunk(chunk) = STREAM.receive().await {
-            if !send_chunk(&mut socket, chunk.as_slice()).await {
+            if let Some(sock) = socket.as_mut()
+                && !send_chunk(sock, chunk.as_slice()).await
+            {
                 print!("ptt: send failed, dropping rest of recording\r\n");
-                drain_utterance().await;
-                break;
+                socket = None;
             }
         }
-        // Dropping `socket` closes the TCP connection, which is this wire
-        // format's end-of-utterance signal to the receiver.
     }
 }
