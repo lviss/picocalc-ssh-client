@@ -26,8 +26,7 @@ GP26/GP27 - `PWM_L`/`PWM_R` on picocalc audio circuitry
 * `GP22` - spare (unused)
 
 These are the pins formerly used by the (now removed) SD card reader; see
-AGENTS.md for why they were repurposed and the pull-request that made the
-change.
+AGENTS.md for why they were repurposed.
 
 ## PSRAM
 * `GP2`  - `RAM_TX`

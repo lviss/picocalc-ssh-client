@@ -328,10 +328,10 @@ pub async fn keyboard_reader(
 
         if let Some(key) = keyboard.process().await {
             log::info!("key == {key:?}");
-            // Push-to-talk: hold to record, mirroring the `Hold`/`Released`
-            // reporting `modifier_flag` already relies on above. Change
-            // `Key::ButtonLeft2` here to rebind to a different physical
-            // button.
+            // Push-to-talk: hold to record. Relies on the same reliable
+            // `Hold`/`Released` state reporting that `modifier_flag` above
+            // already depends on. Change `Key::ButtonLeft2` here to rebind
+            // to a different physical button.
             if key.key == Key::ButtonLeft2 {
                 match key.state {
                     KeyState::Pressed => crate::mic::start_recording().await,
