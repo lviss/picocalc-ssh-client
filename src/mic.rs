@@ -45,6 +45,12 @@ const BIT_DEPTH: u32 = 16;
 const CHANNELS: u32 = 2;
 /// 25ms per frame, comfortably inside the brief's 20-50ms guidance.
 const SAMPLES_PER_CHUNK: usize = SAMPLE_RATE_HZ as usize / 40;
+/// Cap on `ptt_upload_task`'s `pending` backlog (~1.6s of audio at 25ms per
+/// chunk): comfortably above realistic DNS+TCP-connect latency, so a
+/// slow/unreachable `ptt_host` degrades to bounded audio loss (oldest
+/// buffered chunks dropped) instead of unbounded heap growth while the
+/// button stays held.
+const MAX_PENDING_CHUNKS: usize = 64;
 
 type PcmChunk = Box<[i16; SAMPLES_PER_CHUNK]>;
 
@@ -267,10 +273,20 @@ async fn ptt_upload_task() {
 
         let mut socket = {
             let mut connect_fut = pin!(connect_for_upload(&mut tx_buf, &mut rx_buf));
+            let mut dropped_pending = false;
             loop {
                 match select(&mut connect_fut, STREAM.receive()).await {
                     Either::First(socket) => break socket,
-                    Either::Second(StreamMsg::Chunk(chunk)) => pending.push(chunk),
+                    Either::Second(StreamMsg::Chunk(chunk)) => {
+                        if pending.len() >= MAX_PENDING_CHUNKS {
+                            pending.remove(0);
+                            if !dropped_pending {
+                                print!("ptt: connect is slow, dropping oldest buffered audio\r\n");
+                                dropped_pending = true;
+                            }
+                        }
+                        pending.push(chunk);
+                    }
                     Either::Second(StreamMsg::End) => {
                         ended = true;
                         break None;
@@ -278,6 +294,10 @@ async fn ptt_upload_task() {
                 }
             }
         };
+
+        if ended && !pending.is_empty() {
+            print!("ptt: recording ended before connecting, dropping buffered audio\r\n");
+        }
 
         for chunk in pending {
             if let Some(sock) = socket.as_mut()
