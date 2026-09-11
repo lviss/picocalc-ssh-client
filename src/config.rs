@@ -202,8 +202,8 @@ pub async fn config_command(args: &[&str]) {
             print!("{result:?}\r\n");
         }
         ["config", "set", key, rest @ ..] => {
-	    let value: &str = &rest.join(" ");
-	    if *key == "scroll" {
+            let value: &str = &rest.join(" ");
+            if *key == "scroll" {
                 if let Ok(val) = value.parse::<usize>() {
                     // Heap-aware ceiling, not a flat number: keeps the screen's
                     // logical footprint within its heap budget regardless of
