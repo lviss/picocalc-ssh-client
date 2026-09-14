@@ -231,9 +231,9 @@ entirely by the keyboard co-processor and doesn't involve this firmware.
 
 ### Push-to-Talk Voice Capture
 
-Hold `ButtonLeft2` (one of the device's shoulder buttons; see `src/keyboard.rs`
-if you want to rebind it to a different physical button) to capture
-microphone audio and stream it to a network host of your choice — for
+Hold `F1` (plain, no modifiers - see `src/keyboard.rs` if you want to rebind
+it to a different key) to capture microphone audio and stream it to a
+network host of your choice — for
 example, a companion process on your SSH server that runs speech-to-text and
 injects the resulting text into your session. Configure the destination
 before using it:
