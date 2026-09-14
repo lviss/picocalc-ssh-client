@@ -292,15 +292,8 @@ async fn capture_task(mut mic: Mic) {
 
             if started.elapsed() >= MAX_RECORDING_DURATION {
                 CAP_NOTICE_GEN.store(generation, Ordering::Release);
-                if RECORDING
-                    .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let mut screen = SCREEN.get().lock().await;
-                    if CURRENT_GEN.load(Ordering::Acquire) == generation {
-                        screen.clear_overlay();
-                    }
-                }
+                let _ =
+                    RECORDING.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 break;
             }
         }
@@ -331,15 +324,21 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     true
 }
 
-/// Emits any one-shot diagnostics that `capture_task` recorded. Runs on the
-/// upload task, never on the DMA capture path, so the screen lock can be held
-/// by a repaint without stalling the I2S clocks.
+/// Emits any one-shot diagnostics that `capture_task` recorded and dismisses
+/// the overlay a capped recording left up. Runs on the upload task, never on
+/// the DMA capture path, so the screen lock can be held by a repaint without
+/// stalling the I2S clocks.
 async fn emit_pending_notices() {
     if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
         print!("ptt: upload can't keep up, dropping oldest audio\r\n");
     }
-    if CAP_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
+    let capped_generation = CAP_NOTICE_GEN.swap(0, Ordering::AcqRel);
+    if capped_generation != 0 {
         print!("ptt: recording exceeded 60s cap, stopping\r\n");
+        let mut screen = SCREEN.get().lock().await;
+        if CURRENT_GEN.load(Ordering::Acquire) == capped_generation {
+            screen.clear_overlay();
+        }
     }
 }
 
