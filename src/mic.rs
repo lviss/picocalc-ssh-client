@@ -321,6 +321,19 @@ pub fn init_mic(
 /// (left, right, left, right, ...), completely unprocessed.
 #[embassy_executor::task]
 async fn diagnostic_raw_capture_task(mut mic: Mic) {
+    // DEBUG-ONLY: print to the PicoCalc's own screen instead of the USB
+    // serial log - the serial port re-enumerates as a new /dev/ttyACM<N>
+    // every boot, so a terminal has to attach before this line prints or it
+    // is lost; the on-screen terminal has no such race, and scrollback
+    // (Ctrl+Up) recovers it even if later boot output pushes it off-screen.
+    {
+        let sys_freq = clk_sys_freq();
+        let clock_frequency = bit_clock_hz(SAMPLE_RATE_HZ, BIT_DEPTH, CHANNELS);
+        let divider = sys_freq as f64 / clock_frequency as f64 / 2.;
+        print!(
+            "ptt-diag: clk_sys={sys_freq}Hz target_bclk={clock_frequency}Hz divider={divider:.4}\r\n"
+        );
+    }
     loop {
         START_SIGNAL.wait().await;
         mic.set_enabled(true);
