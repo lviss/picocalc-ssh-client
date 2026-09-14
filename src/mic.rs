@@ -255,6 +255,9 @@ async fn capture_task(mut mic: Mic) {
         {
             let mut raw = [0u32; SAMPLES_PER_CHUNK];
             mic.capture(&mut raw).await;
+            if CURRENT_GEN.load(Ordering::Acquire) != generation {
+                continue;
+            }
 
             // One 32-bit FIFO word per L+R frame (ShiftDirection::Left, so
             // MSB-first): the mic's 16-bit sample lands in the upper half

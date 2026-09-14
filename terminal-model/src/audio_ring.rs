@@ -46,6 +46,9 @@ pub struct AudioRing<const N: usize> {
     head: usize,
     /// Number of valid samples currently buffered (`<= N`).
     len: usize,
+    /// Highest generation ever accepted by `write`; used to ignore an
+    /// in-flight chunk that arrives after its generation was superseded.
+    newest_generation: u32,
     /// The generation whose first overflow has already been reported, so
     /// `first_drop` fires once per recording rather than once per overflow.
     last_drop_generation: Option<u32>,
@@ -58,6 +61,7 @@ impl<const N: usize> AudioRing<N> {
             generations: [0; N],
             head: 0,
             len: 0,
+            newest_generation: 0,
             last_drop_generation: None,
         }
     }
@@ -92,8 +96,18 @@ impl<const N: usize> AudioRing<N> {
 
     /// Appends `samples` tagged with `generation`, discarding the oldest
     /// buffered samples (of any generation) when there isn't room. Never
-    /// allocates, never blocks, and never grows past `N`.
+    /// allocates, never blocks, and never grows past `N`. A write tagged with
+    /// a generation older than the newest already accepted is ignored: its
+    /// reader has moved on, and buffering it would only orphan samples ahead
+    /// of live audio.
     pub fn write(&mut self, generation: u32, samples: &[i16]) -> WriteResult {
+        if generation < self.newest_generation {
+            return WriteResult {
+                dropped: 0,
+                first_drop: false,
+            };
+        }
+        self.newest_generation = generation;
         let mut dropped = 0;
         for &sample in samples {
             if self.len == N {
@@ -118,8 +132,15 @@ impl<const N: usize> AudioRing<N> {
 
     /// Removes up to `out.len()` of the oldest samples, but only while they
     /// belong to `generation`; samples of any other generation are left in
-    /// place for their own upload. Returns how many samples were written.
+    /// place for their own upload. Samples from *older* generations are
+    /// discarded first: their upload has already finished, so no reader will
+    /// ever consume them, and leaving them at the head would block the
+    /// generation being read. Returns how many samples were written.
     pub fn read(&mut self, generation: u32, out: &mut [i16]) -> usize {
+        while self.len > 0 && self.generations[self.head] < generation {
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+        }
         let mut n = 0;
         while n < out.len() && n < self.len {
             let index = (self.head + n) % N;
@@ -205,6 +226,37 @@ mod tests {
 
         assert_eq!(ring.read(2, &mut out), 2);
         assert_eq!(&out[..2], [4, 5]);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn stale_write_for_superseded_generation_is_ignored() {
+        let mut ring = AudioRing::<16>::new();
+        ring.write(2, &[20, 21]);
+        let result = ring.write(1, &[10, 11]);
+        assert_eq!(result.dropped, 0);
+        assert!(!result.first_drop);
+
+        let mut out = [0i16; 8];
+        assert_eq!(ring.read(2, &mut out), 2);
+        assert_eq!(&out[..2], [20, 21]);
+        assert!(ring.is_empty());
+    }
+
+    /// Reproduces the ring state a superseded in-flight chunk leaves behind:
+    /// an old-generation chunk is written after the next generation is armed
+    /// but before that generation has written anything, so the ring cannot
+    /// reject it outright. Reading the newer generation must still work.
+    #[test]
+    fn orphaned_superseded_chunk_does_not_block_newer_reads() {
+        let mut ring = AudioRing::<16>::new();
+        ring.write(1, &[10, 11]);
+        ring.write(1, &[12, 13]);
+        ring.write(2, &[20, 21, 22]);
+
+        let mut out = [0i16; 8];
+        let n = ring.read(2, &mut out);
+        assert_eq!(&out[..n], [20, 21, 22]);
         assert!(ring.is_empty());
     }
 
