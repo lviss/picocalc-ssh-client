@@ -2,9 +2,9 @@
 //!
 //! The firmware used to bake this program in with `pio_asm!`, which fixes the
 //! per-channel shift count and the BCLK edge polarity at compile time. Since
-//! those are now runtime debug settings (`ptt_bits`/`ptt_edge` in `mic.rs`),
-//! the program is assembled on the device from the `pio` crate's public
-//! `Assembler` each time the settings change.
+//! those are now runtime debug settings (`ptt_bits`/`ptt_edge`, resolved in
+//! `crate::mic_config`), the program is assembled on the device from the `pio`
+//! crate's public `Assembler` each time the settings change.
 //!
 //! Keeping the assembly here (rather than in the hardware-coupled root crate)
 //! lets host tests decode the produced instructions and assert the loop count,
@@ -126,7 +126,13 @@ mod tests {
         let program = build_i2s_rx_program(32, false);
         assert_eq!(program.code.len(), PROGRAM_SIZE);
         // Full-program wrap: after the last shift, jump back to instruction 0.
-        assert_eq!(program.wrap, pio::Wrap { source: 7, target: 0 });
+        assert_eq!(
+            program.wrap,
+            pio::Wrap {
+                source: 7,
+                target: 0
+            }
+        );
 
         // Both channel phases reset the loop counter with the same value and
         // their `jmp x--` targets the phase's own first `in`.

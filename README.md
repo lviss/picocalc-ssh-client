@@ -327,7 +327,7 @@ default.
 A small "recording..." overlay is shown while the button is held.
 Transcription itself is not implemented by this firmware — it only captures
 and streams raw audio; see AGENTS.md for the wire format a receiving process
-needs to speak, and for the mic's I2S pin wiring.
+needs to speak, and README-DEVICE.md for the mic's I2S pin wiring.
 
 > [!NOTE]
 > This requires a digital I2S microphone wired to the pins documented in

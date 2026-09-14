@@ -113,9 +113,12 @@ impl<const N: usize> AudioRing<N> {
     /// second buffer. Stale-generation handling and overflow reporting match
     /// [`Self::write`].
     pub fn write_u32_words(&mut self, generation: u32, words: &[u32]) -> WriteResult {
-        self.write_iter(generation, words.iter().flat_map(|&word| {
-            [word as u16 as i16, (word >> 16) as u16 as i16]
-        }))
+        self.write_iter(
+            generation,
+            words
+                .iter()
+                .flat_map(|&word| [word as u16 as i16, (word >> 16) as u16 as i16]),
+        )
     }
 
     fn write_iter(
@@ -377,7 +380,13 @@ mod tests {
         assert!(result.first_drop);
         // A superseded generation is ignored just like `write`.
         let stale = ring.write_u32_words(0, &[0xDEAD_BEEFu32]);
-        assert_eq!(stale, WriteResult { dropped: 0, first_drop: false });
+        assert_eq!(
+            stale,
+            WriteResult {
+                dropped: 0,
+                first_drop: false
+            }
+        );
         let mut out = [0i16; 2];
         assert_eq!(ring.read(1, &mut out), 2);
         // Word order is low half then high half, so the two words buffered as

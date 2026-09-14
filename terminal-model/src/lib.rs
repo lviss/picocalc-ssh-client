@@ -7,5 +7,6 @@ pub mod glyphs;
 pub mod i2s_program;
 pub mod key_dispatch;
 pub mod keyfile;
+pub mod mic_config;
 pub mod pcm_extract;
 pub mod screen_model;

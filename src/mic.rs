@@ -24,10 +24,11 @@
 //! one TCP connection per utterance (opened on button press, closed on
 //! release). Each captured frame is sent as a 4-byte little-endian u32 byte
 //! count, followed by that many bytes of raw signed 16-bit little-endian
-//! mono PCM samples at 16 kHz. With `ptt_raw=1` the payload is instead the
-//! unprocessed little-endian 32-bit PIO FIFO words, one per I2S channel slot,
-//! for offline analysis (the diagnostic format used while bringing the mic
-//! up). No handshake and no other framing.
+//! mono PCM samples at the configured `ptt_rate` (default 16 kHz). With
+//! `ptt_raw=1` the payload is instead the unprocessed little-endian 32-bit
+//! PIO FIFO words, one per I2S channel slot, for offline analysis (the
+//! diagnostic format used while bringing the mic up). No handshake and no
+//! other framing.
 
 use crate::Irqs;
 use crate::config::CONFIG;
@@ -54,37 +55,15 @@ use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
-use terminal_model::pcm_extract::{
-    MAX_MIC_BCLK_HZ, MIN_MIC_BCLK_HZ, bit_clock_hz, extract_left_channel_pcm, mic_settings_valid,
+use terminal_model::mic_config::{
+    BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, MicSettings, RATE_KEY, RAW_KEY,
+    effective_setting as mic_effective_setting, resolve as resolve_mic_settings,
+    validate_setting as validate_mic_setting,
 };
+use terminal_model::pcm_extract::{bit_clock_hz, extract_left_channel_pcm};
 
 extern crate alloc;
 
-/// Default sample rate, in Hz. Matches Whisper's internal resampling target,
-/// so there's no benefit to capturing at a higher rate (see the feasibility
-/// report referenced in AGENTS.md). Configurable at runtime via `ptt_rate`.
-const DEFAULT_RATE_HZ: u32 = 16_000;
-/// Default bits per channel I2S slot. The mic (Adafruit SPH0645, a
-/// fixed-ratio I2S digital mic) does not negotiate slot width: its internal
-/// shift-counter is hardwired to a 32-bit slot per channel (64fs total per
-/// L+R frame), confirmed against its documented supported-clock table
-/// (1.024 MHz-4.096 MHz BCLK for 16 kHz-64 kHz sample rates - 16 kHz * 64 =
-/// 1.024 MHz exactly). An earlier build clocked 16-bit slots (512 kHz,
-/// exactly half) and produced garbage on real hardware. Configurable at
-/// runtime via `ptt_bits` for on-device probing, though an out-of-window
-/// slot/rate pair is refused (see `mic_settings_valid`).
-const DEFAULT_BITS: u32 = 32;
-/// Default bit-clock edge polarity: `false` keeps the historical side-set
-/// values; `ptt_edge=1` inverts the low (bit-clock) bit of every side-set
-/// value, shifting sampling half a BCLK cycle. Configurable at runtime via
-/// `ptt_edge`.
-const DEFAULT_EDGE_FLIP: bool = false;
-/// Default capture mode: `false` extracts mono 16-bit PCM; `ptt_raw=1`
-/// streams the unprocessed PIO FIFO words for offline analysis instead.
-const DEFAULT_RAW: bool = false;
-/// I2S always frames a left+right pair per word-select cycle even though
-/// this mono mic only drives one slot; see `capture_task`'s extraction.
-const CHANNELS: u32 = 2;
 /// 25 ms per frame at the default rate, comfortably inside the brief's
 /// 20-50 ms guidance. A chunk is a fixed number of samples, so a non-default
 /// `ptt_rate` changes its duration but not the buffer sizes.
@@ -111,72 +90,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
-/// Config keys for the mic's runtime debug settings, alongside the
-/// `ptt_host`/`ptt_port` destination keys.
-pub const BITS_KEY: &str = "ptt_bits";
-pub const RATE_KEY: &str = "ptt_rate";
-pub const EDGE_KEY: &str = "ptt_edge";
-pub const RAW_KEY: &str = "ptt_raw";
-
-/// Microphone settings resolved from persisted config (see
-/// [`load_settings`]). Re-read and re-applied at the start of every recording,
-/// so `config set ptt_*` takes effect on the next utterance without a reflash
-/// or reboot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MicSettings {
-    /// Bits per channel slot; the PIO loop counter is `bits - 2`.
-    pub bits: u32,
-    /// I2S sample rate in Hz; the bit clock is `rate * bits * CHANNELS`.
-    pub rate: u32,
-    /// `true` inverts the BCLK edge the PIO program samples on.
-    pub edge_flip: bool,
-    /// `true` streams unprocessed raw FIFO words instead of extracted PCM.
-    pub raw: bool,
-}
-
-impl Default for MicSettings {
-    fn default() -> Self {
-        Self {
-            bits: DEFAULT_BITS,
-            rate: DEFAULT_RATE_HZ,
-            edge_flip: DEFAULT_EDGE_FLIP,
-            raw: DEFAULT_RAW,
-        }
-    }
-}
-
-impl MicSettings {
-    /// The bit clock these settings produce, in Hz.
-    pub fn bclk_hz(&self) -> u32 {
-        bit_clock_hz(self.rate, self.bits, CHANNELS)
-    }
-}
-
-/// Effective settings plus whether an out-of-window stored pair had to be
-/// replaced by the default (so the caller can log it once per recording).
-struct ResolvedSettings {
-    settings: MicSettings,
-    fell_back: bool,
-}
-
-fn parse_u32(value: &str) -> Option<u32> {
-    value.trim().parse().ok()
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim() {
-        "1" | "true" | "on" | "yes" => Some(true),
-        "0" | "false" | "off" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Reads the `ptt_*` mic keys and resolves them against their defaults. A
-/// missing or malformed individual value falls back to its own default; if the
-/// resulting clock is outside the SPH0645's documented window, the whole
-/// slot-width/rate pair falls back to the default so the firmware can never
-/// silently mis-clock the mic.
-async fn resolve_settings() -> ResolvedSettings {
+/// Reads the `ptt_*` mic keys and resolves them against their defaults via
+/// [`terminal_model::mic_config::resolve`]: a missing or malformed individual
+/// value falls back to its own default, and an out-of-window slot/rate pair
+/// falls back to the default rather than silently mis-clocking the mic.
+async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
     let (bits, rate, edge, raw) = {
         let mut config = CONFIG.get().lock().await;
         let bits = config.fetch(BITS_KEY).await.ok().flatten();
@@ -185,34 +103,12 @@ async fn resolve_settings() -> ResolvedSettings {
         let raw = config.fetch(RAW_KEY).await.ok().flatten();
         (bits, rate, edge, raw)
     };
-    let mut settings = MicSettings {
-        bits: bits
-            .as_ref()
-            .and_then(|v| parse_u32(v.as_str()))
-            .unwrap_or(DEFAULT_BITS),
-        rate: rate
-            .as_ref()
-            .and_then(|v| parse_u32(v.as_str()))
-            .unwrap_or(DEFAULT_RATE_HZ),
-        edge_flip: edge
-            .as_ref()
-            .and_then(|v| parse_bool(v.as_str()))
-            .unwrap_or(DEFAULT_EDGE_FLIP),
-        raw: raw
-            .as_ref()
-            .and_then(|v| parse_bool(v.as_str()))
-            .unwrap_or(DEFAULT_RAW),
-    };
-    let mut fell_back = false;
-    if !mic_settings_valid(settings.bits, settings.rate) {
-        settings.bits = DEFAULT_BITS;
-        settings.rate = DEFAULT_RATE_HZ;
-        fell_back = true;
-    }
-    ResolvedSettings {
-        settings,
-        fell_back,
-    }
+    resolve_mic_settings(
+        bits.as_ref().map(|v| v.as_str()),
+        rate.as_ref().map(|v| v.as_str()),
+        edge.as_ref().map(|v| v.as_str()),
+        raw.as_ref().map(|v| v.as_str()),
+    )
 }
 
 /// Settings for the recording about to start, logging if a stored value had to
@@ -229,54 +125,15 @@ pub async fn load_settings() -> MicSettings {
 /// settings, so an out-of-window or malformed value is refused at the console
 /// rather than stored. Keys this module does not own return `Ok(())`.
 pub async fn validate_config_setting(key: &str, value: &str) -> Result<(), String> {
-    match key {
-        BITS_KEY | RATE_KEY | EDGE_KEY | RAW_KEY => {}
-        _ => return Ok(()),
-    }
-    let mut candidate = resolve_settings().await.settings;
-    match key {
-        BITS_KEY => {
-            candidate.bits = parse_u32(value)
-                .ok_or_else(|| String::from("ptt_bits must be a number (bits per channel slot)"))?;
-        }
-        RATE_KEY => {
-            candidate.rate =
-                parse_u32(value).ok_or_else(|| String::from("ptt_rate must be a number (Hz)"))?;
-        }
-        EDGE_KEY => {
-            candidate.edge_flip =
-                parse_bool(value).ok_or_else(|| String::from("ptt_edge must be 0 or 1"))?;
-        }
-        RAW_KEY => {
-            candidate.raw =
-                parse_bool(value).ok_or_else(|| String::from("ptt_raw must be 0 or 1"))?;
-        }
-        _ => unreachable!(),
-    }
-    if !mic_settings_valid(candidate.bits, candidate.rate) {
-        return Err(alloc::format!(
-            "invalid mic clock: ptt_bits={} ptt_rate={} -> BCLK {} Hz, outside the mic's documented {}-{} Hz window",
-            candidate.bits,
-            candidate.rate,
-            candidate.bclk_hz(),
-            MIN_MIC_BCLK_HZ,
-            MAX_MIC_BCLK_HZ,
-        ));
-    }
-    Ok(())
+    let current = resolve_settings().await.settings;
+    validate_mic_setting(current, key, value)
 }
 
 /// Effective value of a `ptt_*` setting for `config get`; `None` for keys this
 /// module does not own. Shows the default when the key is unset.
 pub async fn effective_setting(key: &str) -> Option<String> {
     let settings = resolve_settings().await.settings;
-    match key {
-        BITS_KEY => Some(alloc::format!("{}", settings.bits)),
-        RATE_KEY => Some(alloc::format!("{}", settings.rate)),
-        EDGE_KEY => Some(alloc::format!("{}", settings.edge_flip as u8)),
-        RAW_KEY => Some(alloc::format!("{}", settings.raw as u8)),
-        _ => None,
-    }
+    mic_effective_setting(key, settings)
 }
 
 /// Samples captured by `capture_task`, drained by `ptt_upload_task`. A fixed

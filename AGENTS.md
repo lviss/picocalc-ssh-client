@@ -17,7 +17,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
   (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
-  (`audio_ring.rs`), the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`) and the
+  (`audio_ring.rs`), the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`), the mic
+  runtime-settings resolution and console-validation decision table (`mic_config.rs`) and the
   runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, and the SD-card
   SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`. It depends only on
   `vte`, `embedded-graphics`, `pio`, and `profont` — all host-buildable — so it's the place for
@@ -157,13 +158,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
   mono PCM, 1 = stream the unprocessed FIFO words). A `ptt_bits`/`ptt_rate` pair whose
   `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at the
-  console (`mic::validate_config_setting`) and, if a stored value is somehow invalid, falls back
-  to the default pair with a log (`mic::load_settings` via
-  `terminal_model::pcm_extract::mic_settings_valid`) - the firmware never silently mis-clocks the
-  mic. The program itself is built at run time by `terminal-model/src/i2s_program.rs` (the `pio`
-  crate's `Assembler`) because `pio_asm!` bakes the loop count and edge in at compile time;
-  `capture_task` keeps only the even-indexed/left-slot words and `extract_left_channel_pcm` takes
-  the top 16 bits of the configured slot width. An earlier fixed 16-bit slot (a mirror of embassy's
+  console and, if a stored value is somehow invalid, falls back to the default pair with a log.
+  That decision table (`resolve`/`validate_setting`, host-tested) lives in
+  `terminal-model/src/mic_config.rs`; `src/mic.rs` is only the config-store/console adapter, so
+  the firmware never silently mis-clocks the mic. The program itself is built at run time by
+  `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
+  the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
+  words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width. An
+  earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
   every raw word `0x00000000`), confirming this mic will not run below 1.024 MHz. **Still
@@ -173,13 +175,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `raspberrypi/pico-feedback#280`), and this program's BCLK period is only 2 PIO cycles,
   comparable to or shorter than that undocumented pipeline delay. `ptt_edge=1` is the documented
   experiment for that (it inverts the low/bit-clock bit of every side-set value, shifting sampling
-  by half a BCLK cycle without changing the loop shape). Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
-  the capture and upload tasks in a fixed 2048-sample (`i16`, 128ms at 16 kHz) static ring buffer
-  in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the heap - so it does not compete
-  with the `DualHeap` budget and cannot exhaust it. The ring never blocks and never grows; when it
-  is full the oldest samples are dropped, logging a single `ptt: ...` line per recording, so a
-  slow/unreachable `ptt_host` (connect is bounded by a 5s timeout in `mic.rs`) degrades to bounded
-  audio loss rather than a stalled I2S clock or a heap-exhaustion abort, independent of whether a
+  by half a BCLK cycle without changing the loop shape). Capture is 16-bit mono in ~25 ms chunks
+  at the default 16 kHz rate (a non-default `ptt_rate` rescales chunk and ring duration, not
+  their sample counts), staged between the capture and upload tasks in a fixed 2048-sample
+  (`i16`) static ring buffer in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the
+  heap, so it does not compete with the `DualHeap` budget and cannot exhaust it. The ring never
+  blocks and never grows; when it is full the oldest samples are dropped, logging a single
+  `ptt: ...` line per recording, so a slow/unreachable `ptt_host` (connect is bounded by a 5s
+  timeout in `mic.rs`) degrades to bounded audio loss rather than a stalled I2S clock or a
+  heap-exhaustion abort, independent of whether a
   PSRAM heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
   lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Each sample is tagged with the
   utterance generation that produced it (`CURRENT_GEN`/`ENDED_GEN` atomic counters in `mic.rs`,
@@ -207,10 +211,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   special-casing needed in `config.rs`). Wire format (needed by anything implementing the
   receiving side): one TCP connection per utterance, opened on button press and closed on release;
   each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
-  16-bit little-endian mono PCM. With `ptt_raw=1` the payload is instead the unprocessed
-  little-endian `u32` PIO FIFO words, one per channel slot; a receiver should concatenate frame
-  payloads before parsing words (frame boundaries are upload-side, not word-aligned). No handshake,
-  no other framing.
+  16-bit little-endian mono PCM at the configured `ptt_rate` (default 16 kHz; the rate is not
+  signaled on the wire, so the receiver must be told it out of band). With `ptt_raw=1` the payload
+  is instead the unprocessed little-endian `u32` PIO FIFO words, one per channel slot; a receiver
+  should concatenate frame payloads before parsing words (frame boundaries are upload-side, not
+  word-aligned). No handshake, no other framing.
 - `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
   It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
   DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected
