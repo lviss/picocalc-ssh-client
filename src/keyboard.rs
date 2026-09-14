@@ -329,19 +329,26 @@ pub async fn keyboard_reader(
         if let Some(key) = keyboard.process().await {
             log::info!("key == {key:?}");
             // Push-to-talk: hold plain F1 (no modifiers) to record; release
-            // to send. Checked ahead of the Ctrl+F1 reboot shortcut below so
-            // the two don't collide - Ctrl+F1 still reaches that shortcut via
-            // the `else if` branch, since this check requires no modifiers.
+            // to send. Arming and stopping are deliberately independent
+            // checks. Arming requires no modifiers, so Ctrl+F1 falls through
+            // to the reboot shortcut below instead of starting a recording.
+            // Stopping only requires that a recording is active - it does not
+            // re-check modifiers, because a Released report for F1 must
+            // always end the recording regardless of what modifiers are held
+            // at that instant (e.g. Ctrl pressed while F1 was already down).
             // Relies on the same reliable `Hold`/`Released` state reporting
-            // that `modifier_flag` above already depends on. Change the
-            // `Key::F1`/`Modifiers::NONE` check here to rebind to a
-            // different key.
-            if key.key == Key::F1 && key.modifiers == Modifiers::NONE {
-                match key.state {
-                    KeyState::Pressed => crate::mic::start_recording().await,
-                    KeyState::Released => crate::mic::stop_recording().await,
-                    KeyState::Idle | KeyState::Hold => {}
-                }
+            // that `modifier_flag` above already depends on. Rebinding
+            // requires updating both `Key::F1` references here.
+            if key.key == Key::F1
+                && key.state == KeyState::Pressed
+                && key.modifiers == Modifiers::NONE
+            {
+                crate::mic::start_recording().await;
+            } else if key.key == Key::F1
+                && key.state == KeyState::Released
+                && crate::mic::is_recording()
+            {
+                crate::mic::stop_recording().await;
             } else if key.state == KeyState::Pressed {
                 match key.key {
                     Key::F5 if key.modifiers == Modifiers::CTRL => {

@@ -32,6 +32,7 @@ use embassy_rp::pio::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
 
@@ -53,6 +54,13 @@ const SAMPLES_PER_CHUNK: usize = SAMPLE_RATE_HZ as usize / 40;
 /// buffered chunks dropped) instead of unbounded heap growth while the
 /// button stays held.
 const MAX_PENDING_CHUNKS: usize = 64;
+/// Upper bound on a single push-to-talk recording. A `Released` report is the
+/// normal way to end one, but the keyboard co-processor link can drop a
+/// transition (missed poll, I2C glitch) with no automatic recovery until some
+/// other event arrives; this caps worst-case exposure (mic powered, I2S clock
+/// running, "recording..." overlay stuck) to a minute, far longer than any
+/// normal utterance.
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
 type PcmChunk = Box<[i16; SAMPLES_PER_CHUNK]>;
 
@@ -93,8 +101,15 @@ pub async fn start_recording() {
     }
 }
 
+/// Whether a push-to-talk recording is currently active. `keyboard.rs` checks
+/// this on `(KeyState::Released, Key::F1)` so the matching release always
+/// stops capture regardless of which modifiers are held at that instant.
+pub fn is_recording() -> bool {
+    RECORDING.load(Ordering::Acquire)
+}
+
 /// Ends push-to-talk capture; a no-op if not recording. Called from
-/// `keyboard.rs` on `(KeyState::Released, Key::F1)`.
+/// `keyboard.rs` on `(KeyState::Released, Key::F1)` while `is_recording()`.
 pub async fn stop_recording() {
     if RECORDING.swap(false, Ordering::AcqRel) {
         SCREEN.get().lock().await.clear_overlay();
@@ -196,6 +211,7 @@ async fn capture_task(mut mic: Mic) {
     loop {
         START_SIGNAL.wait().await;
         mic.set_enabled(true);
+        let started = Instant::now();
         while RECORDING.load(Ordering::Acquire) {
             let mut raw = [0u32; SAMPLES_PER_CHUNK];
             mic.capture(&mut raw).await;
@@ -210,6 +226,11 @@ async fn capture_task(mut mic: Mic) {
                 *dst = (*word >> 16) as i16;
             }
             STREAM.send(StreamMsg::Chunk(pcm)).await;
+
+            if started.elapsed() >= MAX_RECORDING_DURATION {
+                print!("ptt: recording exceeded 60s cap, stopping\r\n");
+                stop_recording().await;
+            }
         }
         mic.set_enabled(false);
         STREAM.send(StreamMsg::End).await;

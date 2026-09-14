@@ -110,9 +110,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   mono in ~25ms chunks, buffered through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>`
   payloads land in the `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget
   entry above) — deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`.
-  Button binding is plain `Key::F1` (no modifiers - `src/keyboard.rs`, checked ahead of the
-  existing Ctrl+F1 reboot shortcut so the two don't collide; one `match`/guard to change for a
-  different key). `Key::ButtonLeft2`, tried first, turned out to correspond to no physical control
+  Button binding is plain `Key::F1` (`src/keyboard.rs`). Arming and stopping are independently
+  gated: arming requires `KeyState::Pressed` with `Modifiers::NONE` (so Ctrl+F1 still reaches the
+  existing reboot shortcut), while stopping fires on `KeyState::Released` whenever `mic::is_recording()`
+  (reusing `mic.rs`'s `RECORDING` flag) is set, with no modifier re-check, so a release always ends
+  the recording even if a modifier went down mid-hold. Rebinding requires updating both `Key::F1`
+  checks. `capture_task` also self-stops after `MAX_RECORDING_DURATION` (60s) in case the keyboard
+  link drops the `Released` report entirely. `Key::ButtonLeft2`, tried first, turned out to correspond to no physical control
   on real hardware - the PicoCalc has one D-pad and no joystick, and `ButtonLeft2` belongs to a
   `Joy*`/`Button*` group of raw keyboard-protocol codes (`src/keyboard.rs`'s `Key` enum and its
   `From<u8>` impl) that looks like it comes from a joystick/gamepad-bearing variant of this same
