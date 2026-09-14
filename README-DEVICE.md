@@ -30,10 +30,11 @@ GP26/GP27 - `PWM_L`/`PWM_R` on picocalc audio circuitry
 * `GP3`  - I2S `WS`/`LRCLK` (word select, firmware drives this)
 * `GP21` - I2S `SD`/`DOUT` (serial data, mic drives this - the only actual input line)
 
-The mic's I2S slot width, sample rate, BCLK edge polarity and raw-passthrough
-mode are runtime settings (`config set ptt_bits`/`ptt_rate`/`ptt_edge`/`ptt_raw`)
-applied at the start of each recording, so a new configuration can be probed
-without reflashing; see `README.md`'s Push-to-Talk section and `AGENTS.md`.
+The mic's I2S slot width, sample rate, BCLK edge polarity, raw-passthrough
+mode and capture gain are runtime settings (`config set
+ptt_bits`/`ptt_rate`/`ptt_edge`/`ptt_raw`/`ptt_gain`) applied at the start of
+each recording, so a new configuration can be probed without reflashing; see
+`README.md`'s Push-to-Talk section and `AGENTS.md`.
 
 These are exposed expansion/jumper block pins also wired to the PSRAM chip
 (see below); they're free for the mic because this firmware only talks to

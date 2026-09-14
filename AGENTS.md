@@ -156,7 +156,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   store at the start of every recording and applied on the device (no reflash or reboot):
   `ptt_bits` (channel slot width, default 32), `ptt_rate` (sample rate Hz, default 16000),
   `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
-  mono PCM, 1 = stream the unprocessed FIFO words). A `ptt_bits`/`ptt_rate` pair whose
+  mono PCM, 1 = stream the unprocessed FIFO words), `ptt_gain` (1-4096, default 1 = off; see
+  below). A `ptt_bits`/`ptt_rate` pair whose
   `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at the
   console and, if a stored value is somehow invalid, falls back to the default pair with a log.
   That decision table (`resolve`/`validate_setting`, host-tested) lives in
@@ -164,7 +165,16 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   the firmware never silently mis-clocks the mic. The program itself is built at run time by
   `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
   the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
-  words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width. An
+  words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width.
+  `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,
+  `remove_dc_and_gain_words`/`remove_dc_and_gain_samples` (host-tested in `pcm_extract.rs`)
+  subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating
+  arithmetic, in both paths. DC removal is essential because the SPH0645 sits on a large offset
+  (~-6113 in its 18-bit field on this hardware); multiplying the raw value directly would rail at
+  any useful gain. `ptt_gain=1` is a byte-identical no-op. Offline analysis of the captain's
+  `ptt-test-raw.raw` found no recoverable signal (driven-slot 18-bit values only +/-7 counts of
+  uncorrelated noise, ~-97 dBFS RMS, vs the mic's ~-91 dBFS noise floor), so this knob is for
+  visibility only - it cannot rescue a mic that is not converting. An
   earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:

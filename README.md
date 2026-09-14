@@ -316,7 +316,15 @@ $ config set ptt_bits 32     # I2S channel slot width in bits (default 32)
 $ config set ptt_rate 16000  # sample rate in Hz (default 16000)
 $ config set ptt_edge 1      # invert the BCLK sampling edge (default 0)
 $ config set ptt_raw 1       # stream raw FIFO words instead of PCM (default 0)
+$ config set ptt_gain 256    # x256 DC-removed capture gain, 1-4096 (default 1)
 ```
+
+`ptt_gain` is a diagnostic for a very quiet microphone: it subtracts each
+capture chunk's DC offset and then amplifies what is left (saturating, so it
+clips rather than wraps), in both the PCM and `ptt_raw` paths. A gain of `1`
+(the default) does no DC removal and no scaling, so an unconfigured device is
+byte-for-byte unchanged. It cannot conjure a signal that is not there - it only
+makes a faint one easier to see.
 
 `ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is

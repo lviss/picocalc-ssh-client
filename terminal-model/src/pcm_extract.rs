@@ -83,6 +83,60 @@ pub fn extract_left_channel_pcm(raw: &[u32], pcm: &mut [i16], bits_per_channel_s
     }
 }
 
+/// Removes the DC component from the driven (even-indexed/left-slot) raw I2S
+/// FIFO words, then applies a capture-time digital gain in place.
+///
+/// `ptt_gain` is a diagnostic knob for the "this mic reads very quietly"
+/// experiment. Subtracting the per-chunk mean *first* is essential: the
+/// SPH0645 sits on a large DC offset (~-6113 in its 18-bit field on the
+/// captain's hardware), so multiplying the raw value by any useful gain would
+/// rail immediately and reveal nothing. Each word is treated as a signed
+/// 32-bit sample, amplified with saturating arithmetic (so a large gain clips
+/// instead of wrapping into nonsense), and the undriven (odd-indexed/right-slot)
+/// words are left untouched. A gain of `1` (the default) returns immediately,
+/// leaving every word byte-for-byte identical to the un-gained capture.
+pub fn remove_dc_and_gain_words(raw: &mut [u32], gain: u32) {
+    if gain <= 1 {
+        return;
+    }
+    let gain = gain.min(i32::MAX as u32) as i32;
+    let mut sum: i64 = 0;
+    let mut count: i64 = 0;
+    for word in raw.iter().step_by(2) {
+        sum += *word as i32 as i64;
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    let mean = (sum / count) as i32;
+    for word in raw.iter_mut().step_by(2) {
+        let ac = (*word as i32).saturating_sub(mean);
+        *word = ac.saturating_mul(gain) as u32;
+    }
+}
+
+/// The sample-domain counterpart of [`remove_dc_and_gain_words`] for the
+/// production PCM path: subtracts the chunk mean from the extracted mono
+/// samples, then scales the remainder with saturating `i16` arithmetic. A gain
+/// of `1` is a no-op, so the configured-out device is unchanged. This removes
+/// the DC offset before amplifying, which is what makes any useful gain reveal
+/// the AC signal instead of railing on the offset.
+pub fn remove_dc_and_gain_samples(pcm: &mut [i16], gain: u32) {
+    if gain <= 1 || pcm.is_empty() {
+        return;
+    }
+    let gain = gain.min(i32::MAX as u32) as i32;
+    let sum: i64 = pcm.iter().map(|&s| s as i64).sum();
+    let mean = (sum / pcm.len() as i64) as i32;
+    for sample in pcm.iter_mut() {
+        let ac = *sample as i32 - mean;
+        *sample = ac
+            .saturating_mul(gain)
+            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +254,71 @@ mod tests {
         let mut pcm = [0x7fffi16; 3];
         extract_left_channel_pcm(&raw, &mut pcm, 32);
         assert_eq!(pcm, [0x1111u16 as i16, 0x7fff, 0x7fff]);
+    }
+
+    #[test]
+    fn gain_of_one_is_a_byte_for_byte_no_op_on_words() {
+        let mut raw = [0xDEAD_BEEFu32, 0x0000_0000, 0x7FFF_FFFF];
+        let original = raw;
+        remove_dc_and_gain_words(&mut raw, 1);
+        assert_eq!(raw, original);
+    }
+
+    #[test]
+    fn words_gain_removes_dc_then_amplifies_the_deviation() {
+        // The driven words sit at a big DC plateau (0xFFFF_F000) with a small
+        // AC part; 0xFFFF_F800 is +2048 above the mean, 0xFFFF_E800 is -2048.
+        // Odd (undriven) words must be left alone.
+        let mut raw = [
+            0xFFFF_F000u32,
+            0x0000_0000,
+            0xFFFF_F800u32,
+            0x0000_0000,
+            0xFFFF_E800u32,
+        ];
+        remove_dc_and_gain_words(&mut raw, 16);
+        assert_eq!(raw[0], 0);
+        assert_eq!(raw[1], 0); // undriven slot untouched
+        assert_eq!(raw[2], (2048i32 * 16) as u32);
+        assert_eq!(raw[3], 0);
+        assert_eq!(raw[4], (-2048i32 * 16) as u32);
+    }
+
+    #[test]
+    fn words_gain_saturates_at_the_i32_limits_instead_of_wrapping() {
+        // Two driven words at the i32 extremes: the mean is 0, so each scales
+        // from its extreme and must clamp, not wrap into a plausible-looking
+        // but nonsense value. The undriven slot is untouched.
+        let mut raw = [0x7FFF_FFFFu32, 0x0000_0000, 0x8000_0000u32];
+        remove_dc_and_gain_words(&mut raw, 4096);
+        assert_eq!(raw[0], i32::MAX as u32);
+        assert_eq!(raw[1], 0);
+        assert_eq!(raw[2], i32::MIN as u32);
+    }
+
+    #[test]
+    fn samples_gain_is_a_no_op_for_one_and_removes_dc_otherwise() {
+        let mut unchanged = [100i16, -100, 50, -50];
+        let original = unchanged;
+        remove_dc_and_gain_samples(&mut unchanged, 1);
+        assert_eq!(unchanged, original);
+
+        // Mean is 0 here, so a x4 gain scales each sample exactly.
+        let mut pcm = [10i16, -10, 5, -5];
+        remove_dc_and_gain_samples(&mut pcm, 4);
+        assert_eq!(pcm, [40, -40, 20, -20]);
+
+        // A DC-offset chunk is centred first: all four samples share +1000,
+        // which must be removed rather than amplified into the rail.
+        let mut offset = [1001i16, 999, 1002, 998];
+        remove_dc_and_gain_samples(&mut offset, 4);
+        assert_eq!(offset, [4, -4, 8, -8]);
+    }
+
+    #[test]
+    fn samples_gain_clamps_instead_of_wrapping() {
+        let mut pcm = [i16::MAX, i16::MIN];
+        remove_dc_and_gain_samples(&mut pcm, 4096);
+        assert_eq!(pcm, [i16::MAX, i16::MIN]);
     }
 }

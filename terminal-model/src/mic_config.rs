@@ -43,6 +43,14 @@ pub const DEFAULT_EDGE_FLIP: bool = false;
 /// Default capture mode: `false` extracts mono 16-bit PCM; `true` streams the
 /// unprocessed PIO FIFO words for offline analysis.
 pub const DEFAULT_RAW: bool = false;
+/// Default capture-time digital gain: 1, i.e. no scaling, so an unconfigured
+/// device behaves exactly as today.
+pub const DEFAULT_GAIN: u32 = 1;
+/// Lowest accepted `ptt_gain` (no scaling).
+pub const MIN_GAIN: u32 = 1;
+/// Highest accepted `ptt_gain`. Big enough for the captain's x4096 experiment;
+/// the clamp is a safety rail, not a claim that the output is useful there.
+pub const MAX_GAIN: u32 = 4096;
 
 /// Config keys for the mic's runtime debug settings, alongside the
 /// `ptt_host`/`ptt_port` destination keys.
@@ -50,6 +58,8 @@ pub const BITS_KEY: &str = "ptt_bits";
 pub const RATE_KEY: &str = "ptt_rate";
 pub const EDGE_KEY: &str = "ptt_edge";
 pub const RAW_KEY: &str = "ptt_raw";
+/// Capture-time digital gain (diagnostic): scales every captured FIFO word.
+pub const GAIN_KEY: &str = "ptt_gain";
 
 /// Microphone settings resolved from persisted config. Re-read and re-applied
 /// at the start of every recording, so a `config set ptt_*` takes effect on
@@ -64,6 +74,9 @@ pub struct MicSettings {
     pub edge_flip: bool,
     /// `true` streams unprocessed raw FIFO words instead of extracted PCM.
     pub raw: bool,
+    /// Capture-time digital gain applied to every FIFO word before either the
+    /// PCM extraction or the raw passthrough; 1 is a no-op.
+    pub gain: u32,
 }
 
 impl Default for MicSettings {
@@ -73,6 +86,7 @@ impl Default for MicSettings {
             rate: DEFAULT_RATE_HZ,
             edge_flip: DEFAULT_EDGE_FLIP,
             raw: DEFAULT_RAW,
+            gain: DEFAULT_GAIN,
         }
     }
 }
@@ -107,7 +121,7 @@ pub fn parse_bool(value: &str) -> Option<bool> {
 
 /// Whether `key` is one of this module's mic settings.
 pub fn owns(key: &str) -> bool {
-    matches!(key, BITS_KEY | RATE_KEY | EDGE_KEY | RAW_KEY)
+    matches!(key, BITS_KEY | RATE_KEY | EDGE_KEY | RAW_KEY | GAIN_KEY)
 }
 
 /// Resolves the raw stored values (each optional; `None` when the key is
@@ -120,12 +134,17 @@ pub fn resolve(
     rate: Option<&str>,
     edge: Option<&str>,
     raw: Option<&str>,
+    gain: Option<&str>,
 ) -> ResolvedSettings {
     let mut settings = MicSettings {
         bits: bits.and_then(parse_u32).unwrap_or(DEFAULT_BITS),
         rate: rate.and_then(parse_u32).unwrap_or(DEFAULT_RATE_HZ),
         edge_flip: edge.and_then(parse_bool).unwrap_or(DEFAULT_EDGE_FLIP),
         raw: raw.and_then(parse_bool).unwrap_or(DEFAULT_RAW),
+        gain: gain
+            .and_then(parse_u32)
+            .filter(|g| (MIN_GAIN..=MAX_GAIN).contains(g))
+            .unwrap_or(DEFAULT_GAIN),
     };
     let mut fell_back = false;
     if !mic_settings_valid(settings.bits, settings.rate) {
@@ -148,6 +167,7 @@ pub fn effective_setting(key: &str, settings: MicSettings) -> Option<String> {
         RATE_KEY => Some(format!("{}", settings.rate)),
         EDGE_KEY => Some(format!("{}", settings.edge_flip as u8)),
         RAW_KEY => Some(format!("{}", settings.raw as u8)),
+        GAIN_KEY => Some(format!("{}", settings.gain)),
         _ => None,
     }
 }
@@ -177,6 +197,15 @@ pub fn validate_setting(current: MicSettings, key: &str, value: &str) -> Result<
             candidate.raw =
                 parse_bool(value).ok_or_else(|| String::from("ptt_raw must be 0 or 1"))?;
         }
+        GAIN_KEY => {
+            candidate.gain =
+                parse_u32(value).ok_or_else(|| String::from("ptt_gain must be a number"))?;
+            if !(MIN_GAIN..=MAX_GAIN).contains(&candidate.gain) {
+                return Err(format!(
+                    "ptt_gain must be between {MIN_GAIN} and {MAX_GAIN}"
+                ));
+            }
+        }
         _ => return Ok(()),
     }
     if !mic_settings_valid(candidate.bits, candidate.rate) {
@@ -201,7 +230,7 @@ mod tests {
         // Nothing stored: every key resolves to the value the captain has been
         // testing with (32-bit slots at 16 kHz, default edge, extracted PCM),
         // and that pair sits exactly at the bottom of the mic's clock window.
-        let resolved = resolve(None, None, None, None);
+        let resolved = resolve(None, None, None, None, None);
         assert_eq!(resolved.settings, MicSettings::default());
         assert!(!resolved.fell_back);
         assert_eq!(resolved.settings.bits, 32);
@@ -220,7 +249,7 @@ mod tests {
     fn a_valid_stored_change_is_used_without_falling_back() {
         // 16-bit slots at 32 kHz is still exactly 1.024 MHz, so it is a legal
         // probe combination and must be taken as-is.
-        let resolved = resolve(Some("16"), Some("32000"), Some("1"), Some("1"));
+        let resolved = resolve(Some("16"), Some("32000"), Some("1"), Some("1"), None);
         assert!(!resolved.fell_back);
         assert_eq!(resolved.settings.bits, 16);
         assert_eq!(resolved.settings.rate, 32_000);
@@ -233,7 +262,7 @@ mod tests {
     fn malformed_individual_values_fall_back_to_their_own_default() {
         // A malformed value must not be taken literally, and must not disturb
         // the other keys.
-        let resolved = resolve(Some("nonsense"), Some("32000"), Some("maybe"), Some("2"));
+        let resolved = resolve(Some("nonsense"), Some("32000"), Some("maybe"), Some("2"), None);
         assert_eq!(resolved.settings.bits, DEFAULT_BITS);
         assert_eq!(resolved.settings.rate, 32_000);
         assert_eq!(resolved.settings.edge_flip, DEFAULT_EDGE_FLIP);
@@ -243,7 +272,7 @@ mod tests {
 
     #[test]
     fn whitespace_and_the_documented_bool_spellings_are_accepted() {
-        let resolved = resolve(Some(" 16 "), Some("32000\n"), Some("on"), Some("off"));
+        let resolved = resolve(Some(" 16 "), Some("32000\n"), Some("on"), Some("off"), None);
         assert_eq!(resolved.settings.bits, 16);
         assert_eq!(resolved.settings.rate, 32_000);
         assert!(resolved.settings.edge_flip);
@@ -260,7 +289,7 @@ mod tests {
             (Some("16"), Some("16000")),
             (Some("4000000000"), Some("16000")),
         ] {
-            let resolved = resolve(bits, rate, Some("1"), Some("1"));
+            let resolved = resolve(bits, rate, Some("1"), Some("1"), None);
             assert!(resolved.fell_back, "bits={bits:?} rate={rate:?}");
             assert_eq!(resolved.settings.bits, DEFAULT_BITS);
             assert_eq!(resolved.settings.rate, DEFAULT_RATE_HZ);
@@ -285,6 +314,7 @@ mod tests {
             rate: 32_000,
             edge_flip: true,
             raw: true,
+            gain: 256,
         };
         assert!(validate_setting(changed, EDGE_KEY, "1").is_ok());
         assert!(validate_setting(changed, RAW_KEY, "1").is_ok());
@@ -295,6 +325,7 @@ mod tests {
         );
         assert_eq!(effective_setting(EDGE_KEY, changed).as_deref(), Some("1"));
         assert_eq!(effective_setting(RAW_KEY, changed).as_deref(), Some("1"));
+        assert_eq!(effective_setting(GAIN_KEY, changed).as_deref(), Some("256"));
         assert_eq!(effective_setting("ptt_host", changed), None);
     }
 
@@ -306,6 +337,9 @@ mod tests {
             (RATE_KEY, "not-a-rate"),
             (EDGE_KEY, "2"),
             (RAW_KEY, "maybe"),
+            (GAIN_KEY, "0"),
+            (GAIN_KEY, "4097"),
+            (GAIN_KEY, "lots"),
             (BITS_KEY, "16"),         // 512 kHz, below the window
             (RATE_KEY, "128000"),     // 8.192 MHz, above the window
             (BITS_KEY, "7"),          // below the PIO shift-register minimum
@@ -335,7 +369,7 @@ mod tests {
         // stored strings must reproduce the set values.
         let stored_bits = "24";
         let stored_rate = "21334"; // 24-bit * 21334 * 2 = 1.024032 MHz, just inside the window
-        let resolved = resolve(Some(stored_bits), Some(stored_rate), None, None);
+        let resolved = resolve(Some(stored_bits), Some(stored_rate), None, None, None);
         assert!(!resolved.fell_back);
         assert_eq!(resolved.settings.bits, 24);
         assert_eq!(resolved.settings.rate, 21_334);
@@ -343,5 +377,28 @@ mod tests {
             resolved.settings.bits,
             resolved.settings.rate
         ));
+    }
+
+    #[test]
+    fn gain_defaults_to_one_and_survives_an_unrelated_clock_fallback() {
+        // No key stored: gain is the no-op default.
+        assert_eq!(resolve(None, None, None, None, None).settings.gain, 1);
+        // A valid gain is taken as stored.
+        assert_eq!(
+            resolve(None, None, None, None, Some("4096")).settings.gain,
+            4096
+        );
+        // A malformed or out-of-range gain falls back to 1 rather than being
+        // handed to the capture path.
+        for bad in ["0", "4097", "-1", "lots"] {
+            assert_eq!(
+                resolve(None, None, None, None, Some(bad)).settings.gain, 1,
+                "ptt_gain={bad}"
+            );
+        }
+        // The out-of-window clock fallback must not disturb gain either.
+        let resolved = resolve(Some("16"), Some("16000"), None, None, Some("256"));
+        assert!(resolved.fell_back);
+        assert_eq!(resolved.settings.gain, 256);
     }
 }

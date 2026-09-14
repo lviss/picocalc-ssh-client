@@ -56,11 +56,13 @@ use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
 use terminal_model::mic_config::{
-    BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, MicSettings, RATE_KEY, RAW_KEY,
+    BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
     effective_setting as mic_effective_setting, resolve as resolve_mic_settings,
     validate_setting as validate_mic_setting,
 };
-use terminal_model::pcm_extract::{bit_clock_hz, extract_left_channel_pcm};
+use terminal_model::pcm_extract::{
+    bit_clock_hz, extract_left_channel_pcm, remove_dc_and_gain_samples, remove_dc_and_gain_words,
+};
 
 extern crate alloc;
 
@@ -95,19 +97,21 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 /// value falls back to its own default, and an out-of-window slot/rate pair
 /// falls back to the default rather than silently mis-clocking the mic.
 async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
-    let (bits, rate, edge, raw) = {
+    let (bits, rate, edge, raw, gain) = {
         let mut config = CONFIG.get().lock().await;
         let bits = config.fetch(BITS_KEY).await.ok().flatten();
         let rate = config.fetch(RATE_KEY).await.ok().flatten();
         let edge = config.fetch(EDGE_KEY).await.ok().flatten();
         let raw = config.fetch(RAW_KEY).await.ok().flatten();
-        (bits, rate, edge, raw)
+        let gain = config.fetch(GAIN_KEY).await.ok().flatten();
+        (bits, rate, edge, raw, gain)
     };
     resolve_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
         raw.as_ref().map(|v| v.as_str()),
+        gain.as_ref().map(|v| v.as_str()),
     )
 }
 
@@ -373,7 +377,10 @@ async fn capture_task(mut mic: Mic) {
             let result = if settings.raw {
                 // `ptt_raw`: bypass extraction and hand the ring the raw FIFO
                 // words as little-endian i16 halves, so re-serializing them
-                // reproduces the exact unprocessed I2S word stream.
+                // reproduces the exact unprocessed I2S word stream. The gain
+                // knob removes the driven slot's DC offset before amplifying,
+                // so it reveals signal rather than railing on the offset.
+                remove_dc_and_gain_words(&mut raw, settings.gain);
                 PCM_RING.lock().await.write_u32_words(generation, &raw)
             } else {
                 // Keep only the even-indexed (left-slot) words and drop the
@@ -385,6 +392,10 @@ async fn capture_task(mut mic: Mic) {
                 // configured slot width.
                 let mut pcm = [0i16; SAMPLES_PER_CHUNK];
                 extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
+                // `ptt_gain`: the captain's capture-time gain experiment,
+                // applied after DC removal so a useful gain reveals the AC
+                // signal instead of immediately railing on the offset.
+                remove_dc_and_gain_samples(&mut pcm, settings.gain);
                 PCM_RING.lock().await.write(generation, &pcm)
             };
             if result.first_drop {
