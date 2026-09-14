@@ -248,9 +248,7 @@ async fn main(spawner: Spawner) {
         );
         print!("PSRAM (QMI): {}\r\n", byte_size(psram_qmi_size));
         if psram_qmi_size == 0 {
-            // This can happen if you power on the pico without first
-            // powering up the picocalc carrier board
-            print!("\u{1b}[1mExternal PSRAM was NOT found!\u{1b}[0m\r\n");
+            print!("PSRAM heap: none - running from internal RAM only\r\n");
         }
         print!(
             "Heap {} used, {} free\r\n",
