@@ -18,31 +18,44 @@
 ## Audio
 GP26/GP27 - `PWM_L`/`PWM_R` on picocalc audio circuitry
 
-## Microphone (I2S, push-to-talk)
-* `GP16` - I2S `BCLK` (bit clock, firmware drives this)
-* `GP17` - I2S `WS`/`LRCLK` (word select, firmware drives this)
-* `GP18` - I2S `SD` (serial data, mic drives this - the only actual input line)
-* `GP19` - spare (unused, or wire as a mic enable/mute line)
-* `GP22` - spare (unused)
+## TF Card reader
+* `GP16` - `SPI0_RX`
+* `GP17` - `SPI0_CS`
+* `GP18` - `SPI0_SCK`
+* `GP19` - `SPI0_TX`
+* `GP22` - `SD_DET`
 
-These are the pins formerly used by the (now removed) SD card reader; see
-AGENTS.md for why they were repurposed.
+## Microphone (I2S, push-to-talk)
+* `GP2`  - I2S `BCLK` (bit clock, firmware drives this)
+* `GP3`  - I2S `WS`/`LRCLK` (word select, firmware drives this)
+* `GP21` - I2S `SD`/`DOUT` (serial data, mic drives this - the only actual input line)
+
+These are exposed expansion/jumper block pins also wired to the PSRAM chip
+(see below); they're free for the mic because this firmware only talks to
+PSRAM over the QMI/XIP hardware path now, which uses a separate,
+RP2350-internal chip-select pad and never drives these pins (see
+`src/psram.rs`'s header comment and AGENTS.md). `GP20` (PSRAM `RAM_CS`) is
+explicitly held deselected by firmware since nothing drives it as PSRAM
+chip-select anymore.
 
 ## PSRAM
-* `GP2`  - `RAM_TX`
-* `GP3`  - `RAM_RX`
-* `GP4`  - `RAM_IO2`  - quad mode
-* `GP5`  - `RAM_IO3`  - quad mode
-* `GP20` - `RAM_CS`
-* `GP21` - `RAM_SCK`
+* `GP2`  - `RAM_TX` (repurposed for the mic's I2S `BCLK`; see above)
+* `GP3`  - `RAM_RX` (repurposed for the mic's I2S `WS`/`LRCLK`; see above)
+* `GP4`  - `RAM_IO2`  - quad mode (unclaimed by this firmware)
+* `GP5`  - `RAM_IO3`  - quad mode (unclaimed by this firmware)
+* `GP20` - `RAM_CS` (held explicitly deselected by firmware; see above)
+* `GP21` - `RAM_SCK` (repurposed for the mic's I2S `SD`/`DOUT`; see above)
 
-Note that all except the CS are exposed to expansion/jumper block.
+Note that all except the CS are exposed to expansion/jumper block. Only the
+QMI/XIP hardware path (`init_psram_qmi` in `src/psram.rs`) is used to reach
+this chip; the old PIO-driven "slow path" that bit-banged SPI over these
+pins was removed (see AGENTS.md).
 
 ## Expansion Port/Jumper block
-* `GP2`  - Also connected to PSRAM
-* `GP3`  - Also connected to PSRAM
+* `GP2`  - Also connected to PSRAM; used by this firmware for the mic's I2S `BCLK`
+* `GP3`  - Also connected to PSRAM; used by this firmware for the mic's I2S `WS`/`LRCLK`
 * `GP4`  - Also connected to PSRAM
 * `GP5`  - Also connected to PSRAM
-* `GP21` - Also connected to PSRAM
+* `GP21` - Also connected to PSRAM; used by this firmware for the mic's I2S `SD`/`DOUT`
 * `GP28`
 
