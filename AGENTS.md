@@ -17,7 +17,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
   (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
-  (`audio_ring.rs`) from `src/mic.rs`, and the SD-card SSH-key backup text codec
+  (`audio_ring.rs`) and the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`)
+  from `src/mic.rs`, and the SD-card SSH-key backup text codec
   (`keyfile.rs`) from `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
   `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
