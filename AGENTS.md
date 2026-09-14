@@ -133,8 +133,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   mono in ~25ms chunks, buffered through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>`
   payloads land in the `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget
   entry above) — deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`.
-  Button binding is `Key::ButtonLeft2` (`src/keyboard.rs`, one `match` arm to change for a different
-  physical button) and destination is `config set ptt_host`/`config set ptt_port` (plain
+  Button binding is plain `Key::F1` (no modifiers - `src/keyboard.rs`, checked ahead of the
+  existing Ctrl+F1 reboot shortcut so the two don't collide; one `match`/guard to change for a
+  different key). `Key::ButtonLeft2`, tried first, turned out to correspond to no physical control
+  on real hardware - the PicoCalc has one D-pad and no joystick, and `ButtonLeft2` belongs to a
+  `Joy*`/`Button*` group of raw keyboard-protocol codes (`src/keyboard.rs`'s `Key` enum and its
+  `From<u8>` impl) that looks like it comes from a joystick/gamepad-bearing variant of this same
+  keyboard co-processor protocol, not this device - treat that whole code group as suspect for any
+  future key binding on this hardware. Destination is `config set ptt_host`/`config set ptt_port` (plain
   `sequential_storage` keys, no special-casing needed in `config.rs`). Wire format (needed by
   anything implementing the receiving side): one TCP connection per utterance, opened on button
   press and closed on release; each frame is a 4-byte little-endian `u32` byte count followed by

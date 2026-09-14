@@ -80,7 +80,7 @@ static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Begins push-to-talk capture; a no-op if already recording. Called from
-/// `keyboard.rs` on `(KeyState::Pressed, Key::ButtonLeft2)`.
+/// `keyboard.rs` on `(KeyState::Pressed, Key::F1)` (with no modifiers held).
 pub async fn start_recording() {
     if !RECORDING.swap(true, Ordering::AcqRel) {
         SCREEN
@@ -94,7 +94,7 @@ pub async fn start_recording() {
 }
 
 /// Ends push-to-talk capture; a no-op if not recording. Called from
-/// `keyboard.rs` on `(KeyState::Released, Key::ButtonLeft2)`.
+/// `keyboard.rs` on `(KeyState::Released, Key::F1)`.
 pub async fn stop_recording() {
     if RECORDING.swap(false, Ordering::AcqRel) {
         SCREEN.get().lock().await.clear_overlay();

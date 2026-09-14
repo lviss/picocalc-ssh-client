@@ -328,11 +328,15 @@ pub async fn keyboard_reader(
 
         if let Some(key) = keyboard.process().await {
             log::info!("key == {key:?}");
-            // Push-to-talk: hold to record. Relies on the same reliable
-            // `Hold`/`Released` state reporting that `modifier_flag` above
-            // already depends on. Change `Key::ButtonLeft2` here to rebind
-            // to a different physical button.
-            if key.key == Key::ButtonLeft2 {
+            // Push-to-talk: hold plain F1 (no modifiers) to record; release
+            // to send. Checked ahead of the Ctrl+F1 reboot shortcut below so
+            // the two don't collide - Ctrl+F1 still reaches that shortcut via
+            // the `else if` branch, since this check requires no modifiers.
+            // Relies on the same reliable `Hold`/`Released` state reporting
+            // that `modifier_flag` above already depends on. Change the
+            // `Key::F1`/`Modifiers::NONE` check here to rebind to a
+            // different key.
+            if key.key == Key::F1 && key.modifiers == Modifiers::NONE {
                 match key.state {
                     KeyState::Pressed => crate::mic::start_recording().await,
                     KeyState::Released => crate::mic::stop_recording().await,
