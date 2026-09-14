@@ -16,7 +16,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - `terminal-model/` is a separate workspace-member crate (path dependency) holding the
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, plus push-to-talk key dispatch
-  (`key_dispatch.rs`) from `src/keyboard.rs`. It depends only on `vte`, `embedded-graphics`, and
+  (`key_dispatch.rs`) from `src/keyboard.rs` and the capture/upload sample ring
+  (`audio_ring.rs`) from `src/mic.rs`. It depends only on `vte`, `embedded-graphics`, and
   `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
@@ -114,10 +115,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   separate, RP2350-internal chip-select pad, never these pins. GP16/17/18/19/22 (the SD card's
   SPI0 pins) were considered for the mic in an earlier iteration of this feature but the captain's
   own hardware check moved the mic to the PSRAM/expansion-header group instead, keeping SD card
-  support intact (see `storage.rs`). Capture is 16 kHz/16-bit mono in ~25ms chunks, buffered
-  through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>` payloads land in the
-  `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget entry above) —
-  deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Button binding is
+  support intact (see `storage.rs`). Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
+  the capture and upload tasks in a fixed 2048-sample (`i16`, 128ms at 16 kHz) static ring buffer
+  in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the heap - so it does not compete
+  with the `DualHeap` budget and cannot exhaust it. The ring never blocks and never grows; when it
+  is full the oldest samples are dropped, logging a single `ptt: ...` line per recording, so a
+  slow/unreachable `ptt_host` (connect is bounded by a 5s timeout in `mic.rs`) degrades to bounded
+  audio loss rather than a stalled I2S clock or a heap-exhaustion abort, independent of whether a
+  PSRAM heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
+  lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Button binding is
   plain `Key::F1`. Arming and stopping are independently gated: arming requires `KeyState::Pressed`
   with `Modifiers::NONE` (so Ctrl+F1 still reaches the existing reboot shortcut), while stopping
   fires on `KeyState::Released` whenever `mic::is_recording()` (reusing `mic.rs`'s `RECORDING`

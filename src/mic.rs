@@ -3,6 +3,14 @@
 //! (see AGENTS.md and `psram.rs`), plus the task that streams captured audio
 //! to a configurable network host.
 //!
+//! Audio is staged between the capture and upload tasks in a fixed,
+//! allocation-free static ring buffer (`terminal_model::audio_ring`), not on
+//! the heap. Capture never blocks and never allocates; when the network side
+//! falls behind, the ring drops its oldest samples, so a slow or unreachable
+//! `ptt_host` can at worst lose audio, never stall the I2S clock or exhaust
+//! the firmware heap. This holds regardless of whether a PSRAM heap tier is
+//! present or working.
+//!
 //! Wire format (see AGENTS.md for the authoritative copy of this contract):
 //! one TCP connection per utterance (opened on button press, closed on
 //! release). Each captured frame is sent as a 4-byte little-endian u32 byte
@@ -13,10 +21,7 @@ use crate::Irqs;
 use crate::config::CONFIG;
 use crate::net::stack;
 use crate::screen::SCREEN;
-use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::vec::Vec;
-use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -31,11 +36,12 @@ use embassy_rp::pio::{
     Config, Direction, FifoJoin, Pio, ShiftConfig, ShiftDirection, StateMachine,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant};
+use embassy_time::{Duration, Instant, with_timeout};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
+use terminal_model::audio_ring::AudioRing;
 
 extern crate alloc;
 
@@ -49,12 +55,20 @@ const BIT_DEPTH: u32 = 16;
 const CHANNELS: u32 = 2;
 /// 25ms per frame, comfortably inside the brief's 20-50ms guidance.
 const SAMPLES_PER_CHUNK: usize = SAMPLE_RATE_HZ as usize / 40;
-/// Cap on `ptt_upload_task`'s `pending` backlog (~1.6s of audio at 25ms per
-/// chunk): comfortably above realistic DNS+TCP-connect latency, so a
-/// slow/unreachable `ptt_host` degrades to bounded audio loss (oldest
-/// buffered chunks dropped) instead of unbounded heap growth while the
-/// button stays held.
-const MAX_PENDING_CHUNKS: usize = 64;
+/// Capacity of the shared capture/upload ring, in `i16` samples: 2048 samples
+/// at 16 kHz is 128 ms of audio, enough to absorb ordinary connection-setup
+/// and scheduling jitter without being a meaningful memory cost. This buffer
+/// is a plain `static` compiled into `.bss`, so - unlike the heap-allocated
+/// per-chunk `Box`es it replaces - it does not draw on the 64 KiB `DualHeap`
+/// the WiFi/TCP/SSH stack and screen scrollback share, and therefore cannot
+/// exhaust that heap when the network side falls behind (it drops its oldest
+/// samples instead). The behavior does not depend on a PSRAM heap tier
+/// existing or working.
+const RING_SAMPLES: usize = 2048;
+/// Upper bound on DNS + TCP connect for one utterance, so an unreachable
+/// `ptt_host` cannot leave that utterance's upload pending indefinitely
+/// (smoltcp's SYN retry backoff can otherwise run for a long time).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound on a single push-to-talk recording. A `Released` report is the
 /// normal way to end one, but the keyboard co-processor link can drop a
 /// transition (missed poll, I2C glitch) with no automatic recovery until some
@@ -63,29 +77,29 @@ const MAX_PENDING_CHUNKS: usize = 64;
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
-type PcmChunk = Box<[i16; SAMPLES_PER_CHUNK]>;
-
-enum StreamMsg {
-    Chunk(PcmChunk),
-    End,
-}
-
-/// The PSRAM-backed elastic buffer absorbing scheduling jitter between the
-/// capture and network-send tasks (see AGENTS.md's heap/PSRAM notes): the
-/// `Box<[i16; _]>` payloads are ordinary heap allocations, which the global
-/// `DualHeap` overflows into PSRAM once the tiny primary heap is full.
-/// Access is guarded by this channel's internal critical-section mutex, not
-/// atomics, per `heap.rs`'s "PSRAM isn't CAS-atomic-safe" caveat.
-static STREAM: Channel<CriticalSectionRawMutex, StreamMsg, 4> = Channel::new();
+/// Samples captured by `capture_task`, drained by `ptt_upload_task`. A fixed
+/// `static` (never heap-allocated, never resized), guarded by an
+/// `embassy_sync` mutex rather than held lock-free per `heap.rs`'s CAS
+/// caveat. Because `AudioRing::write` never blocks, `capture_task` can deposit
+/// samples cooperatively regardless of whether the upload task has connected
+/// yet, so there is no connect-vs-capture race to manage.
+static PCM_RING: Mutex<CriticalSectionRawMutex, AudioRing<RING_SAMPLES>> =
+    Mutex::new(AudioRing::new());
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Wakes `ptt_upload_task` when `capture_task` has deposited samples. A
+/// `Signal` coalesces, which is exactly the needed contract: one pending wake
+/// means "there is at least one sample to drain", and the drain loop empties
+/// everything available before waiting again.
+static DATA_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Signals the end of the current utterance's capture so `ptt_upload_task`
+/// drains the remainder of `PCM_RING` and closes the connection.
+static STREAM_ENDED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Separate from `START_SIGNAL` (each `Signal` has exactly one waiter:
-/// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` waits on this
-/// one) so the network connection can be dialed concurrently with the very
-/// first captured chunks instead of only after `ptt_upload_task` observes
-/// one on `STREAM` — see AGENTS.md's note on `STREAM`'s capacity being
-/// smaller than realistic connection-setup latency.
+/// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` on this one) so
+/// the upload task can begin DNS/TCP connect as soon as a recording starts,
+/// while `capture_task` fills the static ring.
 static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Begins push-to-talk capture; a no-op if already recording. Called from
@@ -97,6 +111,9 @@ pub async fn start_recording() {
             .lock()
             .await
             .show_overlay(String::from("recording..."));
+        // Start each utterance from an empty ring so `first_drop` is reported
+        // once per recording rather than leaking across recordings.
+        PCM_RING.lock().await.clear();
         START_SIGNAL.signal(());
         UPLOAD_START_SIGNAL.signal(());
     }
@@ -223,11 +240,19 @@ async fn capture_task(mut mic: Mic) {
             // when wired to the left slot (WS low), matching this driver's
             // pin/wiring contract in AGENTS.md. If a captain instead wires
             // the mic to the right slot, swap this to the lower 16 bits.
-            let mut pcm: PcmChunk = Box::new([0i16; SAMPLES_PER_CHUNK]);
+            let mut pcm = [0i16; SAMPLES_PER_CHUNK];
             for (dst, word) in pcm.iter_mut().zip(raw.iter()) {
                 *dst = (*word >> 16) as i16;
             }
-            STREAM.send(StreamMsg::Chunk(pcm)).await;
+
+            // Never blocks and never allocates: if the network side is
+            // behind, the ring drops its oldest samples instead of stalling
+            // the DMA pull that keeps the I2S clocks running.
+            let result = PCM_RING.lock().await.write(&pcm);
+            if result.first_drop {
+                print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+            }
+            DATA_READY.signal(());
 
             if started.elapsed() >= MAX_RECORDING_DURATION {
                 print!("ptt: recording exceeded 60s cap, stopping\r\n");
@@ -235,25 +260,59 @@ async fn capture_task(mut mic: Mic) {
             }
         }
         mic.set_enabled(false);
-        STREAM.send(StreamMsg::End).await;
+        STREAM_ENDED.signal(());
     }
 }
 
+/// Sends one wire frame: a 4-byte little-endian byte count, then the samples.
+/// Uses only fixed stack buffers (no heap) so the upload hot path cannot
+/// allocate.
 async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
-    let mut bytes = Vec::with_capacity(4 + chunk.len() * 2);
-    bytes.extend_from_slice(&(chunk.len() as u32 * 2).to_le_bytes());
-    for sample in chunk {
-        bytes.extend_from_slice(&sample.to_le_bytes());
+    const BATCH_SAMPLES: usize = 64;
+    let byte_len = (chunk.len() * 2) as u32;
+    if socket.write_all(&byte_len.to_le_bytes()).await.is_err() {
+        return false;
     }
-    socket.write_all(&bytes).await.is_ok()
+    let mut bytes = [0u8; BATCH_SAMPLES * 2];
+    for batch in chunk.chunks(BATCH_SAMPLES) {
+        for (i, sample) in batch.iter().enumerate() {
+            bytes[i * 2..i * 2 + 2].copy_from_slice(&sample.to_le_bytes());
+        }
+        if socket.write_all(&bytes[..batch.len() * 2]).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Moves every sample currently in `PCM_RING` to the socket, in order. With
+/// no socket (connect failed or timed out) the samples are discarded instead,
+/// so the ring is still drained and the recording can run to its end without
+/// ever blocking `capture_task`.
+async fn drain_pcm_ring(socket: &mut Option<TcpSocket<'_>>) {
+    let mut buf = [0i16; SAMPLES_PER_CHUNK];
+    loop {
+        let n = {
+            let mut ring = PCM_RING.lock().await;
+            ring.read(&mut buf)
+        };
+        if n == 0 {
+            return;
+        }
+        if let Some(sock) = socket.as_mut()
+            && !send_chunk(sock, &buf[..n]).await
+        {
+            print!("ptt: send failed, dropping rest of recording\r\n");
+            *socket = None;
+        }
+    }
 }
 
 /// Resolves and connects to the configured `ptt_host`/`ptt_port`, returning
-/// `None` (after logging why) on any failure. `ptt_upload_task` races this
-/// against continued `STREAM.receive()` calls (rather than awaiting it to
-/// completion first) so the small `STREAM` channel keeps draining — and
-/// `capture_task`'s DMA pulls / I2S clock keep running — for the whole
-/// DNS+connect window instead of only after it.
+/// `None` (after logging why) on any failure. `ptt_upload_task` bounds this
+/// with `CONNECT_TIMEOUT`; while it runs, captured samples accumulate in the
+/// fixed static ring, which drops the oldest when full, so capture is never
+/// blocked by connection setup.
 async fn connect_for_upload<'a>(
     tx_buf: &'a mut [u8],
     rx_buf: &'a mut [u8],
@@ -304,63 +363,34 @@ async fn ptt_upload_task() {
         let mut tx_buf = [0u8; 2048];
         let mut rx_buf = [0u8; 256];
 
-        // Chunks that arrive on `STREAM` while `connect_for_upload` is
-        // still resolving DNS + TCP connect below: buffered here (instead
-        // of leaving them queued on the bounded `STREAM` channel) so
-        // `capture_task` never blocks on a full channel during connection
-        // setup. Sent once the socket is ready, in the same order.
-        let mut pending: Vec<PcmChunk> = Vec::new();
-        let mut ended = false;
-
-        let mut socket = {
-            let mut connect_fut = pin!(connect_for_upload(&mut tx_buf, &mut rx_buf));
-            let mut dropped_pending = false;
-            loop {
-                match select(&mut connect_fut, STREAM.receive()).await {
-                    Either::First(socket) => break socket,
-                    Either::Second(StreamMsg::Chunk(chunk)) => {
-                        if pending.len() >= MAX_PENDING_CHUNKS {
-                            pending.remove(0);
-                            if !dropped_pending {
-                                print!("ptt: connect is slow, dropping oldest buffered audio\r\n");
-                                dropped_pending = true;
-                            }
-                        }
-                        pending.push(chunk);
-                    }
-                    Either::Second(StreamMsg::End) => {
-                        ended = true;
-                        break None;
-                    }
-                }
+        let mut socket = match with_timeout(
+            CONNECT_TIMEOUT,
+            connect_for_upload(&mut tx_buf, &mut rx_buf),
+        )
+        .await
+        {
+            Ok(socket) => socket,
+            Err(_) => {
+                print!("ptt: connect timed out, dropping recording\r\n");
+                None
             }
         };
 
-        if ended && !pending.is_empty() {
-            print!("ptt: recording ended before connecting, dropping buffered audio\r\n");
-        }
-
-        for chunk in pending {
-            if let Some(sock) = socket.as_mut()
-                && !send_chunk(sock, chunk.as_slice()).await
-            {
-                print!("ptt: send failed, dropping rest of recording\r\n");
-                socket = None;
+        // Drain until capture signals the end of the utterance. The static
+        // ring absorbs (and, when full, drops the oldest of) everything
+        // captured meanwhile, so a failed, slow, or congested connection only
+        // ever costs buffered audio - it never blocks `capture_task`.
+        loop {
+            drain_pcm_ring(&mut socket).await;
+            match select(DATA_READY.wait(), STREAM_ENDED.wait()).await {
+                Either::First(()) => {}
+                Either::Second(()) => break,
             }
         }
+        drain_pcm_ring(&mut socket).await;
 
-        // Dropping `socket` once this loop exits on `StreamMsg::End` closes
-        // the TCP connection, which is this wire format's end-of-utterance
-        // signal to the receiver.
-        if !ended {
-            while let StreamMsg::Chunk(chunk) = STREAM.receive().await {
-                if let Some(sock) = socket.as_mut()
-                    && !send_chunk(sock, chunk.as_slice()).await
-                {
-                    print!("ptt: send failed, dropping rest of recording\r\n");
-                    socket = None;
-                }
-            }
-        }
+        // `socket` drops at the end of this iteration, closing the TCP
+        // connection, which is this wire format's end-of-utterance signal to
+        // the receiver.
     }
 }
