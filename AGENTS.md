@@ -123,7 +123,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   slow/unreachable `ptt_host` (connect is bounded by a 5s timeout in `mic.rs`) degrades to bounded
   audio loss rather than a stalled I2S clock or a heap-exhaustion abort, independent of whether a
   PSRAM heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
-  lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Button binding is
+  lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Each sample is tagged with the
+  utterance generation that produced it (`CURRENT_GEN`/`ENDED_GEN` atomic counters in `mic.rs`,
+  with the pure `utterance_ended` predicate in `audio_ring.rs`), so a recording that starts while
+  a previous one's connect is still in flight shares the ring without its audio being sent over
+  the older connection or its own end being consumed as the older one's; the single upload task
+  serves generations in order and every connection closes when its own generation ends. Button binding is
   plain `Key::F1`. Arming and stopping are independently gated: arming requires `KeyState::Pressed`
   with `Modifiers::NONE` (so Ctrl+F1 still reaches the existing reboot shortcut), while stopping
   fires on `KeyState::Released` whenever `mic::is_recording()` (reusing `mic.rs`'s `RECORDING`

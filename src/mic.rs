@@ -22,9 +22,9 @@ use crate::config::CONFIG;
 use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::select;
 use embassy_net::IpEndpoint;
 use embassy_net::dns::{DnsQueryType, DnsSocket};
 use embassy_net::tcp::TcpSocket;
@@ -41,7 +41,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, with_timeout};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
-use terminal_model::audio_ring::AudioRing;
+use terminal_model::audio_ring::{AudioRing, utterance_ended};
 
 extern crate alloc;
 
@@ -82,19 +82,34 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 /// `embassy_sync` mutex rather than held lock-free per `heap.rs`'s CAS
 /// caveat. Because `AudioRing::write` never blocks, `capture_task` can deposit
 /// samples cooperatively regardless of whether the upload task has connected
-/// yet, so there is no connect-vs-capture race to manage.
+/// yet, so there is no connect-vs-capture race to manage. Each sample carries
+/// the utterance generation that produced it, so overlapping utterances can
+/// share the buffer without one's audio (or end) leaking into the other's
+/// connection.
 static PCM_RING: Mutex<CriticalSectionRawMutex, AudioRing<RING_SAMPLES>> =
     Mutex::new(AudioRing::new());
+
+/// Highest generation a recording has been armed for; bumped by
+/// `start_recording` and read by both tasks. Generations are what distinguish
+/// overlapping utterances, so a later recording can never be mistaken for (or
+/// consume the end of) an earlier one still being uploaded.
+static CURRENT_GEN: AtomicU32 = AtomicU32::new(0);
+/// Highest generation whose capture has finished. Monotonic, because only one
+/// recording runs at a time.
+static ENDED_GEN: AtomicU32 = AtomicU32::new(0);
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Wakes `ptt_upload_task` when `capture_task` has deposited samples. A
 /// `Signal` coalesces, which is exactly the needed contract: one pending wake
-/// means "there is at least one sample to drain", and the drain loop empties
-/// everything available before waiting again.
+/// means "there may be samples to drain", and the drain loop empties
+/// everything available before waiting again. Correctness comes from
+/// `CURRENT_GEN`/`ENDED_GEN`, not from this signal, so coalescing across
+/// utterances is harmless.
 static DATA_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-/// Signals the end of the current utterance's capture so `ptt_upload_task`
-/// drains the remainder of `PCM_RING` and closes the connection.
+/// Wake-up hint for the same reason as `DATA_READY`; the actual end of an
+/// utterance is decided by [`utterance_ended`] against the generation
+/// counters.
 static STREAM_ENDED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Separate from `START_SIGNAL` (each `Signal` has exactly one waiter:
 /// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` on this one) so
@@ -111,9 +126,11 @@ pub async fn start_recording() {
             .lock()
             .await
             .show_overlay(String::from("recording..."));
-        // Start each utterance from an empty ring so `first_drop` is reported
-        // once per recording rather than leaking across recordings.
-        PCM_RING.lock().await.clear();
+        // A new generation identifies this utterance for the rest of its
+        // life. The ring is deliberately *not* cleared here: a previous
+        // utterance's undrained audio must stay available to the connection
+        // that owns it, and the generation tags keep the two separate.
+        CURRENT_GEN.fetch_add(1, Ordering::AcqRel);
         START_SIGNAL.signal(());
         UPLOAD_START_SIGNAL.signal(());
     }
@@ -229,9 +246,13 @@ pub fn init_mic(
 async fn capture_task(mut mic: Mic) {
     loop {
         START_SIGNAL.wait().await;
+        let generation = CURRENT_GEN.load(Ordering::Acquire);
         mic.set_enabled(true);
         let started = Instant::now();
-        while RECORDING.load(Ordering::Acquire) {
+        // Ends when the button is released, when a newer recording supersedes
+        // this one, or on the recording-duration cap below.
+        while RECORDING.load(Ordering::Acquire) && CURRENT_GEN.load(Ordering::Acquire) == generation
+        {
             let mut raw = [0u32; SAMPLES_PER_CHUNK];
             mic.capture(&mut raw).await;
 
@@ -248,7 +269,7 @@ async fn capture_task(mut mic: Mic) {
             // Never blocks and never allocates: if the network side is
             // behind, the ring drops its oldest samples instead of stalling
             // the DMA pull that keeps the I2S clocks running.
-            let result = PCM_RING.lock().await.write(&pcm);
+            let result = PCM_RING.lock().await.write(generation, &pcm);
             if result.first_drop {
                 print!("ptt: upload can't keep up, dropping oldest audio\r\n");
             }
@@ -260,6 +281,7 @@ async fn capture_task(mut mic: Mic) {
             }
         }
         mic.set_enabled(false);
+        ENDED_GEN.fetch_max(generation, Ordering::AcqRel);
         STREAM_ENDED.signal(());
     }
 }
@@ -285,31 +307,83 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     true
 }
 
-/// Moves every sample currently in `PCM_RING` to the socket, in order. With
-/// no socket (connect failed or timed out) the samples are discarded instead,
-/// so the ring is still drained and the recording can run to its end without
-/// ever blocking `capture_task`.
-async fn drain_pcm_ring(socket: &mut Option<TcpSocket<'_>>) {
+/// Sends one utterance's audio over its own connection: connect (bounded by
+/// `CONNECT_TIMEOUT`), drain every sample tagged `generation` until that
+/// generation ends, then close the connection. Samples belonging to any other
+/// generation are left in the ring for their own upload, and the end
+/// condition is [`utterance_ended`] on the generation counters - never a
+/// shared signal - so a later recording can neither have its audio sent here
+/// nor be mistaken for this one's end. With no socket (connect failed or
+/// timed out) the samples are discarded instead, so the ring is still drained
+/// and the recording always terminates.
+async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) {
+    let mut socket = match with_timeout(CONNECT_TIMEOUT, connect_for_upload(tx_buf, rx_buf)).await {
+        Ok(socket) => socket,
+        Err(_) => {
+            print!("ptt: connect timed out, dropping recording\r\n");
+            None
+        }
+    };
+
     let mut buf = [0i16; SAMPLES_PER_CHUNK];
     loop {
-        let n = {
-            let mut ring = PCM_RING.lock().await;
-            ring.read(&mut buf)
-        };
-        if n == 0 {
-            return;
+        // Drain everything this generation has buffered so far. The static
+        // ring absorbs (and, when full, drops the oldest of) whatever capture
+        // produces meanwhile, so a failed, slow, or congested connection only
+        // ever costs buffered audio - it never blocks `capture_task`.
+        loop {
+            let n = {
+                let mut ring = PCM_RING.lock().await;
+                ring.read(generation, &mut buf)
+            };
+            if n == 0 {
+                break;
+            }
+            if let Some(sock) = socket.as_mut()
+                && !send_chunk(sock, &buf[..n]).await
+            {
+                print!("ptt: send failed, dropping rest of recording\r\n");
+                socket = None;
+            }
         }
-        if let Some(sock) = socket.as_mut()
-            && !send_chunk(sock, &buf[..n]).await
-        {
-            print!("ptt: send failed, dropping rest of recording\r\n");
-            *socket = None;
+
+        if utterance_ended(
+            CURRENT_GEN.load(Ordering::Acquire),
+            ENDED_GEN.load(Ordering::Acquire),
+            generation,
+        ) {
+            break;
         }
+        // Nothing more for this generation yet; wait for more audio, for the
+        // end of the recording, or for a newer recording that supersedes this
+        // one (the counters are re-checked on wake).
+        select(DATA_READY.wait(), STREAM_ENDED.wait()).await;
+    }
+
+    // `socket` drops here, closing the TCP connection, which is this wire
+    // format's end-of-utterance signal to the receiver.
+}
+
+#[embassy_executor::task]
+async fn ptt_upload_task() {
+    let mut tx_buf = [0u8; 2048];
+    let mut rx_buf = [0u8; 256];
+    let mut next_generation: u32 = 1;
+
+    loop {
+        // Serve every utterance exactly once, in order. Generations are
+        // contiguous, so once `CURRENT_GEN` has reached one it exists and must
+        // be served - even if it was superseded before its connect resolved.
+        while next_generation > CURRENT_GEN.load(Ordering::Acquire) {
+            UPLOAD_START_SIGNAL.wait().await;
+        }
+        serve_utterance(next_generation, &mut tx_buf, &mut rx_buf).await;
+        next_generation += 1;
     }
 }
 
 /// Resolves and connects to the configured `ptt_host`/`ptt_port`, returning
-/// `None` (after logging why) on any failure. `ptt_upload_task` bounds this
+/// `None` (after logging why) on any failure. `serve_utterance` bounds this
 /// with `CONNECT_TIMEOUT`; while it runs, captured samples accumulate in the
 /// fixed static ring, which drops the oldest when full, so capture is never
 /// blocked by connection setup.
@@ -353,44 +427,4 @@ async fn connect_for_upload<'a>(
         return None;
     }
     Some(socket)
-}
-
-#[embassy_executor::task]
-async fn ptt_upload_task() {
-    loop {
-        UPLOAD_START_SIGNAL.wait().await;
-
-        let mut tx_buf = [0u8; 2048];
-        let mut rx_buf = [0u8; 256];
-
-        let mut socket = match with_timeout(
-            CONNECT_TIMEOUT,
-            connect_for_upload(&mut tx_buf, &mut rx_buf),
-        )
-        .await
-        {
-            Ok(socket) => socket,
-            Err(_) => {
-                print!("ptt: connect timed out, dropping recording\r\n");
-                None
-            }
-        };
-
-        // Drain until capture signals the end of the utterance. The static
-        // ring absorbs (and, when full, drops the oldest of) everything
-        // captured meanwhile, so a failed, slow, or congested connection only
-        // ever costs buffered audio - it never blocks `capture_task`.
-        loop {
-            drain_pcm_ring(&mut socket).await;
-            match select(DATA_READY.wait(), STREAM_ENDED.wait()).await {
-                Either::First(()) => {}
-                Either::Second(()) => break,
-            }
-        }
-        drain_pcm_ring(&mut socket).await;
-
-        // `socket` drops at the end of this iteration, closing the TCP
-        // connection, which is this wire format's end-of-utterance signal to
-        // the receiver.
-    }
 }
