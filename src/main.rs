@@ -4,8 +4,9 @@
 
 use crate::config::{CONFIG, Flash};
 use crate::heap::{HEAP, init_qmi_psram_heap};
-use crate::psram::{init_psram, init_psram_qmi};
+use crate::psram::init_psram_qmi;
 use crate::screen::SCREEN;
+use crate::storage::init_storage;
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
@@ -59,6 +60,7 @@ mod psram;
 mod rng;
 mod screen;
 mod sshkey;
+mod storage;
 mod time;
 
 const MAX_SPI_FREQ: u32 = 62_500_000;
@@ -225,10 +227,14 @@ async fn main(spawner: Spawner) {
     let flash = Flash::new(p.FLASH, p.DMA_CH3);
     CONFIG.get().lock().await.assign_flash(flash);
 
-    let psram = init_psram(
-        p.PIO1, p.PIN_21, p.PIN_2, p.PIN_3, p.PIN_20, p.DMA_CH1, p.DMA_CH2,
-    )
-    .await;
+    // PIN_20 (RAM_CS) used to be driven by the slow bit-banged PSRAM path
+    // below; now that nothing drives it, hold it explicitly deselected
+    // (push-pull high, not just relying on the board's passive pull-up)
+    // so the PSRAM chip can't answer stray clocks on the pins we now drive
+    // as I2S (see psram.rs's header comment). Bound here and never dropped,
+    // since `main` never returns, so this stays driven for the firmware's
+    // whole lifetime.
+    let _psram_cs_deselect = Output::new(p.PIN_20, Level::High);
 
     let psram_qmi_size = init_psram_qmi(&embassy_rp::pac::QMI, &embassy_rp::pac::XIP_CTRL);
     if psram_qmi_size > 0 {
@@ -240,12 +246,8 @@ async fn main(spawner: Spawner) {
             "RAM {} avail of 520KiB\r\n",
             byte_size(get_max_usable_stack()),
         );
-        print!(
-            "PSRAM: {} (SLOW), {} (QMI)\r\n",
-            byte_size(psram.size),
-            byte_size(psram_qmi_size),
-        );
-        if psram.size == 0 {
+        print!("PSRAM (QMI): {}\r\n", byte_size(psram_qmi_size));
+        if psram_qmi_size == 0 {
             // This can happen if you power on the pico without first
             // powering up the picocalc carrier board
             print!("\u{1b}[1mExternal PSRAM was NOT found!\u{1b}[0m\r\n");
@@ -257,7 +259,12 @@ async fn main(spawner: Spawner) {
         );
     }
 
-    crate::mic::init_mic(&spawner, p.PIO2, p.PIN_16, p.PIN_17, p.PIN_18, p.DMA_CH4);
+    init_storage(
+        &spawner, p.PIN_16, p.PIN_17, p.PIN_18, p.PIN_19, p.PIN_22, p.SPI0,
+    )
+    .await;
+
+    crate::mic::init_mic(&spawner, p.PIO2, p.PIN_2, p.PIN_3, p.PIN_21, p.DMA_CH4);
 
     // Load scrollback config
     if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await

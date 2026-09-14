@@ -1,6 +1,7 @@
 //! Push-to-talk voice capture: a PIO-driven I2S RX driver for a digital mic
-//! wired to the pins freed by removing SD card support (see AGENTS.md), plus
-//! the task that streams captured audio to a configurable network host.
+//! wired to the expansion-header pins freed by dropping the slow PSRAM path
+//! (see AGENTS.md and `psram.rs`), plus the task that streams captured audio
+//! to a configurable network host.
 //!
 //! Wire format (see AGENTS.md for the authoritative copy of this contract):
 //! one TCP connection per utterance (opened on button press, closed on
@@ -24,7 +25,7 @@ use embassy_net::dns::{DnsQueryType, DnsSocket};
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::PeripheralRef;
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::peripherals::{DMA_CH4, PIN_16, PIN_17, PIN_18, PIO2};
+use embassy_rp::peripherals::{DMA_CH4, PIN_2, PIN_3, PIN_21, PIO2};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, Pio, ShiftConfig, ShiftDirection, StateMachine,
@@ -141,15 +142,16 @@ impl Mic {
 }
 
 /// Claims PIO2 (unclaimed elsewhere in this codebase; PIO0 is WiFi, PIO1 is
-/// PSRAM) and the pins freed by dropping SD card support, and spawns the
-/// capture and network-upload tasks. `bclk`/`ws`/`sd` must be
-/// `PIN_16`/`PIN_17`/`PIN_18` per AGENTS.md's pin contract.
+/// now unused since the slow PSRAM path was dropped) and the expansion-header
+/// pins that path used to claim, and spawns the capture and network-upload
+/// tasks. `bclk`/`ws`/`sd` must be `PIN_2`/`PIN_3`/`PIN_21` per AGENTS.md's
+/// pin contract.
 pub fn init_mic(
     spawner: &Spawner,
     pio2: PIO2,
-    bclk: PIN_16,
-    ws: PIN_17,
-    sd: PIN_18,
+    bclk: PIN_2,
+    ws: PIN_3,
+    sd: PIN_21,
     dma_ch4: DMA_CH4,
 ) {
     let mut pio = Pio::new(pio2, Irqs);

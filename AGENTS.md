@@ -98,44 +98,58 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   newer `Peri<'d, T>` style) — always check the actual installed crate source
   (`~/.cargo/registry/src/*/embassy-rp-<version>/`, fetch it with `cargo fetch` first if absent)
   before writing code against any embassy-rp API, rather than trusting the submodule's source.
-  `src/psram.rs` is the up-to-date, actually-building example of this project's real PIO/DMA idiom
-  (`PeripheralRef`, `into_ref!`/`PeripheralRef::new`, `pio_asm!` via
-  `embassy_rp::pio::program::pio_asm`) to copy from.
+  `src/mic.rs` is the up-to-date, actually-building example of this project's real PIO/DMA idiom
+  (`PeripheralRef`, `PeripheralRef::new`, `pio_asm!` via `embassy_rp::pio::program::pio_asm`) to
+  copy from; `src/psram.rs` no longer has any PIO code of its own (see its own entry below) — it
+  only drives PSRAM via raw `embassy_rp::pac` register access now.
 - Push-to-talk voice capture (`src/mic.rs`) captures mic audio on a held button and streams it to a
   network host; the receiving/transcribing side is a separate, not-yet-built process outside this
-  repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is PSRAM) for a hand-written I2S RX
-  PIO program (embassy-rp ships no I2S RX driver, only the TX-only `pio_programs::i2s`; `mic.rs`'s
-  program is the mirror image of that driver's `pio_asm!` block, `in pins, 1` instead of
-  `out pins, 1`, unverified on real hardware) and the pins freed by removing SD card support (see
-  below): `GP16`/`GP17`/`GP18` = I2S `BCLK`/`WS`/`SD` (`GP19`/`GP22` spare). Capture is 16 kHz/16-bit
-  mono in ~25ms chunks, buffered through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>`
-  payloads land in the `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget
-  entry above) — deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`.
-  Button binding is plain `Key::F1`. Arming and stopping are independently
-  gated: arming requires `KeyState::Pressed` with `Modifiers::NONE` (so Ctrl+F1 still reaches the
-  existing reboot shortcut), while stopping fires on `KeyState::Released` whenever `mic::is_recording()`
-  (reusing `mic.rs`'s `RECORDING` flag) is set, with no modifier re-check, so a release always ends
-  the recording even if a modifier went down mid-hold. The decision table itself lives in
+  repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is now unused; see the PSRAM note
+  below) for a hand-written I2S RX PIO program (embassy-rp ships no I2S RX driver, only the TX-only
+  `pio_programs::i2s`; `mic.rs`'s program is the mirror image of that driver's `pio_asm!` block,
+  `in pins, 1` instead of `out pins, 1`, unverified on real hardware) and expansion-header pins
+  freed by dropping the slow PSRAM path (see below): `GP2`/`GP3`/`GP21` = I2S `BCLK`/`WS`/`SD`.
+  These pins are also wired to the PSRAM chip (see `psram.rs`'s header comment) - that's safe
+  because the QMI/XIP hardware path this firmware now uses to reach PSRAM drives a completely
+  separate, RP2350-internal chip-select pad, never these pins. GP16/17/18/19/22 (the SD card's
+  SPI0 pins) were considered for the mic in an earlier iteration of this feature but the captain's
+  own hardware check moved the mic to the PSRAM/expansion-header group instead, keeping SD card
+  support intact (see `storage.rs`). Capture is 16 kHz/16-bit mono in ~25ms chunks, buffered
+  through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>` payloads land in the
+  `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget entry above) —
+  deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Button binding is
+  plain `Key::F1`. Arming and stopping are independently gated: arming requires `KeyState::Pressed`
+  with `Modifiers::NONE` (so Ctrl+F1 still reaches the existing reboot shortcut), while stopping
+  fires on `KeyState::Released` whenever `mic::is_recording()` (reusing `mic.rs`'s `RECORDING`
+  flag) is set, with no modifier re-check, so a release always ends the recording even if a
+  modifier went down mid-hold. The decision table itself lives in
   `terminal-model/src/key_dispatch.rs`'s `ptt_action` (host-tested with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu key_dispatch`) and `src/keyboard.rs`
   is only the I2C/`KeyReport`-to-`ptt_action` adapter, so rebinding means changing the single
   `Key::F1` check passed to `ptt_action` there and updating that module's tests.
   `capture_task` also self-stops after `MAX_RECORDING_DURATION` (60s) in case the keyboard
-  link drops the `Released` report entirely. `Key::ButtonLeft2`, tried first, turned out to correspond to no physical control
-  on real hardware - the PicoCalc has one D-pad and no joystick, and `ButtonLeft2` belongs to a
-  `Joy*`/`Button*` group of raw keyboard-protocol codes (`src/keyboard.rs`'s `Key` enum and its
-  `From<u8>` impl) that looks like it comes from a joystick/gamepad-bearing variant of this same
-  keyboard co-processor protocol, not this device - treat that whole code group as suspect for any
-  future key binding on this hardware. Destination is `config set ptt_host`/`config set ptt_port` (plain
-  `sequential_storage` keys, no special-casing needed in `config.rs`). Wire format (needed by
-  anything implementing the receiving side): one TCP connection per utterance, opened on button
-  press and closed on release; each frame is a 4-byte little-endian `u32` byte count followed by
-  that many bytes of raw signed 16-bit little-endian mono PCM. No handshake, no other framing.
-- SD card support (`storage.rs`, the `ls` command, `README-DEVICE.md`'s old "TF Card reader"
-  section) was removed to free `GP16`/`GP17`/`GP18`/`GP19`/`GP22` for the mic above — it was an
-  undocumented, listing-only (no file content, no README.md feature mention), SPI0-only local
-  command with no interaction with the SSH/terminal workflow this project exists for. If it's ever
-  needed again, `git log` for its removal commit has the full original implementation to revert.
+  link drops the `Released` report entirely. `Key::ButtonLeft2`, tried first, turned out to
+  correspond to no physical control on real hardware - the PicoCalc has one D-pad and no joystick,
+  and `ButtonLeft2` belongs to a `Joy*`/`Button*` group of raw keyboard-protocol codes
+  (`src/keyboard.rs`'s `Key` enum and its `From<u8>` impl) that looks like it comes from a
+  joystick/gamepad-bearing variant of this same keyboard co-processor protocol, not this device -
+  treat that whole code group as suspect for any future key binding on this hardware. Destination
+  is `config set ptt_host`/`config set ptt_port` (plain `sequential_storage` keys, no
+  special-casing needed in `config.rs`). Wire format (needed by anything implementing the
+  receiving side): one TCP connection per utterance, opened on button press and closed on release;
+  each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
+  16-bit little-endian mono PCM. No handshake, no other framing.
+- `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
+  It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
+  DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected
+  size was never fed to the heap allocator — only `init_qmi_psram_heap` (driven by
+  `init_psram_qmi`'s result) does that — so it was dropped as dead weight, freeing PIO1,
+  DMA_CH1/CH2, and those pins (see the mic note above for where `PIN_2`/`PIN_3`/`PIN_21` went).
+  `PIN_20` (`RAM_CS`) is explicitly held deselected in `main.rs` (`Output::new(p.PIN_20,
+  Level::High)`, bound for `main`'s whole lifetime) since nothing drives it as PSRAM chip-select
+  anymore and it must not float. This is safe regardless of the QMI path's own state: QMI/XIP uses
+  a separate, RP2350-internal CS pad (`detect_psram_qmi`'s `XIP_CS_PIN`), never `PIN_20`, so
+  deselecting `PIN_20` cannot interfere with QMI PSRAM access.
 
 ## Maintaining this file
 

@@ -25,6 +25,27 @@ use sntpc::{NtpContext, NtpResult, NtpTimestampGenerator, get_time};
 // That allows us to provide a UnixTime type and associated
 // UnixTime::now() method to return the current unix time.
 
+/// This type is used to expose the current time to the
+/// embedded_sdmmc crate
+pub struct PicoTimeSource();
+
+impl embedded_sdmmc::TimeSource for PicoTimeSource {
+    fn get_timestamp(&self) -> embedded_sdmmc::Timestamp {
+        let now = UnixTime::now();
+        let chrono = now.as_chrono();
+        let date = chrono.date_naive();
+        let time = chrono.time();
+        embedded_sdmmc::Timestamp {
+            year_since_1970: (date.year() - 1970) as u8,
+            zero_indexed_month: date.month0() as u8,
+            zero_indexed_day: date.day0() as u8,
+            hours: time.hour() as u8,
+            minutes: time.minute() as u8,
+            seconds: time.second() as u8,
+        }
+    }
+}
+
 /// Represents a time relative to the Unix Epoch
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnixTime {
