@@ -51,14 +51,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `.unwrap_or(0).max(1)` (see `cursor_move_count` in `terminal-model/src/screen_model.rs`) for any
   CSI parameter that has a nonzero default.
 - `ScreenModel::overlay` (`terminal-model/src/screen_model.rs`) is the pattern for any transient
-  on-screen banner (currently just the battery readout on a power-button press, wired in
-  `src/keyboard.rs`'s `keyboard_reader`): it's a paint-time-only flag that never touches
-  `lines`/`scrollback`, composited on top each frame in `src/screen.rs`'s `update_display` /
-  `draw_overlay`. `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real,
-  possibly-changed cell content underneath from scratch rather than needing a save/restore buffer.
-  Auto-dismiss timing (`embassy_time::Instant`) lives on the `Screen` wrapper in `src/screen.rs`
+  on-screen banner (the battery readout on a power-button press, and the push-to-talk
+  "recording..." indicator): it's a paint-time-only flag that never touches `lines`/`scrollback`,
+  composited on top each frame in `src/screen.rs`'s `update_display` / `draw_overlay`.
+  `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real, possibly-changed
+  cell content underneath from scratch rather than needing a save/restore buffer. Auto-dismiss
+  timing (`embassy_time::Instant`) lives on the `Screen` wrapper in `src/screen.rs`
   (`overlay_expiry`, checked in `Screen::update_display`), not in `ScreenModel`, since
-  `terminal-model` is host-portable and has no clock.
+  `terminal-model` is host-portable and has no clock. Always show overlays through a `Screen`
+  helper: `Screen::show_battery_overlay` arms that timer, while `Screen::show_overlay` (used by
+  `src/mic.rs` for the recording indicator) clears any leftover `overlay_expiry`, so an earlier
+  timed overlay cannot prematurely dismiss a newer non-timed one.
 - Despite the caution above about the root package not building for the host target: this repo's
   installed toolchain does carry a prebuilt `thumbv8m.main-none-eabihf` std, so
   `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully
