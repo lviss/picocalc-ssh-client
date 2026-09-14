@@ -401,24 +401,28 @@ impl Mic {
     }
 
     /// (Re)configures the PIO program and clock for `settings`, freeing the
-    /// previously loaded program. A no-op when the running configuration
-    /// already matches, so an unchanged config costs nothing.
+    /// previously loaded program. The program is rebuilt and reloaded only
+    /// when `settings` changed; the state-machine reset and clock/pin config
+    /// run on every call.
     fn apply(&mut self, settings: MicSettings) {
-        if self.applied == Some(settings) {
-            return;
-        }
         self.pio.sm0.set_enable(false);
         self.pio.sm0.restart();
         self.pio.sm0.clear_fifos();
 
-        let program = build_i2s_rx_program(settings.bits, settings.edge_flip);
-        if let Some(old) = self.loaded.take() {
-            // SAFETY: the state machine was disabled and restarted above, so
-            // it is not executing the instruction memory being freed.
-            unsafe { self.pio.common.free_instr(old.used_memory) };
+        if self.applied != Some(settings) {
+            let program = build_i2s_rx_program(settings.bits, settings.edge_flip);
+            if let Some(old) = self.loaded.take() {
+                // SAFETY: the state machine was disabled and restarted above,
+                // so it is not executing the instruction memory being freed.
+                unsafe { self.pio.common.free_instr(old.used_memory) };
+            }
+            self.loaded = Some(self.pio.common.load_program(&program));
         }
-        let loaded = self.pio.common.load_program(&program);
 
+        let loaded = self
+            .loaded
+            .take()
+            .expect("PIO program must be loaded before applying its config");
         let mut cfg = Config::default();
         cfg.use_program(&loaded, &[&self.bclk, &self.ws]);
         cfg.set_in_pins(&[&self.sd]);
@@ -439,8 +443,8 @@ impl Mic {
         self.pio
             .sm0
             .set_pin_dirs(Direction::Out, &[&self.bclk, &self.ws]);
-        self.applied = Some(settings);
         self.loaded = Some(loaded);
+        self.applied = Some(settings);
     }
 }
 

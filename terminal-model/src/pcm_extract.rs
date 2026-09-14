@@ -23,7 +23,9 @@
 /// SPH0645's fixed 32-bit slot at 16 kHz this is 1.024 MHz, the bottom of its
 /// documented supported-clock table.
 pub const fn bit_clock_hz(sample_rate_hz: u32, bits_per_channel_slot: u32, channels: u32) -> u32 {
-    sample_rate_hz * bits_per_channel_slot * channels
+    sample_rate_hz
+        .saturating_mul(bits_per_channel_slot)
+        .saturating_mul(channels)
 }
 
 /// Lowest BCLK the SPH0645's documented clock table supports (1.024 MHz).
@@ -102,6 +104,17 @@ mod tests {
         // 32-bit slots at 32/64 kHz sit at the top of the window.
         assert!(mic_settings_valid(32, 64_000));
         assert_eq!(bit_clock_hz(64_000, 32, 2), 4_096_000);
+    }
+
+    #[test]
+    fn bit_clock_saturates_instead_of_wrapping_for_absurd_rates() {
+        // A `config set ptt_rate` far above the mic's range is correctly
+        // rejected by `mic_settings_valid`, but `bclk_hz()` still formats the
+        // refusal message. A wrapping multiply would print a plausible
+        // in-window number (or panic with overflow checks on); saturating
+        // keeps the displayed clock honest.
+        assert_eq!(bit_clock_hz(u32::MAX, 32, 2), u32::MAX);
+        assert_eq!(bit_clock_hz(4_000_000_000, 32, 2), u32::MAX);
     }
 
     #[test]
