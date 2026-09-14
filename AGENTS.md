@@ -14,9 +14,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bindings and will not compile for a host target — don't try to `cargo test`/`cargo check` the
   root `picocalc-wezterm` package for `x86_64-unknown-linux-gnu`, it fails deep in `embassy-rp`.
 - `terminal-model/` is a separate workspace-member crate (path dependency) holding the
-  hardware-independent terminal buffer/VTE logic (`screen_model.rs`), vector glyph-drawing
-  (`glyphs.rs`), and the SD-card SSH-key backup text codec (`keyfile.rs`), pulled in by
-  `src/screen.rs` and `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
+  hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
+  vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
+  (`key_dispatch.rs`) from `src/keyboard.rs`, and the SD-card SSH-key backup text codec
+  (`keyfile.rs`) from `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
   `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
@@ -133,12 +134,16 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   mono in ~25ms chunks, buffered through an `embassy_sync::channel::Channel` whose `Box<[i16; _]>`
   payloads land in the `DualHeap`'s PSRAM tier under primary-heap pressure (see the heap-budget
   entry above) — deliberately not a lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`.
-  Button binding is plain `Key::F1` (`src/keyboard.rs`). Arming and stopping are independently
+  Button binding is plain `Key::F1`. Arming and stopping are independently
   gated: arming requires `KeyState::Pressed` with `Modifiers::NONE` (so Ctrl+F1 still reaches the
   existing reboot shortcut), while stopping fires on `KeyState::Released` whenever `mic::is_recording()`
   (reusing `mic.rs`'s `RECORDING` flag) is set, with no modifier re-check, so a release always ends
-  the recording even if a modifier went down mid-hold. Rebinding requires updating both `Key::F1`
-  checks. `capture_task` also self-stops after `MAX_RECORDING_DURATION` (60s) in case the keyboard
+  the recording even if a modifier went down mid-hold. The decision table itself lives in
+  `terminal-model/src/key_dispatch.rs`'s `ptt_action` (host-tested with
+  `cargo test -p terminal-model --target x86_64-unknown-linux-gnu key_dispatch`) and `src/keyboard.rs`
+  is only the I2C/`KeyReport`-to-`ptt_action` adapter, so rebinding means changing the single
+  `Key::F1` check passed to `ptt_action` there and updating that module's tests.
+  `capture_task` also self-stops after `MAX_RECORDING_DURATION` (60s) in case the keyboard
   link drops the `Released` report entirely. `Key::ButtonLeft2`, tried first, turned out to correspond to no physical control
   on real hardware - the PicoCalc has one D-pad and no joystick, and `ButtonLeft2` belongs to a
   `Joy*`/`Button*` group of raw keyboard-protocol codes (`src/keyboard.rs`'s `Key` enum and its
