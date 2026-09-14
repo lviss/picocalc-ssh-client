@@ -171,10 +171,19 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating
   arithmetic, in both paths. DC removal is essential because the SPH0645 sits on a large offset
   (~-6113 in its 18-bit field on this hardware); multiplying the raw value directly would rail at
-  any useful gain. `ptt_gain=1` is a byte-identical no-op. Offline analysis of the captain's
-  `ptt-test-raw.raw` found no recoverable signal (driven-slot 18-bit values only +/-7 counts of
-  uncorrelated noise, ~-97 dBFS RMS, vs the mic's ~-91 dBFS noise floor), so this knob is for
-  visibility only - it cannot rescue a mic that is not converting. An
+  any useful gain. `ptt_gain=1` is a byte-identical no-op. This knob is explicitly DIAGNOSTIC, not
+  the production gain path: the SPH0645 is a fixed-sensitivity digital mic with no gain register
+  (SEL only selects the L/R slot), so any real gain/normalization belongs on the receiving /
+  transcription side, where the audio is consumed - the device ships its native levels. The
+  overlay also carries a realtime level meter while recording: `ac_rms_level`/
+  `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish the DC-removed AC RMS through
+  `mic::level()`, and `src/screen.rs`'s `draw_overlay` draws it as a bar when `mic::is_recording()`
+  (empty at the noise floor, red when pinned). Offline analysis was inconclusive about absolute
+  audio quality and the earlier "mic not converting" reading was over-generalized: the raw-mode
+  capture was near-constant (that capture had no signal), while the production PCM captures carry
+  real AC energy (~-35 dBFS RMS after DC removal) and the captain sees live changes. Judge audio
+  quality from a fresh deliberate capture converted with the `raw-to-wav.pl` helper (outside this
+  repo), not from the offline statistics alone. An
   earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:

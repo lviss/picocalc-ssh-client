@@ -137,6 +137,65 @@ pub fn remove_dc_and_gain_samples(pcm: &mut [i16], gain: u32) {
     }
 }
 
+/// Integer square root (Newton), used by the capture-path level meter so the
+/// capture hot path does no floating-point work.
+fn integer_sqrt(value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let mut x = value;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + value / x) / 2;
+    }
+    x
+}
+
+/// Level-meter value for a chunk of extracted mono samples: the RMS of the
+/// samples' deviation from the chunk mean, i.e. the AC level with the mic's
+/// large DC offset removed. Integer-only and linear, so a mic sitting on its
+/// noise floor reads near zero while speech drives it up; the raw value is
+/// the number of `i16` counts, which the overlay maps to a bar. Independent of
+/// `ptt_gain` (it is measured before gain is applied).
+pub fn ac_rms_level(samples: &[i16]) -> u32 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let n = samples.len() as i64;
+    let mean = samples.iter().map(|&s| s as i64).sum::<i64>() / n;
+    let sum_sq: i64 = samples
+        .iter()
+        .map(|&s| {
+            let d = s as i64 - mean;
+            d * d
+        })
+        .sum();
+    integer_sqrt((sum_sq / n) as u64) as u32
+}
+
+/// The same AC RMS level for a raw `ptt_raw` chunk, measured over the driven
+/// (even-indexed/left-slot) words' top 16 bits - the samples the production
+/// PCM path would extract - so the level meter works in both modes.
+pub fn ac_rms_level_words(raw: &[u32]) -> u32 {
+    let count = raw.len().div_ceil(2);
+    if count == 0 {
+        return 0;
+    }
+    let n = count as i64;
+    let sample = |word: u32| ((word >> 16) & 0xffff) as u16 as i16 as i64;
+    let mean = raw.iter().step_by(2).map(|&w| sample(w)).sum::<i64>() / n;
+    let sum_sq: i64 = raw
+        .iter()
+        .step_by(2)
+        .map(|&w| {
+            let d = sample(w) - mean;
+            d * d
+        })
+        .sum();
+    integer_sqrt((sum_sq / n) as u64) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +379,34 @@ mod tests {
         let mut pcm = [i16::MAX, i16::MIN];
         remove_dc_and_gain_samples(&mut pcm, 4096);
         assert_eq!(pcm, [i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn ac_level_ignores_dc_and_measures_the_deviation() {
+        // A flat DC chunk is silence no matter how large the offset.
+        assert_eq!(ac_rms_level(&[1234i16; 64]), 0);
+        // A +/-10 square wave has RMS 10.
+        let square: [i16; 8] = [10, -10, 10, -10, 10, -10, 10, -10];
+        assert_eq!(ac_rms_level(&square), 10);
+        // The same deviation on top of a large DC offset is unchanged.
+        let offset: [i16; 8] = [1010, 990, 1010, 990, 1010, 990, 1010, 990];
+        assert_eq!(ac_rms_level(&offset), 10);
+        assert_eq!(ac_rms_level(&[]), 0);
+    }
+
+    #[test]
+    fn word_level_matches_the_pcm_level_on_the_driven_slot() {
+        // Two driven words (even indices) with a +/-100 swing on top of a DC,
+        // one undriven odd word that must be ignored entirely. The sample sits
+        // in the top 16 bits, matching what the PCM path extracts.
+        let raw = [
+            (100i32 << 16) as u32,  // +100
+            0,                      // undriven (odd)
+            (-100i32 << 16) as u32, // -100
+        ];
+        assert_eq!(ac_rms_level_words(&raw), 100);
+        // A flat driven slot is silence.
+        let flat = [(5000i32 << 16) as u32, 0, (5000i32 << 16) as u32];
+        assert_eq!(ac_rms_level_words(&flat), 0);
     }
 }

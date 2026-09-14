@@ -57,7 +57,8 @@ use terminal_model::mic_config::{
     validate_setting as validate_mic_setting,
 };
 use terminal_model::pcm_extract::{
-    bit_clock_hz, extract_left_channel_pcm, remove_dc_and_gain_samples, remove_dc_and_gain_words,
+    ac_rms_level, ac_rms_level_words, bit_clock_hz, extract_left_channel_pcm,
+    remove_dc_and_gain_samples, remove_dc_and_gain_words,
 };
 
 extern crate alloc;
@@ -167,6 +168,19 @@ static OVERFLOW_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 /// Generation that hit `MAX_RECORDING_DURATION` and has not yet been reported,
 /// set for the same reason as `OVERFLOW_NOTICE_GEN`.
 static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Latest chunk's AC RMS level (in `i16` counts), for the on-screen level
+/// meter. Updated by `capture_task` once per chunk with integer-only work, and
+/// reset to 0 when a recording ends. The screen painter polls it, so the
+/// capture path never takes the screen lock.
+static PTT_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Current push-to-talk input level for the on-screen meter; 0 when idle.
+/// Deliberately the DC-removed (AC) level, so a mic sitting on its noise floor
+/// reads near zero instead of being pinned by its DC offset.
+pub fn level() -> u32 {
+    PTT_LEVEL.load(Ordering::Acquire)
+}
 
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Wakes `ptt_upload_task` when `capture_task` has deposited samples. A
@@ -376,6 +390,7 @@ async fn capture_task(mut mic: Mic) {
                 // reproduces the exact unprocessed I2S word stream. The gain
                 // knob removes the driven slot's DC offset before amplifying,
                 // so it reveals signal rather than railing on the offset.
+                PTT_LEVEL.store(ac_rms_level_words(&raw), Ordering::Release);
                 remove_dc_and_gain_words(&mut raw, settings.gain);
                 PCM_RING.lock().await.write_u32_words(generation, &raw)
             } else {
@@ -388,6 +403,10 @@ async fn capture_task(mut mic: Mic) {
                 // configured slot width.
                 let mut pcm = [0i16; SAMPLES_PER_CHUNK];
                 extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
+                // Publish the AC level for the overlay meter before applying
+                // gain, so the meter shows the mic's real input, not the
+                // diagnostic gain.
+                PTT_LEVEL.store(ac_rms_level(&pcm), Ordering::Release);
                 // `ptt_gain`: the captain's capture-time gain experiment,
                 // applied after DC removal so a useful gain reveals the AC
                 // signal instead of immediately railing on the offset.
@@ -407,6 +426,7 @@ async fn capture_task(mut mic: Mic) {
             }
         }
         mic.set_enabled(false);
+        PTT_LEVEL.store(0, Ordering::Release);
         ENDED_GEN.fetch_max(generation, Ordering::AcqRel);
         STREAM_ENDED.signal(());
     }

@@ -326,6 +326,15 @@ clips rather than wraps), in both the PCM and `ptt_raw` paths. A gain of `1`
 byte-for-byte unchanged. It cannot conjure a signal that is not there - it only
 makes a faint one easier to see.
 
+The microphone has no hardware gain register (its `SEL` pin only selects the
+left/right slot), so `ptt_gain` is explicitly a **diagnostic**: real gain and
+normalization belong in the receiving/transcription pipeline, where the audio is
+consumed, and the device ships its native sample levels. While recording, the
+overlay also draws a realtime input meter under "recording..." - it shows the
+DC-removed level, so a mic sitting on its noise floor reads empty and speech
+fills the bar (it turns red if the input is pinned) - making "hold `F1` and
+speak" the quickest "is the mic hearing anything?" check.
+
 `ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
 refused with the allowed range. `config get ptt_bits` (and friends) reports the
