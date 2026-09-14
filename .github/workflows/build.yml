@@ -17,12 +17,45 @@ permissions:
   contents: read
 
 jobs:
+  determine-version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - name: Determine next artifact iteration
+      id: version
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const marker = "<!-- picocalc-uf2-artifacts -->";
+          const prNumber = context.payload.pull_request.number;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          let version = 1;
+          const match = existing?.body.match(/UF2 build artifacts — v(\d+)/);
+          if (match) {
+            version = parseInt(match[1], 10) + 1;
+          }
+          core.setOutput("version", version);
+
   build-pr:
     if: github.event_name == 'pull_request'
+    needs: determine-version
     runs-on: ubuntu-latest
     strategy:
       matrix:
         chip: [pico2w, pimoroni2w]
+    env:
+      ARTIFACT_NAME: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}-v${{ needs.determine-version.outputs.version }}
 
     steps:
     - uses: actions/checkout@v4
@@ -40,12 +73,70 @@ jobs:
     - name: Build
       run: make CHIP=${{ matrix.chip }} image
     - name: Rename artifact
-      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}.uf2
+      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 ${{ env.ARTIFACT_NAME }}.uf2
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}
-        path: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}.uf2
+        name: ${{ env.ARTIFACT_NAME }}
+        path: ${{ env.ARTIFACT_NAME }}.uf2
+
+  comment-pr:
+    if: github.event_name == 'pull_request'
+    needs: [determine-version, build-pr]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+    - name: Comment UF2 artifact links
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const marker = "<!-- picocalc-uf2-artifacts -->";
+          const prNumber = context.payload.pull_request.number;
+          const version = "${{ needs.determine-version.outputs.version }}";
+          const suffix = `-pr${prNumber}-v${version}`;
+
+          const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+          });
+
+          const relevant = artifacts
+            .filter(a => a.name.endsWith(suffix))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+          const links = relevant
+            .map(a => {
+              const chip = a.name.slice("picocalc-ssh-client-".length, a.name.length - suffix.length);
+              return `- [v${version} - ${chip}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${a.id})`;
+            })
+            .join("\n");
+
+          const body = `${marker}\n### 📦 UF2 build artifacts — v${version}\n\n${links}\n\n(Updated for the latest push to this PR.)`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+          }
 
   build-release:
     if: github.event_name == 'workflow_dispatch'

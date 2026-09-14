@@ -23,11 +23,23 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
   extending this crate over adding tests to the hardware-coupled root crate.
-- `.github/workflows/build.yml` has two jobs: `build-pr` (on `pull_request`, builds both
-  `pico2w`/`pimoroni2w` via `make CHIP=<chip> image`, uploads each as a workflow artifact named
-  `picocalc-ssh-client-<chip>-pr<N>`) and `build-release`/`publish-release` (manual
-  `workflow_dispatch` with a required `version` input, builds both chips, publishes one GitHub
-  Release tagged `version` with both `.uf2` assets). There is no push-to-main auto-release anymore.
+- `.github/workflows/build.yml` has four jobs. On `pull_request`: `determine-version` (parses the
+  prior PR comment's `v<N>` heading, made by the job below, to compute the next per-PR iteration
+  number — starts at 1, deliberately not `github.run_number`/`run_attempt` since neither is a
+  per-PR counter) → `build-pr` (matrix over `pico2w`/`pimoroni2w`, builds via `make CHIP=<chip>
+  image`, uploads each as a workflow artifact named `picocalc-ssh-client-<chip>-pr<N>-v<version>`)
+  → `comment-pr` (needs `build-pr`, runs once — not matrixed — and posts/updates a single PR
+  comment linking both chips' just-built artifacts, via `actions/github-script` listing this run's
+  artifacts over the REST API rather than passing `upload-artifact`'s `artifact-id`/`artifact-url`
+  step outputs through matrix job outputs: GitHub Actions matrix job outputs are last-write-wins
+  per key across all matrix legs unconditionally, even when the losing leg's value was an empty/
+  guard-conditioned string, so a naive "one output key per chip" scheme silently drops one chip's
+  link depending on leg completion order — the artifact-listing API sidesteps that race). The
+  comment is found and edited in place on later pushes via a stable `<!-- picocalc-uf2-artifacts
+  -->` HTML marker, not reposted. `build-release`/`publish-release` (manual `workflow_dispatch`
+  with a required `version` input, builds both chips, publishes one GitHub Release tagged
+  `version` with both `.uf2` assets) are unrelated to the PR flow. There is no push-to-main
+  auto-release anymore.
   This repo is a fork, and GitHub disables Actions by default on forks until the owner opts in from
   the repo's web UI Settings > Actions page (the REST `actions/permissions` endpoint 403s for a
   non-admin token, so this can't be done via `gh api`) — check `gh api
