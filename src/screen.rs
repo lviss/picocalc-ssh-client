@@ -94,6 +94,13 @@ impl Screen {
         self.overlay_expiry = Some(Instant::now() + OVERLAY_DURATION);
     }
 
+    /// Show `text` as an overlay that stays until it is explicitly cleared,
+    /// cancelling any auto-dismiss left over from a previous overlay.
+    pub fn show_overlay(&mut self, text: String) {
+        self.model.show_overlay(text);
+        self.overlay_expiry = None;
+    }
+
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
         if let Some(expiry) = self.overlay_expiry
             && Instant::now() >= expiry
