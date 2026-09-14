@@ -266,7 +266,15 @@ pub fn init_mic(
     cfg.use_program(&program, &[&bit_clock_pin, &lr_clock_pin]);
     cfg.set_in_pins(&[&data_pin]);
     let clock_frequency = bit_clock_hz(SAMPLE_RATE_HZ, BIT_DEPTH, CHANNELS);
-    cfg.clock_divider = (clk_sys_freq() as f64 / clock_frequency as f64 / 2.).to_fixed();
+    // DEBUG-ONLY: temporary diagnostic for the SPH0645 clock-rate
+    // investigation (ground-truth clk_sys_freq() vs the computed target
+    // BCLK/divider). Revert before this touches the PR.
+    let sys_freq = clk_sys_freq();
+    let divider = sys_freq as f64 / clock_frequency as f64 / 2.;
+    log::info!(
+        "ptt-diag: clk_sys_freq={sys_freq} Hz, target BCLK={clock_frequency} Hz, computed divider={divider}"
+    );
+    cfg.clock_divider = divider.to_fixed();
     // threshold is the ISR's full 32 bits either way; what changed with the
     // slot-width fix is what one autopushed word *means* - previously one
     // word packed both channels' (wrong-width) slots together, now one word
@@ -293,8 +301,68 @@ pub fn init_mic(
         dma_ch: PeripheralRef::new(dma_ch4),
     };
 
-    spawner.must_spawn(capture_task(mic));
-    spawner.must_spawn(ptt_upload_task());
+    // DEBUG-ONLY: swapped in for the SPH0645 capture investigation. Revert
+    // to the two lines below before this touches the PR.
+    spawner.must_spawn(diagnostic_raw_capture_task(mic));
+    // spawner.must_spawn(capture_task(mic));
+    // spawner.must_spawn(ptt_upload_task());
+}
+
+/// DEBUG-ONLY, NOT FOR THE PR: streams every raw 32-bit I2S word exactly as
+/// captured - both channels, no even/odd discarding, no `>>16` truncation,
+/// no ring buffer/generation tagging - so a single capture can be sliced
+/// multiple ways offline instead of guessing extraction logic blind on each
+/// round. Replaces `capture_task`/`ptt_upload_task` entirely for this build;
+/// reuses their pin/PIO/connect setup unchanged.
+///
+/// Wire format for this debug build only (NOT the production format in
+/// AGENTS.md): per chunk, a 4-byte little-endian `u32` byte count, then that
+/// many bytes of raw little-endian `u32` words, one per `in pins, 1` phase
+/// (left, right, left, right, ...), completely unprocessed.
+#[embassy_executor::task]
+async fn diagnostic_raw_capture_task(mut mic: Mic) {
+    loop {
+        START_SIGNAL.wait().await;
+        mic.set_enabled(true);
+
+        let mut tx_buf = [0u8; 4096];
+        let mut rx_buf = [0u8; 256];
+        let mut socket = match with_timeout(CONNECT_TIMEOUT, connect_for_upload(&mut tx_buf, &mut rx_buf)).await
+        {
+            Ok(socket) => socket,
+            Err(_) => {
+                print!("ptt-diag: connect timed out\r\n");
+                None
+            }
+        };
+
+        while RECORDING.load(Ordering::Acquire) != 0 {
+            let mut raw = [0u32; SAMPLES_PER_CHUNK * 2];
+            mic.capture(&mut raw).await;
+
+            if let Some(sock) = socket.as_mut() {
+                let byte_len = (raw.len() * 4) as u32;
+                if sock.write_all(&byte_len.to_le_bytes()).await.is_err() {
+                    print!("ptt-diag: send failed, dropping rest of recording\r\n");
+                    socket = None;
+                    continue;
+                }
+                let mut bytes = [0u8; 4];
+                for word in raw.iter() {
+                    bytes.copy_from_slice(&word.to_le_bytes());
+                    if sock.write_all(&bytes).await.is_err() {
+                        print!("ptt-diag: send failed, dropping rest of recording\r\n");
+                        socket = None;
+                        break;
+                    }
+                }
+            }
+        }
+        mic.set_enabled(false);
+        // Dropping `socket` here (going out of scope at the next loop
+        // iteration's reassignment, or at task-loop-back) closes the
+        // connection - same end-of-utterance signal as production.
+    }
 }
 
 #[embassy_executor::task]
