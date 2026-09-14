@@ -2,7 +2,7 @@
 //! settings from persisted config strings.
 //!
 //! The firmware stores the I2S debug knobs as plain strings in its existing
-//! config store (`config set ptt_bits|ptt_rate|ptt_edge|ptt_raw`, see
+//! config store (`config set ptt_bits|ptt_rate|ptt_edge|ptt_raw|ptt_gain`, see
 //! `src/mic.rs` for the store access). This module holds the pure part - the
 //! defaults, the string parsing, the out-of-window fallback, the effective
 //! value each key reports, and the console-time validation - so that host
@@ -58,7 +58,7 @@ pub const BITS_KEY: &str = "ptt_bits";
 pub const RATE_KEY: &str = "ptt_rate";
 pub const EDGE_KEY: &str = "ptt_edge";
 pub const RAW_KEY: &str = "ptt_raw";
-/// Capture-time digital gain (diagnostic): scales every captured FIFO word.
+/// Capture-time digital gain (diagnostic); see [`MicSettings::gain`].
 pub const GAIN_KEY: &str = "ptt_gain";
 
 /// Microphone settings resolved from persisted config. Re-read and re-applied
@@ -72,10 +72,12 @@ pub struct MicSettings {
     pub rate: u32,
     /// `true` inverts the BCLK edge the PIO program samples on.
     pub edge_flip: bool,
-    /// `true` streams unprocessed raw FIFO words instead of extracted PCM.
+    /// `true` streams raw FIFO words instead of extracted PCM (the driven
+    /// slots are DC-removed and gained first when `gain > 1`).
     pub raw: bool,
-    /// Capture-time digital gain applied to every FIFO word before either the
-    /// PCM extraction or the raw passthrough; 1 is a no-op.
+    /// Diagnostic capture gain: after each chunk's DC mean is removed, the
+    /// driven samples are scaled by this factor with saturating arithmetic, in
+    /// both the raw-word and extracted-PCM paths; 1 is a no-op.
     pub gain: u32,
 }
 
@@ -262,7 +264,13 @@ mod tests {
     fn malformed_individual_values_fall_back_to_their_own_default() {
         // A malformed value must not be taken literally, and must not disturb
         // the other keys.
-        let resolved = resolve(Some("nonsense"), Some("32000"), Some("maybe"), Some("2"), None);
+        let resolved = resolve(
+            Some("nonsense"),
+            Some("32000"),
+            Some("maybe"),
+            Some("2"),
+            None,
+        );
         assert_eq!(resolved.settings.bits, DEFAULT_BITS);
         assert_eq!(resolved.settings.rate, 32_000);
         assert_eq!(resolved.settings.edge_flip, DEFAULT_EDGE_FLIP);
@@ -392,7 +400,8 @@ mod tests {
         // handed to the capture path.
         for bad in ["0", "4097", "-1", "lots"] {
             assert_eq!(
-                resolve(None, None, None, None, Some(bad)).settings.gain, 1,
+                resolve(None, None, None, None, Some(bad)).settings.gain,
+                1,
                 "ptt_gain={bad}"
             );
         }

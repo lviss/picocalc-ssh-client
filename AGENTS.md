@@ -156,10 +156,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   store at the start of every recording and applied on the device (no reflash or reboot):
   `ptt_bits` (channel slot width, default 32), `ptt_rate` (sample rate Hz, default 16000),
   `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
-  mono PCM, 1 = stream the unprocessed FIFO words), `ptt_gain` (1-4096, default 1 = off; see
-  below). A `ptt_bits`/`ptt_rate` pair whose
-  `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at the
-  console and, if a stored value is somehow invalid, falls back to the default pair with a log.
+  mono PCM, 1 = stream the FIFO words; the driven slots are DC-removed and gained first when
+  `ptt_gain` > 1), `ptt_gain` (1-4096, default 1 = off; see below). A `ptt_bits`/`ptt_rate` pair
+  whose `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at
+  the console and, if a stored value is somehow invalid, falls back to the default pair with a log.
   That decision table (`resolve`/`validate_setting`, host-tested) lives in
   `terminal-model/src/mic_config.rs`; `src/mic.rs` is only the config-store/console adapter, so
   the firmware never silently mis-clocks the mic. The program itself is built at run time by
@@ -223,9 +223,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
   16-bit little-endian mono PCM at the configured `ptt_rate` (default 16 kHz; the rate is not
   signaled on the wire, so the receiver must be told it out of band). With `ptt_raw=1` the payload
-  is instead the unprocessed little-endian `u32` PIO FIFO words, one per channel slot; a receiver
-  should concatenate frame payloads before parsing words (frame boundaries are upload-side, not
-  word-aligned). No handshake, no other framing.
+  is instead the little-endian `u32` PIO FIFO words, one per channel slot (byte-for-byte
+  unprocessed at the default `ptt_gain=1`; at a higher gain the driven slots are DC-removed and
+  scaled first - see the `ptt_gain` note above); a receiver should concatenate frame payloads
+  before parsing words (frame boundaries are upload-side, not word-aligned). No handshake, no
+  other framing.
 - `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
   It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
   DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected

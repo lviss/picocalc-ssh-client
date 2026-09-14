@@ -11,24 +11,20 @@
 //! the firmware heap. This holds regardless of whether a PSRAM heap tier is
 //! present or working.
 //!
-//! The I2S slot width, sample rate and bit-clock edge polarity - plus a raw
-//! passthrough mode that streams unprocessed FIFO words - are runtime settings
-//! read from the persisted config store (`ptt_bits`/`ptt_rate`/`ptt_edge`/
-//! `ptt_raw`, see [`load_settings`]) at the start of every recording. The PIO
+//! The I2S slot width, sample rate, bit-clock edge polarity, raw-passthrough
+//! mode and diagnostic capture gain are runtime settings read from the
+//! persisted config store (`ptt_bits`/`ptt_rate`/`ptt_edge`/`ptt_raw`/
+//! `ptt_gain`, see [`load_settings`]) at the start of every recording. The PIO
 //! program is assembled on the device at that point rather than by `pio_asm!`,
 //! so a `config set` takes effect on the next utterance without a reflash or
 //! reboot. An out-of-window slot/rate pair is refused at the console and falls
 //! back to the default rather than silently mis-clocking the mic.
 //!
-//! Wire format (see AGENTS.md for the authoritative copy of this contract):
-//! one TCP connection per utterance (opened on button press, closed on
-//! release). Each captured frame is sent as a 4-byte little-endian u32 byte
-//! count, followed by that many bytes of raw signed 16-bit little-endian
-//! mono PCM samples at the configured `ptt_rate` (default 16 kHz). With
-//! `ptt_raw=1` the payload is instead the unprocessed little-endian 32-bit
-//! PIO FIFO words, one per I2S channel slot, for offline analysis (the
-//! diagnostic format used while bringing the mic up). No handshake and no
-//! other framing.
+//! Wire format: see AGENTS.md's push-to-talk entry for the authoritative
+//! framing contract a receiving process must speak (one TCP connection per
+//! utterance, opened on button press and closed on release; a 4-byte
+//! little-endian length prefix per frame, then mono PCM at `ptt_rate` - or the
+//! raw FIFO words under `ptt_raw=1`).
 
 use crate::Irqs;
 use crate::config::CONFIG;

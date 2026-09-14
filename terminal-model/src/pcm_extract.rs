@@ -13,10 +13,10 @@
 //! exercise the exact arithmetic the firmware runs, per AGENTS.md's
 //! "host-testable logic lives in terminal-model" guidance.
 //!
-//! Slot width, sample rate and BCLK edge polarity are runtime-configurable on
-//! the device (see `mic.rs`) so the microphone can be probed without a
-//! reflash. The default remains the documented-correct 32-bit slot at
-//! 16 kHz, i.e. a 1.024 MHz BCLK.
+//! Slot width, sample rate, BCLK edge polarity and the diagnostic capture gain
+//! are runtime-configurable on the device (see `mic.rs`) so the microphone can
+//! be probed without a reflash. The default remains the documented-correct
+//! 32-bit slot at 16 kHz, i.e. a 1.024 MHz BCLK.
 
 /// Bit-clock (BCLK) frequency, in Hz, this mic requires for a given sample
 /// rate: `sample_rate_hz * bits_per_channel_slot * channels`. For the
