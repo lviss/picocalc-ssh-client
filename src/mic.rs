@@ -60,11 +60,13 @@ const SAMPLE_RATE_HZ: u32 = 16_000;
 /// BCLK - exactly half of the 1.024 MHz this mic requires - which the
 /// captain's real hardware capture (a small fixed set of garbage sample
 /// values, not audio) confirmed. See AGENTS.md for the full writeup.
-// DEBUG-ONLY TEMPORARY REVERT: BIT_DEPTH back to 16 to empirically test
-// whether this mic's real slot width is 16 bits (32fs) rather than the
-// documented-but-unconfirmed 32 bits (64fs) - see AGENTS.md/PR #20 for the
-// full writeup. Not the shipped value.
-const BIT_DEPTH: u32 = 16;
+// DEBUG-ONLY: the v3 16-bit/512 kHz experiment (BIT_DEPTH=16, `set x, 14`)
+// captured a completely dead line (every raw word 0x00000000) on real
+// hardware, consistent with this mic refusing to clock out anything below
+// its documented 1.024 MHz minimum - so the 16-bit hypothesis could not be
+// tested that way and is reverted here, keeping the raw-passthrough
+// diagnostic in place, to capture true 32-bit (64fs) slots instead.
+const BIT_DEPTH: u32 = 32;
 /// I2S always frames a left+right pair per word-select cycle even though
 /// this mono mic only drives one slot; see `capture_task`'s extraction.
 const CHANNELS: u32 = 2;
@@ -249,12 +251,12 @@ pub fn init_mic(
     // BCLK cycle without changing the loop shape or word-select polarity.
     let prg = pio_asm!(
         ".side_set 2",
-        "    set x, 14          side 0b01", // side 0bWB - W = Word Clock, B = Bit Clock
+        "    set x, 30          side 0b01", // side 0bWB - W = Word Clock, B = Bit Clock
         "left_data:",
         "    in pins, 1         side 0b00",
         "    jmp x-- left_data  side 0b01",
         "    in pins, 1         side 0b10",
-        "    set x, 14          side 0b11",
+        "    set x, 30          side 0b11",
         "right_data:",
         "    in pins, 1         side 0b10",
         "    jmp x-- right_data side 0b11",
