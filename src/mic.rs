@@ -22,7 +22,7 @@ use crate::config::CONFIG;
 use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
 use embassy_net::IpEndpoint;
@@ -98,7 +98,17 @@ static CURRENT_GEN: AtomicU32 = AtomicU32::new(0);
 /// recording runs at a time.
 static ENDED_GEN: AtomicU32 = AtomicU32::new(0);
 
-static RECORDING: AtomicBool = AtomicBool::new(false);
+/// Active recording generation, or 0 when idle. Storing the generation rather
+/// than a bool lets the duration cap stop only its own recording.
+static RECORDING: AtomicU32 = AtomicU32::new(0);
+/// Generation whose capture first overflowed the ring and has not yet been
+/// reported, or 0. `capture_task` records this instead of printing, because
+/// `print!` awaits the screen lock and would stall the I2S DMA pull.
+static OVERFLOW_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
+/// Generation that hit `MAX_RECORDING_DURATION` and has not yet been reported,
+/// set for the same reason as `OVERFLOW_NOTICE_GEN`.
+static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
+
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Wakes `ptt_upload_task` when `capture_task` has deposited samples. A
 /// `Signal` coalesces, which is exactly the needed contract: one pending wake
@@ -120,17 +130,18 @@ static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Begins push-to-talk capture; a no-op if already recording. Called from
 /// `keyboard.rs` on `(KeyState::Pressed, Key::F1)` (with no modifiers held).
 pub async fn start_recording() {
-    if !RECORDING.swap(true, Ordering::AcqRel) {
+    if RECORDING.load(Ordering::Acquire) == 0 {
+        // A new generation identifies this utterance for the rest of its
+        // life. The ring is deliberately *not* cleared here: a previous
+        // utterance's undrained audio must stay available to the connection
+        // that owns it, and the generation tags keep the two separate.
+        let generation = CURRENT_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+        RECORDING.store(generation, Ordering::Release);
         SCREEN
             .get()
             .lock()
             .await
             .show_overlay(String::from("recording..."));
-        // A new generation identifies this utterance for the rest of its
-        // life. The ring is deliberately *not* cleared here: a previous
-        // utterance's undrained audio must stay available to the connection
-        // that owns it, and the generation tags keep the two separate.
-        CURRENT_GEN.fetch_add(1, Ordering::AcqRel);
         START_SIGNAL.signal(());
         UPLOAD_START_SIGNAL.signal(());
     }
@@ -140,13 +151,13 @@ pub async fn start_recording() {
 /// this on `(KeyState::Released, Key::F1)` so the matching release always
 /// stops capture regardless of which modifiers are held at that instant.
 pub fn is_recording() -> bool {
-    RECORDING.load(Ordering::Acquire)
+    RECORDING.load(Ordering::Acquire) != 0
 }
 
 /// Ends push-to-talk capture; a no-op if not recording. Called from
 /// `keyboard.rs` on `(KeyState::Released, Key::F1)` while `is_recording()`.
 pub async fn stop_recording() {
-    if RECORDING.swap(false, Ordering::AcqRel) {
+    if RECORDING.swap(0, Ordering::AcqRel) != 0 {
         SCREEN.get().lock().await.clear_overlay();
     }
 }
@@ -251,7 +262,8 @@ async fn capture_task(mut mic: Mic) {
         let started = Instant::now();
         // Ends when the button is released, when a newer recording supersedes
         // this one, or on the recording-duration cap below.
-        while RECORDING.load(Ordering::Acquire) && CURRENT_GEN.load(Ordering::Acquire) == generation
+        while RECORDING.load(Ordering::Acquire) == generation
+            && CURRENT_GEN.load(Ordering::Acquire) == generation
         {
             let mut raw = [0u32; SAMPLES_PER_CHUNK];
             mic.capture(&mut raw).await;
@@ -274,13 +286,22 @@ async fn capture_task(mut mic: Mic) {
             // the DMA pull that keeps the I2S clocks running.
             let result = PCM_RING.lock().await.write(generation, &pcm);
             if result.first_drop {
-                print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+                OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
             }
             DATA_READY.signal(());
 
             if started.elapsed() >= MAX_RECORDING_DURATION {
-                print!("ptt: recording exceeded 60s cap, stopping\r\n");
-                stop_recording().await;
+                CAP_NOTICE_GEN.store(generation, Ordering::Release);
+                if RECORDING
+                    .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let mut screen = SCREEN.get().lock().await;
+                    if CURRENT_GEN.load(Ordering::Acquire) == generation {
+                        screen.clear_overlay();
+                    }
+                }
+                break;
             }
         }
         mic.set_enabled(false);
@@ -310,6 +331,18 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     true
 }
 
+/// Emits any one-shot diagnostics that `capture_task` recorded. Runs on the
+/// upload task, never on the DMA capture path, so the screen lock can be held
+/// by a repaint without stalling the I2S clocks.
+async fn emit_pending_notices() {
+    if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
+        print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+    }
+    if CAP_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
+        print!("ptt: recording exceeded 60s cap, stopping\r\n");
+    }
+}
+
 /// Sends one utterance's audio over its own connection: connect (bounded by
 /// `CONNECT_TIMEOUT`), drain every sample tagged `generation` until that
 /// generation ends, then close the connection. Samples belonging to any other
@@ -330,6 +363,7 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
 
     let mut buf = [0i16; SAMPLES_PER_CHUNK];
     loop {
+        emit_pending_notices().await;
         // Drain everything this generation has buffered so far. The static
         // ring absorbs (and, when full, drops the oldest of) whatever capture
         // produces meanwhile, so a failed, slow, or congested connection only
@@ -362,6 +396,7 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
         // one (the counters are re-checked on wake).
         select(DATA_READY.wait(), STREAM_ENDED.wait()).await;
     }
+    emit_pending_notices().await;
 
     // `socket` drops here, closing the TCP connection, which is this wire
     // format's end-of-utterance signal to the receiver.
@@ -380,6 +415,7 @@ async fn ptt_upload_task() {
         while next_generation > CURRENT_GEN.load(Ordering::Acquire) {
             UPLOAD_START_SIGNAL.wait().await;
         }
+        emit_pending_notices().await;
         serve_utterance(next_generation, &mut tx_buf, &mut rx_buf).await;
         next_generation += 1;
     }
