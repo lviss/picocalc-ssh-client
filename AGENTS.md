@@ -111,14 +111,34 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is now unused; see the PSRAM note
   below) for a hand-written I2S RX PIO program (embassy-rp ships no I2S RX driver, only the TX-only
   `pio_programs::i2s`; `mic.rs`'s program is the mirror image of that driver's `pio_asm!` block,
-  `in pins, 1` instead of `out pins, 1`, unverified on real hardware) and expansion-header pins
+  `in pins, 1` instead of `out pins, 1`) and expansion-header pins
   freed by dropping the slow PSRAM path (see below): `GP2`/`GP3`/`GP21` = I2S `BCLK`/`WS`/`SD`.
   These pins are also wired to the PSRAM chip (see `psram.rs`'s header comment) - that's safe
   because the QMI/XIP hardware path this firmware now uses to reach PSRAM drives a completely
   separate, RP2350-internal chip-select pad, never these pins. GP16/17/18/19/22 (the SD card's
   SPI0 pins) were considered for the mic in an earlier iteration of this feature but the captain's
   own hardware check moved the mic to the PSRAM/expansion-header group instead, keeping SD card
-  support intact (see `storage.rs`). Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
+  support intact (see `storage.rs`). The mic is an Adafruit SPH0645 breakout (identified from a real
+  capture the captain took with a netcat listener; not INMP441 as this project's earlier
+  investigation reports assumed) - a fixed-ratio I2S digital mic whose internal shift-counter is
+  hardwired to a 32-bit-per-channel slot (64fs total per L+R frame: confirmed against its documented
+  clock table, 1.024 MHz-4.096 MHz BCLK for 16 kHz-64 kHz sample rates, 16 kHz * 64 = 1.024 MHz
+  exactly). The PIO program's slot width (`set x, 30` in `mic.rs`, i.e. `BIT_DEPTH = 32`) and
+  `capture_task`'s extraction (one FIFO word is now one channel's full slot, not a combined L+R
+  pair - keep only the even-indexed/left-slot words, `>>16` for the top 16 of the mic's 18
+  significant bits) both reflect that. This was originally `BIT_DEPTH = 16` (a mirror of embassy's
+  `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
+  mic) - producing a 512 kHz BCLK instead of the 1.024 MHz this mic requires at 16 kHz, exactly
+  half; the captain's real capture (a small fixed set of garbage sample values, not audio) confirmed
+  this. **Still unverified without hardware**: the mic's documented rising-edge (non-standard)
+  data-change timing versus which BCLK edge this PIO program's `in pins, 1` actually samples on -
+  the RP2040/2350 datasheet does not document PIO's internal input/output pipeline timing at all
+  (confirmed via `raspberrypi/pico-feedback#280`), and this program's BCLK period is only 2 PIO
+  cycles, comparable to or shorter than that undocumented pipeline delay, so this could not be
+  settled from source alone. If a real capture still looks wrong after the slot-width fix, the
+  single documented one-line alternative to try is inverting the low (bit-clock) bit of every `side`
+  value in the PIO program (see the program's own comment in `mic.rs`), which shifts sampling by
+  half a BCLK cycle without changing the loop shape. Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
   the capture and upload tasks in a fixed 2048-sample (`i16`, 128ms at 16 kHz) static ring buffer
   in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the heap - so it does not compete
   with the `DualHeap` budget and cannot exhaust it. The ring never blocks and never grows; when it

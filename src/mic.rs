@@ -42,6 +42,7 @@ use embassy_time::{Duration, Instant, with_timeout};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
+use terminal_model::pcm_extract::{bit_clock_hz, extract_left_channel_pcm};
 
 extern crate alloc;
 
@@ -49,7 +50,17 @@ extern crate alloc;
 /// capturing at a higher rate (see the feasibility report referenced in
 /// AGENTS.md).
 const SAMPLE_RATE_HZ: u32 = 16_000;
-const BIT_DEPTH: u32 = 16;
+/// The mic (Adafruit SPH0645, a fixed-ratio I2S digital mic) does not
+/// negotiate slot width: its internal shift-counter is hardwired to a 32
+/// bit-clock slot per channel (64fs total per L+R frame), confirmed against
+/// its documented supported-clock table (1.024 MHz-4.096 MHz BCLK for
+/// 16 kHz-64 kHz sample rates - 16 kHz * 64 = 1.024 MHz exactly). This was
+/// wrongly 16 before (a mirror of embassy's `PioI2sOut` DAC example, which
+/// targets ordinary 16-bit-slot I2S DACs, not this mic), producing a 512 kHz
+/// BCLK - exactly half of the 1.024 MHz this mic requires - which the
+/// captain's real hardware capture (a small fixed set of garbage sample
+/// values, not audio) confirmed. See AGENTS.md for the full writeup.
+const BIT_DEPTH: u32 = 32;
 /// I2S always frames a left+right pair per word-select cycle even though
 /// this mono mic only drives one slot; see `capture_task`'s extraction.
 const CHANNELS: u32 = 2;
@@ -204,14 +215,42 @@ pub fn init_mic(
     // Mirror of PioI2sOutProgram's pio_asm! block: same word/bit-clock
     // side-set generation (the Pico is I2S master either way), with `in
     // pins, 1` replacing `out pins, 1` to capture instead of emit.
+    //
+    // `set x, 30` (X_init + 2 = 32 total `in pins,1` shifts per channel,
+    // matching this mic's fixed 32-bit-slot/64fs requirement - see
+    // `BIT_DEPTH`'s comment) was `set x, 14` (16 bits/slot) before; that was
+    // the parameter that needed adapting from embassy's `PioI2sOut` DAC
+    // example, not the loop shape itself.
+    //
+    // Word-select-to-first-bit delay: this structure already provides the
+    // standard Philips-I2S one-BCLK-cycle gap between a channel's `side`
+    // flipping and its first `in pins,1` shift "for free" - the WS bit
+    // flips on the *last* shift of the *previous* phase (see the trailing
+    // `in pins,1 side 0b10`/`0b00` lines below, whose `side` already shows
+    // the *next* phase), and the following `set x, ..` (a non-shift
+    // instruction) is the delay slot before that next phase's first real
+    // shift. No extra dummy shift is needed for this. This is inferred from
+    // this program's own instruction ordering, not confirmed against a
+    // primary SPH0645 timing diagram - see AGENTS.md for the caveat.
+    //
+    // Bit-clock edge polarity is unchanged from before (this mic is
+    // documented elsewhere as driving new data on BCLK's *rising* edge,
+    // non-standard for I2S) - kept as-is since neither a primary datasheet
+    // nor a hardware capture has settled which edge this program actually
+    // samples on once real PIO pipeline delay is accounted for (undocumented
+    // by the RP2040/2350 datasheet; see AGENTS.md). If real captures still
+    // look wrong after the slot-width fix, the single, obvious edge-flip to
+    // try is inverting the low (B) bit of every `side` value below - i.e.
+    // 0b00<->0b01 and 0b10<->0b11 - which shifts every sample by half a
+    // BCLK cycle without changing the loop shape or word-select polarity.
     let prg = pio_asm!(
         ".side_set 2",
-        "    set x, 14          side 0b01", // side 0bWB - W = Word Clock, B = Bit Clock
+        "    set x, 30          side 0b01", // side 0bWB - W = Word Clock, B = Bit Clock
         "left_data:",
         "    in pins, 1         side 0b00",
         "    jmp x-- left_data  side 0b01",
         "    in pins, 1         side 0b10",
-        "    set x, 14          side 0b11",
+        "    set x, 30          side 0b11",
         "right_data:",
         "    in pins, 1         side 0b10",
         "    jmp x-- right_data side 0b11",
@@ -226,8 +265,13 @@ pub fn init_mic(
     let mut cfg = Config::default();
     cfg.use_program(&program, &[&bit_clock_pin, &lr_clock_pin]);
     cfg.set_in_pins(&[&data_pin]);
-    let clock_frequency = SAMPLE_RATE_HZ * BIT_DEPTH * CHANNELS;
+    let clock_frequency = bit_clock_hz(SAMPLE_RATE_HZ, BIT_DEPTH, CHANNELS);
     cfg.clock_divider = (clk_sys_freq() as f64 / clock_frequency as f64 / 2.).to_fixed();
+    // threshold is the ISR's full 32 bits either way; what changed with the
+    // slot-width fix is what one autopushed word *means* - previously one
+    // word packed both channels' (wrong-width) slots together, now one word
+    // is exactly one channel's full 32-bit slot (left, then right,
+    // alternating) - see `capture_task`'s extraction.
     cfg.shift_in = ShiftConfig {
         threshold: 32,
         direction: ShiftDirection::Left,
@@ -265,21 +309,28 @@ async fn capture_task(mut mic: Mic) {
         while RECORDING.load(Ordering::Acquire) == generation
             && CURRENT_GEN.load(Ordering::Acquire) == generation
         {
-            let mut raw = [0u32; SAMPLES_PER_CHUNK];
+            // One 32-bit FIFO word is now one channel's full slot (see
+            // `BIT_DEPTH`'s comment), not a combined L+R pair: the PIO
+            // program pushes left, then right, alternating, so a chunk's
+            // worth of *mono* samples needs twice as many raw words.
+            let mut raw = [0u32; SAMPLES_PER_CHUNK * 2];
             mic.capture(&mut raw).await;
             if CURRENT_GEN.load(Ordering::Acquire) != generation {
                 continue;
             }
 
-            // One 32-bit FIFO word per L+R frame (ShiftDirection::Left, so
-            // MSB-first): the mic's 16-bit sample lands in the upper half
-            // when wired to the left slot (WS low), matching this driver's
-            // pin/wiring contract in AGENTS.md. If a captain instead wires
-            // the mic to the right slot, swap this to the lower 16 bits.
+            // Keep only the even-indexed (left-slot) words and drop the
+            // odd-indexed (right-slot) ones the mic never drives, matching
+            // this driver's left-slot pin/wiring contract in AGENTS.md (swap
+            // to odd-indexed words if a captain instead wires the mic to the
+            // right slot). ShiftDirection::Left means MSB-first, so each
+            // 32-bit word holds this mic's 18 significant bits (2's
+            // complement, MSB-first) in bits 31-14, with the low 14 bits
+            // zero-padded per its documented format; `>>16` keeps the top 16
+            // of those 18 significant bits as the PCM sample, discarding
+            // only their bottom 2 bits of resolution.
             let mut pcm = [0i16; SAMPLES_PER_CHUNK];
-            for (dst, word) in pcm.iter_mut().zip(raw.iter()) {
-                *dst = (*word >> 16) as i16;
-            }
+            extract_left_channel_pcm(&raw, &mut pcm);
 
             // Never blocks and never allocates: if the network side is
             // behind, the ring drops its oldest samples instead of stalling
