@@ -16,8 +16,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - `terminal-model/` is a separate workspace-member crate (path dependency) holding the
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, plus push-to-talk key dispatch
-  (`key_dispatch.rs`) from `src/keyboard.rs` and the capture/upload sample ring
-  (`audio_ring.rs`) from `src/mic.rs`. It depends only on `vte`, `embedded-graphics`, and
+  (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
+  (`audio_ring.rs`) and the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`)
+  from `src/mic.rs`. It depends only on `vte`, `embedded-graphics`, and
   `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
