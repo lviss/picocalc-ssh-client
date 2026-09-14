@@ -11,11 +11,23 @@
 //! the firmware heap. This holds regardless of whether a PSRAM heap tier is
 //! present or working.
 //!
+//! The I2S slot width, sample rate and bit-clock edge polarity - plus a raw
+//! passthrough mode that streams unprocessed FIFO words - are runtime settings
+//! read from the persisted config store (`ptt_bits`/`ptt_rate`/`ptt_edge`/
+//! `ptt_raw`, see [`load_settings`]) at the start of every recording. The PIO
+//! program is assembled on the device at that point rather than by `pio_asm!`,
+//! so a `config set` takes effect on the next utterance without a reflash or
+//! reboot. An out-of-window slot/rate pair is refused at the console and falls
+//! back to the default rather than silently mis-clocking the mic.
+//!
 //! Wire format (see AGENTS.md for the authoritative copy of this contract):
 //! one TCP connection per utterance (opened on button press, closed on
 //! release). Each captured frame is sent as a 4-byte little-endian u32 byte
 //! count, followed by that many bytes of raw signed 16-bit little-endian
-//! mono PCM samples at 16 kHz. No handshake and no other framing.
+//! mono PCM samples at 16 kHz. With `ptt_raw=1` the payload is instead the
+//! unprocessed little-endian 32-bit PIO FIFO words, one per I2S channel slot,
+//! for offline analysis (the diagnostic format used while bringing the mic
+//! up). No handshake and no other framing.
 
 use crate::Irqs;
 use crate::config::CONFIG;
@@ -31,9 +43,8 @@ use embassy_net::tcp::TcpSocket;
 use embassy_rp::PeripheralRef;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::{DMA_CH4, PIN_2, PIN_3, PIN_21, PIO2};
-use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
-    Config, Direction, FifoJoin, Pio, ShiftConfig, ShiftDirection, StateMachine,
+    Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, ShiftConfig, ShiftDirection,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -42,30 +53,42 @@ use embassy_time::{Duration, Instant, with_timeout};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
-use terminal_model::pcm_extract::{bit_clock_hz, extract_left_channel_pcm};
+use terminal_model::i2s_program::build_i2s_rx_program;
+use terminal_model::pcm_extract::{
+    MAX_MIC_BCLK_HZ, MIN_MIC_BCLK_HZ, bit_clock_hz, extract_left_channel_pcm, mic_settings_valid,
+};
 
 extern crate alloc;
 
-/// Matches Whisper's internal resampling target, so there's no benefit to
-/// capturing at a higher rate (see the feasibility report referenced in
-/// AGENTS.md).
-const SAMPLE_RATE_HZ: u32 = 16_000;
-/// The mic (Adafruit SPH0645, a fixed-ratio I2S digital mic) does not
-/// negotiate slot width: its internal shift-counter is hardwired to a 32
-/// bit-clock slot per channel (64fs total per L+R frame), confirmed against
-/// its documented supported-clock table (1.024 MHz-4.096 MHz BCLK for
-/// 16 kHz-64 kHz sample rates - 16 kHz * 64 = 1.024 MHz exactly). This was
-/// wrongly 16 before (a mirror of embassy's `PioI2sOut` DAC example, which
-/// targets ordinary 16-bit-slot I2S DACs, not this mic), producing a 512 kHz
-/// BCLK - exactly half of the 1.024 MHz this mic requires - which the
-/// captain's real hardware capture (a small fixed set of garbage sample
-/// values, not audio) confirmed. See AGENTS.md for the full writeup.
-const BIT_DEPTH: u32 = 32;
+/// Default sample rate, in Hz. Matches Whisper's internal resampling target,
+/// so there's no benefit to capturing at a higher rate (see the feasibility
+/// report referenced in AGENTS.md). Configurable at runtime via `ptt_rate`.
+const DEFAULT_RATE_HZ: u32 = 16_000;
+/// Default bits per channel I2S slot. The mic (Adafruit SPH0645, a
+/// fixed-ratio I2S digital mic) does not negotiate slot width: its internal
+/// shift-counter is hardwired to a 32-bit slot per channel (64fs total per
+/// L+R frame), confirmed against its documented supported-clock table
+/// (1.024 MHz-4.096 MHz BCLK for 16 kHz-64 kHz sample rates - 16 kHz * 64 =
+/// 1.024 MHz exactly). An earlier build clocked 16-bit slots (512 kHz,
+/// exactly half) and produced garbage on real hardware. Configurable at
+/// runtime via `ptt_bits` for on-device probing, though an out-of-window
+/// slot/rate pair is refused (see `mic_settings_valid`).
+const DEFAULT_BITS: u32 = 32;
+/// Default bit-clock edge polarity: `false` keeps the historical side-set
+/// values; `ptt_edge=1` inverts the low (bit-clock) bit of every side-set
+/// value, shifting sampling half a BCLK cycle. Configurable at runtime via
+/// `ptt_edge`.
+const DEFAULT_EDGE_FLIP: bool = false;
+/// Default capture mode: `false` extracts mono 16-bit PCM; `ptt_raw=1`
+/// streams the unprocessed PIO FIFO words for offline analysis instead.
+const DEFAULT_RAW: bool = false;
 /// I2S always frames a left+right pair per word-select cycle even though
 /// this mono mic only drives one slot; see `capture_task`'s extraction.
 const CHANNELS: u32 = 2;
-/// 25ms per frame, comfortably inside the brief's 20-50ms guidance.
-const SAMPLES_PER_CHUNK: usize = SAMPLE_RATE_HZ as usize / 40;
+/// 25 ms per frame at the default rate, comfortably inside the brief's
+/// 20-50 ms guidance. A chunk is a fixed number of samples, so a non-default
+/// `ptt_rate` changes its duration but not the buffer sizes.
+const SAMPLES_PER_CHUNK: usize = DEFAULT_RATE_HZ as usize / 40;
 /// Capacity of the shared capture/upload ring, in `i16` samples: 2048 samples
 /// at 16 kHz is 128 ms of audio, enough to absorb ordinary connection-setup
 /// and scheduling jitter without being a meaningful memory cost. This buffer
@@ -87,6 +110,174 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// running, "recording..." overlay stuck) to a minute, far longer than any
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
+
+/// Config keys for the mic's runtime debug settings, alongside the
+/// `ptt_host`/`ptt_port` destination keys.
+pub const BITS_KEY: &str = "ptt_bits";
+pub const RATE_KEY: &str = "ptt_rate";
+pub const EDGE_KEY: &str = "ptt_edge";
+pub const RAW_KEY: &str = "ptt_raw";
+
+/// Microphone settings resolved from persisted config (see
+/// [`load_settings`]). Re-read and re-applied at the start of every recording,
+/// so `config set ptt_*` takes effect on the next utterance without a reflash
+/// or reboot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MicSettings {
+    /// Bits per channel slot; the PIO loop counter is `bits - 2`.
+    pub bits: u32,
+    /// I2S sample rate in Hz; the bit clock is `rate * bits * CHANNELS`.
+    pub rate: u32,
+    /// `true` inverts the BCLK edge the PIO program samples on.
+    pub edge_flip: bool,
+    /// `true` streams unprocessed raw FIFO words instead of extracted PCM.
+    pub raw: bool,
+}
+
+impl Default for MicSettings {
+    fn default() -> Self {
+        Self {
+            bits: DEFAULT_BITS,
+            rate: DEFAULT_RATE_HZ,
+            edge_flip: DEFAULT_EDGE_FLIP,
+            raw: DEFAULT_RAW,
+        }
+    }
+}
+
+impl MicSettings {
+    /// The bit clock these settings produce, in Hz.
+    pub fn bclk_hz(&self) -> u32 {
+        bit_clock_hz(self.rate, self.bits, CHANNELS)
+    }
+}
+
+/// Effective settings plus whether an out-of-window stored pair had to be
+/// replaced by the default (so the caller can log it once per recording).
+struct ResolvedSettings {
+    settings: MicSettings,
+    fell_back: bool,
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value.trim().parse().ok()
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads the `ptt_*` mic keys and resolves them against their defaults. A
+/// missing or malformed individual value falls back to its own default; if the
+/// resulting clock is outside the SPH0645's documented window, the whole
+/// slot-width/rate pair falls back to the default so the firmware can never
+/// silently mis-clock the mic.
+async fn resolve_settings() -> ResolvedSettings {
+    let (bits, rate, edge, raw) = {
+        let mut config = CONFIG.get().lock().await;
+        let bits = config.fetch(BITS_KEY).await.ok().flatten();
+        let rate = config.fetch(RATE_KEY).await.ok().flatten();
+        let edge = config.fetch(EDGE_KEY).await.ok().flatten();
+        let raw = config.fetch(RAW_KEY).await.ok().flatten();
+        (bits, rate, edge, raw)
+    };
+    let mut settings = MicSettings {
+        bits: bits
+            .as_ref()
+            .and_then(|v| parse_u32(v.as_str()))
+            .unwrap_or(DEFAULT_BITS),
+        rate: rate
+            .as_ref()
+            .and_then(|v| parse_u32(v.as_str()))
+            .unwrap_or(DEFAULT_RATE_HZ),
+        edge_flip: edge
+            .as_ref()
+            .and_then(|v| parse_bool(v.as_str()))
+            .unwrap_or(DEFAULT_EDGE_FLIP),
+        raw: raw
+            .as_ref()
+            .and_then(|v| parse_bool(v.as_str()))
+            .unwrap_or(DEFAULT_RAW),
+    };
+    let mut fell_back = false;
+    if !mic_settings_valid(settings.bits, settings.rate) {
+        settings.bits = DEFAULT_BITS;
+        settings.rate = DEFAULT_RATE_HZ;
+        fell_back = true;
+    }
+    ResolvedSettings {
+        settings,
+        fell_back,
+    }
+}
+
+/// Settings for the recording about to start, logging if a stored value had to
+/// be replaced by the default.
+pub async fn load_settings() -> MicSettings {
+    let resolved = resolve_settings().await;
+    if resolved.fell_back {
+        print!("ptt: stored mic clock settings out of range, using defaults\r\n");
+    }
+    resolved.settings
+}
+
+/// Validates a `config set ptt_*` request against the currently effective
+/// settings, so an out-of-window or malformed value is refused at the console
+/// rather than stored. Keys this module does not own return `Ok(())`.
+pub async fn validate_config_setting(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        BITS_KEY | RATE_KEY | EDGE_KEY | RAW_KEY => {}
+        _ => return Ok(()),
+    }
+    let mut candidate = resolve_settings().await.settings;
+    match key {
+        BITS_KEY => {
+            candidate.bits = parse_u32(value)
+                .ok_or_else(|| String::from("ptt_bits must be a number (bits per channel slot)"))?;
+        }
+        RATE_KEY => {
+            candidate.rate =
+                parse_u32(value).ok_or_else(|| String::from("ptt_rate must be a number (Hz)"))?;
+        }
+        EDGE_KEY => {
+            candidate.edge_flip =
+                parse_bool(value).ok_or_else(|| String::from("ptt_edge must be 0 or 1"))?;
+        }
+        RAW_KEY => {
+            candidate.raw =
+                parse_bool(value).ok_or_else(|| String::from("ptt_raw must be 0 or 1"))?;
+        }
+        _ => unreachable!(),
+    }
+    if !mic_settings_valid(candidate.bits, candidate.rate) {
+        return Err(alloc::format!(
+            "invalid mic clock: ptt_bits={} ptt_rate={} -> BCLK {} Hz, outside the mic's documented {}-{} Hz window",
+            candidate.bits,
+            candidate.rate,
+            candidate.bclk_hz(),
+            MIN_MIC_BCLK_HZ,
+            MAX_MIC_BCLK_HZ,
+        ));
+    }
+    Ok(())
+}
+
+/// Effective value of a `ptt_*` setting for `config get`; `None` for keys this
+/// module does not own. Shows the default when the key is unset.
+pub async fn effective_setting(key: &str) -> Option<String> {
+    let settings = resolve_settings().await.settings;
+    match key {
+        BITS_KEY => Some(alloc::format!("{}", settings.bits)),
+        RATE_KEY => Some(alloc::format!("{}", settings.rate)),
+        EDGE_KEY => Some(alloc::format!("{}", settings.edge_flip as u8)),
+        RAW_KEY => Some(alloc::format!("{}", settings.raw as u8)),
+        _ => None,
+    }
+}
 
 /// Samples captured by `capture_task`, drained by `ptt_upload_task`. A fixed
 /// `static` (never heap-allocated, never resized), guarded by an
@@ -179,21 +370,77 @@ pub async fn stop_recording() {
 /// shape) — embassy-rp ships no I2S RX driver, so this is written directly
 /// against the public `embassy_rp::pio` API rather than vendored, following
 /// this project's existing `psram.rs` precedent for a custom PIO program.
+///
+/// It owns the whole `Pio` block plus its pins so [`Self::apply`] can rebuild
+/// the runtime-assembled program and swap the loaded one as settings change.
 struct Mic {
-    sm: StateMachine<'static, PIO2, 0>,
+    pio: Pio<'static, PIO2>,
     dma_ch: PeripheralRef<'static, DMA_CH4>,
+    bclk: Pin<'static, PIO2>,
+    ws: Pin<'static, PIO2>,
+    sd: Pin<'static, PIO2>,
+    /// Settings currently loaded into the SM, or `None` before the first
+    /// recording; lets `apply` skip redundant reloads.
+    applied: Option<MicSettings>,
+    /// Instruction memory of the currently loaded program, freed before a new
+    /// one is loaded so repeated reconfiguration cannot exhaust PIO RAM.
+    loaded: Option<LoadedProgram<'static, PIO2>>,
 }
 
 impl Mic {
     fn set_enabled(&mut self, enabled: bool) {
-        self.sm.set_enable(enabled);
+        self.pio.sm0.set_enable(enabled);
     }
 
     async fn capture(&mut self, buf: &mut [u32]) {
-        self.sm
+        self.pio
+            .sm0
             .rx()
             .dma_pull(self.dma_ch.reborrow(), buf, false)
             .await;
+    }
+
+    /// (Re)configures the PIO program and clock for `settings`, freeing the
+    /// previously loaded program. A no-op when the running configuration
+    /// already matches, so an unchanged config costs nothing.
+    fn apply(&mut self, settings: MicSettings) {
+        if self.applied == Some(settings) {
+            return;
+        }
+        self.pio.sm0.set_enable(false);
+        self.pio.sm0.restart();
+        self.pio.sm0.clear_fifos();
+
+        let program = build_i2s_rx_program(settings.bits, settings.edge_flip);
+        if let Some(old) = self.loaded.take() {
+            // SAFETY: the state machine was disabled and restarted above, so
+            // it is not executing the instruction memory being freed.
+            unsafe { self.pio.common.free_instr(old.used_memory) };
+        }
+        let loaded = self.pio.common.load_program(&program);
+
+        let mut cfg = Config::default();
+        cfg.use_program(&loaded, &[&self.bclk, &self.ws]);
+        cfg.set_in_pins(&[&self.sd]);
+        let clock_frequency = bit_clock_hz(settings.rate, settings.bits, CHANNELS);
+        cfg.clock_divider = (clk_sys_freq() as f64 / clock_frequency as f64 / 2.).to_fixed();
+        // One autopush per channel slot regardless of width, so FIFO words
+        // are always left, right, left, ... and can be sliced by parity.
+        cfg.shift_in = ShiftConfig {
+            threshold: settings.bits as u8,
+            direction: ShiftDirection::Left,
+            auto_fill: true,
+        };
+        // Doubles RX FIFO depth since TX is unused; mirrors PioI2sOut.
+        cfg.fifo_join = FifoJoin::RxOnly;
+
+        self.pio.sm0.set_config(&cfg);
+        self.pio.sm0.set_pin_dirs(Direction::In, &[&self.sd]);
+        self.pio
+            .sm0
+            .set_pin_dirs(Direction::Out, &[&self.bclk, &self.ws]);
+        self.applied = Some(settings);
+        self.loaded = Some(loaded);
     }
 }
 
@@ -211,86 +458,21 @@ pub fn init_mic(
     dma_ch4: DMA_CH4,
 ) {
     let mut pio = Pio::new(pio2, Irqs);
+    let bclk = pio.common.make_pio_pin(bclk);
+    let ws = pio.common.make_pio_pin(ws);
+    let sd = pio.common.make_pio_pin(sd);
 
-    // Mirror of PioI2sOutProgram's pio_asm! block: same word/bit-clock
-    // side-set generation (the Pico is I2S master either way), with `in
-    // pins, 1` replacing `out pins, 1` to capture instead of emit.
-    //
-    // `set x, 30` (X_init + 2 = 32 total `in pins,1` shifts per channel,
-    // matching this mic's fixed 32-bit-slot/64fs requirement - see
-    // `BIT_DEPTH`'s comment) was `set x, 14` (16 bits/slot) before; that was
-    // the parameter that needed adapting from embassy's `PioI2sOut` DAC
-    // example, not the loop shape itself.
-    //
-    // Word-select-to-first-bit delay: this structure already provides the
-    // standard Philips-I2S one-BCLK-cycle gap between a channel's `side`
-    // flipping and its first `in pins,1` shift "for free" - the WS bit
-    // flips on the *last* shift of the *previous* phase (see the trailing
-    // `in pins,1 side 0b10`/`0b00` lines below, whose `side` already shows
-    // the *next* phase), and the following `set x, ..` (a non-shift
-    // instruction) is the delay slot before that next phase's first real
-    // shift. No extra dummy shift is needed for this. This is inferred from
-    // this program's own instruction ordering, not confirmed against a
-    // primary SPH0645 timing diagram - see AGENTS.md for the caveat.
-    //
-    // Bit-clock edge polarity is unchanged from before (this mic is
-    // documented elsewhere as driving new data on BCLK's *rising* edge,
-    // non-standard for I2S) - kept as-is since neither a primary datasheet
-    // nor a hardware capture has settled which edge this program actually
-    // samples on once real PIO pipeline delay is accounted for (undocumented
-    // by the RP2040/2350 datasheet; see AGENTS.md). If real captures still
-    // look wrong after the slot-width fix, the single, obvious edge-flip to
-    // try is inverting the low (B) bit of every `side` value below - i.e.
-    // 0b00<->0b01 and 0b10<->0b11 - which shifts every sample by half a
-    // BCLK cycle without changing the loop shape or word-select polarity.
-    let prg = pio_asm!(
-        ".side_set 2",
-        "    set x, 30          side 0b01", // side 0bWB - W = Word Clock, B = Bit Clock
-        "left_data:",
-        "    in pins, 1         side 0b00",
-        "    jmp x-- left_data  side 0b01",
-        "    in pins, 1         side 0b10",
-        "    set x, 30          side 0b11",
-        "right_data:",
-        "    in pins, 1         side 0b10",
-        "    jmp x-- right_data side 0b11",
-        "    in pins, 1         side 0b00",
-    );
-    let program = pio.common.load_program(&prg.program);
-
-    let bit_clock_pin = pio.common.make_pio_pin(bclk);
-    let lr_clock_pin = pio.common.make_pio_pin(ws);
-    let data_pin = pio.common.make_pio_pin(sd);
-
-    let mut cfg = Config::default();
-    cfg.use_program(&program, &[&bit_clock_pin, &lr_clock_pin]);
-    cfg.set_in_pins(&[&data_pin]);
-    let clock_frequency = bit_clock_hz(SAMPLE_RATE_HZ, BIT_DEPTH, CHANNELS);
-    cfg.clock_divider = (clk_sys_freq() as f64 / clock_frequency as f64 / 2.).to_fixed();
-    // threshold is the ISR's full 32 bits either way; what changed with the
-    // slot-width fix is what one autopushed word *means* - previously one
-    // word packed both channels' (wrong-width) slots together, now one word
-    // is exactly one channel's full 32-bit slot (left, then right,
-    // alternating) - see `capture_task`'s extraction.
-    cfg.shift_in = ShiftConfig {
-        threshold: 32,
-        direction: ShiftDirection::Left,
-        auto_fill: true,
-    };
-    // Doubles RX FIFO depth since TX is unused; mirrors PioI2sOut's TxOnly.
-    cfg.fifo_join = FifoJoin::RxOnly;
-
-    let mut sm = pio.sm0;
-    sm.set_config(&cfg);
-    sm.set_pin_dirs(Direction::In, &[&data_pin]);
-    sm.set_pin_dirs(Direction::Out, &[&bit_clock_pin, &lr_clock_pin]);
-    // Left disabled (no clocks driven, no mic power/noise) until a
-    // recording actually starts.
-    sm.set_enable(false);
-
+    // Left unconfigured and disabled (no clocks driven, no mic power/noise)
+    // until the first recording, when `capture_task` resolves the runtime
+    // settings and `Mic::apply` builds the program for them.
     let mic = Mic {
-        sm,
+        pio,
         dma_ch: PeripheralRef::new(dma_ch4),
+        bclk,
+        ws,
+        sd,
+        applied: None,
+        loaded: None,
     };
 
     spawner.must_spawn(capture_task(mic));
@@ -302,6 +484,11 @@ async fn capture_task(mut mic: Mic) {
     loop {
         START_SIGNAL.wait().await;
         let generation = CURRENT_GEN.load(Ordering::Acquire);
+        // Resolve and apply the runtime debug configuration before the I2S
+        // clock starts, so a `config set ptt_*` affects this very utterance
+        // (no rebuild, reflash or reboot).
+        let settings = load_settings().await;
+        mic.apply(settings);
         mic.set_enabled(true);
         let started = Instant::now();
         // Ends when the button is released, when a newer recording supersedes
@@ -309,33 +496,36 @@ async fn capture_task(mut mic: Mic) {
         while RECORDING.load(Ordering::Acquire) == generation
             && CURRENT_GEN.load(Ordering::Acquire) == generation
         {
-            // One 32-bit FIFO word is now one channel's full slot (see
-            // `BIT_DEPTH`'s comment), not a combined L+R pair: the PIO
-            // program pushes left, then right, alternating, so a chunk's
-            // worth of *mono* samples needs twice as many raw words.
+            // One FIFO word is one channel slot (see `MicSettings::bits`), not
+            // a combined L+R pair: the PIO program pushes left, then right,
+            // alternating, so a chunk's worth of *mono* samples needs twice as
+            // many raw words.
             let mut raw = [0u32; SAMPLES_PER_CHUNK * 2];
             mic.capture(&mut raw).await;
             if CURRENT_GEN.load(Ordering::Acquire) != generation {
                 continue;
             }
 
-            // Keep only the even-indexed (left-slot) words and drop the
-            // odd-indexed (right-slot) ones the mic never drives, matching
-            // this driver's left-slot pin/wiring contract in AGENTS.md (swap
-            // to odd-indexed words if a captain instead wires the mic to the
-            // right slot). ShiftDirection::Left means MSB-first, so each
-            // 32-bit word holds this mic's 18 significant bits (2's
-            // complement, MSB-first) in bits 31-14, with the low 14 bits
-            // zero-padded per its documented format; `>>16` keeps the top 16
-            // of those 18 significant bits as the PCM sample, discarding
-            // only their bottom 2 bits of resolution.
-            let mut pcm = [0i16; SAMPLES_PER_CHUNK];
-            extract_left_channel_pcm(&raw, &mut pcm);
-
             // Never blocks and never allocates: if the network side is
             // behind, the ring drops its oldest samples instead of stalling
             // the DMA pull that keeps the I2S clocks running.
-            let result = PCM_RING.lock().await.write(generation, &pcm);
+            let result = if settings.raw {
+                // `ptt_raw`: bypass extraction and hand the ring the raw FIFO
+                // words as little-endian i16 halves, so re-serializing them
+                // reproduces the exact unprocessed I2S word stream.
+                PCM_RING.lock().await.write_u32_words(generation, &raw)
+            } else {
+                // Keep only the even-indexed (left-slot) words and drop the
+                // odd-indexed (right-slot) ones the mic never drives, matching
+                // this driver's left-slot pin/wiring contract in AGENTS.md
+                // (swap to odd-indexed words if a captain instead wires the mic
+                // to the right slot). ShiftDirection::Left means MSB-first, and
+                // `extract_left_channel_pcm` takes the top 16 bits of the
+                // configured slot width.
+                let mut pcm = [0i16; SAMPLES_PER_CHUNK];
+                extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
+                PCM_RING.lock().await.write(generation, &pcm)
+            };
             if result.first_drop {
                 OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
             }

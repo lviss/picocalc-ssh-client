@@ -17,10 +17,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
   (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
-  (`audio_ring.rs`) and the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`)
-  from `src/mic.rs`, and the SD-card SSH-key backup text codec
-  (`keyfile.rs`) from `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
-  `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
+  (`audio_ring.rs`), the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`) and the
+  runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, and the SD-card
+  SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`. It depends only on
+  `vte`, `embedded-graphics`, `pio`, and `profont` — all host-buildable — so it's the place for
+  real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
   extending this crate over adding tests to the hardware-coupled root crate.
@@ -127,9 +128,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (`~/.cargo/registry/src/*/embassy-rp-<version>/`, fetch it with `cargo fetch` first if absent)
   before writing code against any embassy-rp API, rather than trusting the submodule's source.
   `src/mic.rs` is the up-to-date, actually-building example of this project's real PIO/DMA idiom
-  (`PeripheralRef`, `PeripheralRef::new`, `pio_asm!` via `embassy_rp::pio::program::pio_asm`) to
-  copy from; `src/psram.rs` no longer has any PIO code of its own (see its own entry below) — it
-  only drives PSRAM via raw `embassy_rp::pac` register access now.
+  (`PeripheralRef`, `PeripheralRef::new`, `Pio::new` + `make_pio_pin` + `StateMachine`) to copy
+  from; since the mic's slot width/edge are runtime settings, its program is built at run time by
+  `terminal-model/src/i2s_program.rs` with the `pio` crate's `Assembler` instead of `pio_asm!`
+  (the macro is still the right tool for a fixed program). `src/psram.rs` no longer has any PIO
+  code of its own (see its own entry below) — it only drives PSRAM via raw `embassy_rp::pac`
+  register access now.
 - Push-to-talk voice capture (`src/mic.rs`) captures mic audio on a held button and streams it to a
   network host; the receiving/transcribing side is a separate, not-yet-built process outside this
   repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is now unused; see the PSRAM note
@@ -147,22 +151,29 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   investigation reports assumed) - a fixed-ratio I2S digital mic whose internal shift-counter is
   hardwired to a 32-bit-per-channel slot (64fs total per L+R frame: confirmed against its documented
   clock table, 1.024 MHz-4.096 MHz BCLK for 16 kHz-64 kHz sample rates, 16 kHz * 64 = 1.024 MHz
-  exactly). The PIO program's slot width (`set x, 30` in `mic.rs`, i.e. `BIT_DEPTH = 32`) and
-  `capture_task`'s extraction (one FIFO word is now one channel's full slot, not a combined L+R
-  pair - keep only the even-indexed/left-slot words, `>>16` for the top 16 of the mic's 18
-  significant bits) both reflect that. This was originally `BIT_DEPTH = 16` (a mirror of embassy's
+  exactly). The PIO program and its clock are now **runtime settings**, resolved from the config
+  store at the start of every recording and applied on the device (no reflash or reboot):
+  `ptt_bits` (channel slot width, default 32), `ptt_rate` (sample rate Hz, default 16000),
+  `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
+  mono PCM, 1 = stream the unprocessed FIFO words). A `ptt_bits`/`ptt_rate` pair whose
+  `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at the
+  console (`mic::validate_config_setting`) and, if a stored value is somehow invalid, falls back
+  to the default pair with a log (`mic::load_settings` via
+  `terminal_model::pcm_extract::mic_settings_valid`) - the firmware never silently mis-clocks the
+  mic. The program itself is built at run time by `terminal-model/src/i2s_program.rs` (the `pio`
+  crate's `Assembler`) because `pio_asm!` bakes the loop count and edge in at compile time;
+  `capture_task` keeps only the even-indexed/left-slot words and `extract_left_channel_pcm` takes
+  the top 16 bits of the configured slot width. An earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
-  mic) - producing a 512 kHz BCLK instead of the 1.024 MHz this mic requires at 16 kHz, exactly
-  half; the captain's real capture (a small fixed set of garbage sample values, not audio) confirmed
-  this. **Still unverified without hardware**: the mic's documented rising-edge (non-standard)
-  data-change timing versus which BCLK edge this PIO program's `in pins, 1` actually samples on -
-  the RP2040/2350 datasheet does not document PIO's internal input/output pipeline timing at all
-  (confirmed via `raspberrypi/pico-feedback#280`), and this program's BCLK period is only 2 PIO
-  cycles, comparable to or shorter than that undocumented pipeline delay, so this could not be
-  settled from source alone. If a real capture still looks wrong after the slot-width fix, the
-  single documented one-line alternative to try is inverting the low (bit-clock) bit of every `side`
-  value in the PIO program (see the program's own comment in `mic.rs`), which shifts sampling by
-  half a BCLK cycle without changing the loop shape. Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
+  mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
+  every raw word `0x00000000`), confirming this mic will not run below 1.024 MHz. **Still
+  unverified without hardware**: the mic's documented rising-edge (non-standard) data-change timing
+  versus which BCLK edge this PIO program's `in pins, 1` actually samples on - the RP2040/2350
+  datasheet does not document PIO's internal input/output pipeline timing at all (confirmed via
+  `raspberrypi/pico-feedback#280`), and this program's BCLK period is only 2 PIO cycles,
+  comparable to or shorter than that undocumented pipeline delay. `ptt_edge=1` is the documented
+  experiment for that (it inverts the low/bit-clock bit of every side-set value, shifting sampling
+  by half a BCLK cycle without changing the loop shape). Capture is 16 kHz/16-bit mono in ~25ms chunks, staged between
   the capture and upload tasks in a fixed 2048-sample (`i16`, 128ms at 16 kHz) static ring buffer
   in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the heap - so it does not compete
   with the `DualHeap` budget and cannot exhaust it. The ring never blocks and never grows; when it
@@ -196,7 +207,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   special-casing needed in `config.rs`). Wire format (needed by anything implementing the
   receiving side): one TCP connection per utterance, opened on button press and closed on release;
   each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
-  16-bit little-endian mono PCM. No handshake, no other framing.
+  16-bit little-endian mono PCM. With `ptt_raw=1` the payload is instead the unprocessed
+  little-endian `u32` PIO FIFO words, one per channel slot; a receiver should concatenate frame
+  payloads before parsing words (frame boundaries are upload-side, not word-aligned). No handshake,
+  no other framing.
 - `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
   It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
   DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected

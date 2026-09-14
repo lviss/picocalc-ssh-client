@@ -2080,6 +2080,7 @@ name = "terminal-model"
 version = "0.1.0"
 dependencies = [
  "embedded-graphics",
+ "pio",
  "profont",
  "vte",
 ]

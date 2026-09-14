@@ -307,6 +307,23 @@ $ config set ptt_host mymachine.example.com
 $ config set ptt_port 9000
 ```
 
+For bringing up a new microphone there are also optional debug settings. They
+take effect on the *next* recording without a rebuild or reflash, and default to
+the documented-correct values:
+
+```bash
+$ config set ptt_bits 32     # I2S channel slot width in bits (default 32)
+$ config set ptt_rate 16000  # sample rate in Hz (default 16000)
+$ config set ptt_edge 1      # invert the BCLK sampling edge (default 0)
+$ config set ptt_raw 1       # stream raw FIFO words instead of PCM (default 0)
+```
+
+`ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
+inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
+refused with the allowed range. `config get ptt_bits` (and friends) reports the
+value the next recording will actually use, and `config rm` restores the
+default.
+
 A small "recording..." overlay is shown while the button is held.
 Transcription itself is not implemented by this firmware — it only captures
 and streams raw audio; see AGENTS.md for the wire format a receiving process

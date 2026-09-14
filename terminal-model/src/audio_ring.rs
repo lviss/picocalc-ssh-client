@@ -101,6 +101,28 @@ impl<const N: usize> AudioRing<N> {
     /// reader has moved on, and buffering it would only orphan samples ahead
     /// of live audio.
     pub fn write(&mut self, generation: u32, samples: &[i16]) -> WriteResult {
+        self.write_iter(generation, samples.iter().copied())
+    }
+
+    /// Appends the little-endian 16-bit halves of each raw I2S FIFO word,
+    /// tagged with `generation`, exactly like [`Self::write`]. Each `u32`
+    /// becomes two `i16` samples low half first, so a later
+    /// little-endian `i16` serialization of the ring reproduces the original
+    /// `u32` bytes - this is how the `ptt_raw` diagnostic passthrough streams
+    /// unprocessed PIO words through the same allocation-free ring without a
+    /// second buffer. Stale-generation handling and overflow reporting match
+    /// [`Self::write`].
+    pub fn write_u32_words(&mut self, generation: u32, words: &[u32]) -> WriteResult {
+        self.write_iter(generation, words.iter().flat_map(|&word| {
+            [word as u16 as i16, (word >> 16) as u16 as i16]
+        }))
+    }
+
+    fn write_iter(
+        &mut self,
+        generation: u32,
+        samples: impl IntoIterator<Item = i16>,
+    ) -> WriteResult {
         if generation < self.newest_generation {
             return WriteResult {
                 dropped: 0,
@@ -109,7 +131,7 @@ impl<const N: usize> AudioRing<N> {
         }
         self.newest_generation = generation;
         let mut dropped = 0;
-        for &sample in samples {
+        for sample in samples {
             if self.len == N {
                 self.head = (self.head + 1) % N;
                 self.len -= 1;
@@ -325,6 +347,43 @@ mod tests {
         assert_eq!(log_count, 1);
         // A new generation gets its own first-drop report.
         assert!(ring.write(8, &[0; 20]).first_drop);
+    }
+
+    /// The `ptt_raw` passthrough reinterprets each captured 32-bit word as
+    /// two little-endian `i16` samples, so that re-serializing the ring is
+    /// byte-for-byte identical to sending the original `u32` words.
+    #[test]
+    fn write_u32_words_reproduces_the_word_bytes_little_endian() {
+        let mut ring = AudioRing::<8>::new();
+        ring.write_u32_words(1, &[0x1234_5678u32, 0xABCD_0001u32]);
+
+        let mut out = [0i16; 8];
+        let n = ring.read(1, &mut out);
+        assert_eq!(n, 4);
+        let mut bytes = [0u8; 8];
+        for (i, sample) in out[..n].iter().enumerate() {
+            bytes[i * 2..i * 2 + 2].copy_from_slice(&sample.to_le_bytes());
+        }
+        assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0xCD, 0xAB]);
+    }
+
+    #[test]
+    fn write_u32_words_shares_stale_and_overflow_behavior() {
+        let mut ring = AudioRing::<2>::new();
+        // Two words is four samples against a capacity of two, so the two
+        // oldest samples are dropped, exactly as `write` would.
+        let result = ring.write_u32_words(1, &[0x0001_0002u32, 0x0003_0004u32]);
+        assert_eq!(result.dropped, 2);
+        assert!(result.first_drop);
+        // A superseded generation is ignored just like `write`.
+        let stale = ring.write_u32_words(0, &[0xDEAD_BEEFu32]);
+        assert_eq!(stale, WriteResult { dropped: 0, first_drop: false });
+        let mut out = [0i16; 2];
+        assert_eq!(ring.read(1, &mut out), 2);
+        // Word order is low half then high half, so the two words buffered as
+        // [0x0002, 0x0001, 0x0004, 0x0003]; the oldest two are dropped.
+        assert_eq!(out[0], 0x0004u16 as i16);
+        assert_eq!(out[1], 0x0003u16 as i16);
     }
 
     #[test]
