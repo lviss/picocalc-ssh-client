@@ -162,11 +162,17 @@ pub async fn config_command(args: &[&str]) {
             print!("{result:?}");
         }
         ["config", "list"] => {
-            let mut config = CONFIG.get().lock().await;
-            match config.get_all().await {
+            let map = {
+                let mut config = CONFIG.get().lock().await;
+                config.get_all().await
+            };
+            match map {
                 Ok(map) => {
                     for (k, v) in &map {
-                        print!("{k}={v}\r\n");
+                        match crate::mic::effective_setting(k.as_str()).await {
+                            Some(effective) => print!("{k}={effective}\r\n"),
+                            None => print!("{k}={v}\r\n"),
+                        }
                     }
                 }
                 Err(err) => {

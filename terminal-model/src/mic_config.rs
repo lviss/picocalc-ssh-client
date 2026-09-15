@@ -25,6 +25,7 @@
 use crate::pcm_extract::{MAX_MIC_BCLK_HZ, MIN_MIC_BCLK_HZ, bit_clock_hz, mic_settings_valid};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// I2S frames a left+right pair per word-select cycle; fixed at two, as the
 /// captain settled the channel framing.
@@ -158,6 +159,62 @@ pub fn resolve(
         settings,
         fell_back,
     }
+}
+
+/// A stored `ptt_*` value the next recording will not actually use, together
+/// with the canonical value to write back so the store, `config get`/`list`,
+/// and the effective settings all agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredValueFix {
+    pub key: &'static str,
+    pub value: String,
+}
+
+fn stored_fix(key: &'static str, settings: MicSettings) -> StoredValueFix {
+    StoredValueFix {
+        key,
+        value: effective_setting(key, settings).expect("owned key has an effective form"),
+    }
+}
+
+/// Resolves the raw stored values and reports every stored `ptt_*` key whose
+/// value differs from the effective setting, with the canonical value to write
+/// back. An out-of-window slot/rate pair makes both stored keys "used"
+/// defaults rather than the stale stored value, so a later `config set` cannot
+/// silently re-adopt a key the console already reported as default. Applying
+/// the returned fixes leaves store, reports and effective settings in
+/// agreement.
+pub fn reconcile(
+    bits: Option<&str>,
+    rate: Option<&str>,
+    edge: Option<&str>,
+    raw: Option<&str>,
+    gain: Option<&str>,
+) -> (ResolvedSettings, Vec<StoredValueFix>) {
+    let resolved = resolve(bits, rate, edge, raw, gain);
+    let effective = resolved.settings;
+    let mut fixes = Vec::new();
+    if bits.is_some() && bits.and_then(parse_u32) != Some(effective.bits) {
+        fixes.push(stored_fix(BITS_KEY, effective));
+    }
+    if rate.is_some() && rate.and_then(parse_u32) != Some(effective.rate) {
+        fixes.push(stored_fix(RATE_KEY, effective));
+    }
+    if edge.is_some() && edge.and_then(parse_bool) != Some(effective.edge_flip) {
+        fixes.push(stored_fix(EDGE_KEY, effective));
+    }
+    if raw.is_some() && raw.and_then(parse_bool) != Some(effective.raw) {
+        fixes.push(stored_fix(RAW_KEY, effective));
+    }
+    if gain.is_some()
+        && gain
+            .and_then(parse_u32)
+            .filter(|g| (MIN_GAIN..=MAX_GAIN).contains(g))
+            != Some(effective.gain)
+    {
+        fixes.push(stored_fix(GAIN_KEY, effective));
+    }
+    (resolved, fixes)
 }
 
 /// Effective value of a `ptt_*` setting for `config get`, so an unset key
@@ -409,5 +466,50 @@ mod tests {
         let resolved = resolve(Some("16"), Some("16000"), None, None, Some("256"));
         assert!(resolved.fell_back);
         assert_eq!(resolved.settings.gain, 256);
+    }
+
+    #[test]
+    fn reconcile_reports_every_stored_key_that_diverges_from_the_effective_value() {
+        // An out-of-window pair (8-bit @ 32 kHz) plus a malformed edge and an
+        // out-of-range gain: every one of those stored keys is not what the
+        // next recording uses, so each must be reported for rewriting.
+        let (resolved, fixes) = reconcile(
+            Some("8"),
+            Some("32000"),
+            Some("maybe"),
+            Some("1"),
+            Some("0"),
+        );
+        assert!(resolved.fell_back);
+        assert_eq!(resolved.settings.bits, DEFAULT_BITS);
+        assert_eq!(resolved.settings.rate, DEFAULT_RATE_HZ);
+        assert!(!resolved.settings.edge_flip);
+        assert!(resolved.settings.raw);
+        assert_eq!(resolved.settings.gain, DEFAULT_GAIN);
+        let keys: Vec<&str> = fixes.iter().map(|f| f.key).collect();
+        assert!(keys.contains(&BITS_KEY));
+        assert!(keys.contains(&RATE_KEY));
+        assert!(keys.contains(&EDGE_KEY));
+        assert!(keys.contains(&GAIN_KEY));
+        // A valid stored value is left alone.
+        assert!(!keys.contains(&RAW_KEY));
+        for fix in &fixes {
+            assert_eq!(
+                effective_setting(fix.key, resolved.settings).as_deref(),
+                Some(fix.value.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_leaves_a_consistent_store_untouched() {
+        // A legal stored pair with legal non-clock keys is exactly what the
+        // next recording uses, so nothing needs rewriting.
+        let (resolved, fixes) =
+            reconcile(Some("16"), Some("32000"), Some("1"), Some("1"), Some("256"));
+        assert!(!resolved.fell_back);
+        assert_eq!(resolved.settings.bits, 16);
+        assert_eq!(resolved.settings.rate, 32_000);
+        assert!(fixes.is_empty());
     }
 }

@@ -73,13 +73,22 @@ pub fn mic_settings_valid(bits_per_channel_slot: u32, sample_rate_hz: u32) -> bo
 /// `16 - bits` for narrower slots. `pcm` is filled from `raw.len() / 2`
 /// words; any extra `pcm` entries beyond that are left untouched.
 pub fn extract_left_channel_pcm(raw: &[u32], pcm: &mut [i16], bits_per_channel_slot: u32) {
-    let bits = bits_per_channel_slot.clamp(1, 32);
     for (dst, word) in pcm.iter_mut().zip(raw.iter().step_by(2)) {
-        *dst = if bits >= 16 {
-            (*word >> (bits - 16)) as i16
-        } else {
-            (*word << (16 - bits)) as u16 as i16
-        };
+        *dst = slot_sample(*word, bits_per_channel_slot);
+    }
+}
+
+/// The 16-bit PCM sample a single captured slot word carries, using the same
+/// shift the production extraction applies: the slot's most significant 16
+/// bits for widths >= 16, or the captured bits left-justified for narrower
+/// slots. Shared by [`extract_left_channel_pcm`] and [`ac_rms_level_words`] so
+/// the level meter always measures the same bit field the payload carries.
+pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
+    let bits = bits_per_channel_slot.clamp(1, 32);
+    if bits >= 16 {
+        (word >> (bits - 16)) as i16
+    } else {
+        (word << (16 - bits)) as u16 as i16
     }
 }
 
@@ -175,15 +184,17 @@ pub fn ac_rms_level(samples: &[i16]) -> u32 {
 }
 
 /// The same AC RMS level for a raw `ptt_raw` chunk, measured over the driven
-/// (even-indexed/left-slot) words' top 16 bits - the samples the production
-/// PCM path would extract - so the level meter works in both modes.
-pub fn ac_rms_level_words(raw: &[u32]) -> u32 {
+/// (even-indexed/left-slot) words' sample field for the configured slot width
+/// - the exact bits [`extract_left_channel_pcm`] would extract - so the level
+/// meter and the streamed payload read the same field in both modes, and a
+/// narrow raw slot cannot meter zero while carrying signal.
+pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
     let count = raw.len().div_ceil(2);
     if count == 0 {
         return 0;
     }
     let n = count as i64;
-    let sample = |word: u32| ((word >> 16) & 0xffff) as u16 as i16 as i64;
+    let sample = |word: u32| slot_sample(word, bits_per_channel_slot) as i64;
     let mean = raw.iter().step_by(2).map(|&w| sample(w)).sum::<i64>() / n;
     let sum_sq: i64 = raw
         .iter()
@@ -404,9 +415,25 @@ mod tests {
             0,                      // undriven (odd)
             (-100i32 << 16) as u32, // -100
         ];
-        assert_eq!(ac_rms_level_words(&raw), 100);
+        assert_eq!(ac_rms_level_words(&raw, 32), 100);
         // A flat driven slot is silence.
         let flat = [(5000i32 << 16) as u32, 0, (5000i32 << 16) as u32];
-        assert_eq!(ac_rms_level_words(&flat), 0);
+        assert_eq!(ac_rms_level_words(&flat, 32), 0);
+    }
+
+    #[test]
+    fn word_level_reads_the_configured_slot_width_like_the_payload() {
+        // A 16-bit slot keeps its samples in the low 16 bits, so a meter that
+        // always read the top 16 would stay pinned at zero. The meter must
+        // follow the same field `extract_left_channel_pcm` puts on the wire.
+        let raw = [100u32, 0, 0xFFFF_FF9Cu32]; // +100, then -100 in the low 16
+        let mut pcm = [0i16; 2];
+        extract_left_channel_pcm(&raw, &mut pcm, 16);
+        assert_eq!(pcm, [100, -100]);
+        assert_eq!(ac_rms_level_words(&raw, 16), ac_rms_level(&pcm));
+        assert_eq!(ac_rms_level_words(&raw, 16), 100);
+        // The same words through the 32-bit field are a flat DC plateau, so
+        // this also proves the width argument changes what is measured.
+        assert_eq!(ac_rms_level_words(&raw, 32), 0);
     }
 }

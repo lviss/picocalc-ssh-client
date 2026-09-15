@@ -160,9 +160,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `ptt_gain` > 1), `ptt_gain` (1-4096, default 1 = off; see below). A `ptt_bits`/`ptt_rate` pair
   whose `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at
   the console and, if a stored value is somehow invalid, falls back to the default pair with a log.
-  That decision table (`resolve`/`validate_setting`, host-tested) lives in
-  `terminal-model/src/mic_config.rs`; `src/mic.rs` is only the config-store/console adapter, so
-  the firmware never silently mis-clocks the mic. The program itself is built at run time by
+  That decision table (`resolve`/`reconcile`/`validate_setting`, host-tested) lives in
+  `terminal-model/src/mic_config.rs`; `src/mic.rs` is only the config-store/console adapter.
+  `reconcile` also rewrites any stored key that no longer matches its effective value, so the
+  store, `config get`/`config list`, and the next recording cannot diverge - otherwise a
+  `ptt_rate`/`ptt_bits` key left stale by `config rm` could be silently re-adopted by a later
+  `config set`. Concurrently, `config list` overlays the effective values for the `ptt_*` keys.
+  The program itself is built at run time by
   `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
   the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
   words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width.
@@ -177,7 +181,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   transcription side, where the audio is consumed - the device ships its native levels. The
   overlay also carries a realtime level meter while recording: `ac_rms_level`/
   `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish the DC-removed AC RMS through
-  `mic::level()`, and `src/screen.rs`'s `draw_overlay` draws it as a bar when `mic::is_recording()`
+  `mic::level()`, both reading the configured slot width's sample field (the same bits
+  `extract_left_channel_pcm` puts on the wire), so a narrow raw slot cannot meter zero while
+  carrying signal. `src/screen.rs`'s `draw_overlay` draws it as a bar when `mic::is_recording()`
   (empty at the noise floor, red when pinned). Offline analysis was inconclusive about absolute
   audio quality and the earlier "mic not converting" reading was over-generalized: the raw-mode
   capture was near-constant (that capture had no signal), while the production PCM captures carry

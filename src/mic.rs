@@ -27,7 +27,7 @@
 //! raw FIFO words under `ptt_raw=1`).
 
 use crate::Irqs;
-use crate::config::CONFIG;
+use crate::config::{CONFIG, StrValue};
 use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
@@ -53,7 +53,7 @@ use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
 use terminal_model::mic_config::{
     BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
-    effective_setting as mic_effective_setting, resolve as resolve_mic_settings,
+    effective_setting as mic_effective_setting, reconcile as reconcile_mic_settings,
     validate_setting as validate_mic_setting,
 };
 use terminal_model::pcm_extract::{
@@ -90,26 +90,31 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
 /// Reads the `ptt_*` mic keys and resolves them against their defaults via
-/// [`terminal_model::mic_config::resolve`]: a missing or malformed individual
+/// [`terminal_model::mic_config::reconcile`]: a missing or malformed individual
 /// value falls back to its own default, and an out-of-window slot/rate pair
-/// falls back to the default rather than silently mis-clocking the mic.
+/// falls back to the default rather than silently mis-clocking the mic. A
+/// stored key that no longer matches its effective value is rewritten, so the
+/// store, `config get`/`list`, and the next recording all agree.
 async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
-    let (bits, rate, edge, raw, gain) = {
-        let mut config = CONFIG.get().lock().await;
-        let bits = config.fetch(BITS_KEY).await.ok().flatten();
-        let rate = config.fetch(RATE_KEY).await.ok().flatten();
-        let edge = config.fetch(EDGE_KEY).await.ok().flatten();
-        let raw = config.fetch(RAW_KEY).await.ok().flatten();
-        let gain = config.fetch(GAIN_KEY).await.ok().flatten();
-        (bits, rate, edge, raw, gain)
-    };
-    resolve_mic_settings(
+    let mut config = CONFIG.get().lock().await;
+    let bits = config.fetch(BITS_KEY).await.ok().flatten();
+    let rate = config.fetch(RATE_KEY).await.ok().flatten();
+    let edge = config.fetch(EDGE_KEY).await.ok().flatten();
+    let raw = config.fetch(RAW_KEY).await.ok().flatten();
+    let gain = config.fetch(GAIN_KEY).await.ok().flatten();
+    let (resolved, fixes) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
         raw.as_ref().map(|v| v.as_str()),
         gain.as_ref().map(|v| v.as_str()),
-    )
+    );
+    for fix in &fixes {
+        if let Ok(value) = TryInto::<StrValue>::try_into(fix.value.as_str()) {
+            let _ = config.store(fix.key, value).await;
+        }
+    }
+    resolved
 }
 
 /// Settings for the recording about to start, logging if a stored value had to
@@ -390,7 +395,7 @@ async fn capture_task(mut mic: Mic) {
                 // reproduces the exact unprocessed I2S word stream. The gain
                 // knob removes the driven slot's DC offset before amplifying,
                 // so it reveals signal rather than railing on the offset.
-                PTT_LEVEL.store(ac_rms_level_words(&raw), Ordering::Release);
+                PTT_LEVEL.store(ac_rms_level_words(&raw, settings.bits), Ordering::Release);
                 remove_dc_and_gain_words(&mut raw, settings.gain);
                 PCM_RING.lock().await.write_u32_words(generation, &raw)
             } else {

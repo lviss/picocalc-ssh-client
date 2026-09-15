@@ -19,8 +19,8 @@
 use pio::{Instruction, InstructionOperands, SetDestination};
 use terminal_model::i2s_program::{PROGRAM_SIZE, build_i2s_rx_program};
 use terminal_model::mic_config::{
-    BITS_KEY, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
-    effective_setting, resolve, validate_setting,
+    BITS_KEY, DEFAULT_BITS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
+    effective_setting, reconcile as reconcile_settings, resolve, validate_setting,
 };
 use terminal_model::pcm_extract::{
     extract_left_channel_pcm, remove_dc_and_gain_samples, remove_dc_and_gain_words,
@@ -45,9 +45,29 @@ impl ConfigStore {
         self.entries.retain(|(k, _)| k != key);
     }
 
+    /// Mirrors `mic::resolve_settings`: rewrites any stored `ptt_*` key that
+    /// no longer matches the effective setting, so the store and the reported/
+    /// effective values cannot diverge.
+    fn reconcile(&mut self) {
+        let (_, fixes) = reconcile_settings(
+            self.fetch(BITS_KEY).as_deref(),
+            self.fetch(RATE_KEY).as_deref(),
+            self.fetch(EDGE_KEY).as_deref(),
+            self.fetch(RAW_KEY).as_deref(),
+            self.fetch(GAIN_KEY).as_deref(),
+        );
+        for fix in fixes {
+            match self.entries.iter_mut().find(|(k, _)| k == fix.key) {
+                Some((_, v)) => *v = fix.value,
+                None => self.entries.push((fix.key.to_string(), fix.value)),
+            }
+        }
+    }
+
     /// The settings a recording started right now would use, exactly as
     /// `mic::resolve_settings` computes them from the store.
-    fn settings(&self) -> MicSettings {
+    fn settings(&mut self) -> MicSettings {
+        self.reconcile();
         resolve(
             self.fetch(BITS_KEY).as_deref(),
             self.fetch(RATE_KEY).as_deref(),
@@ -71,7 +91,7 @@ impl ConfigStore {
     }
 
     /// `config get`: the value the next recording will actually use.
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&mut self, key: &str) -> Option<String> {
         effective_setting(key, self.settings())
     }
 }
@@ -94,7 +114,7 @@ fn loop_count(program: &pio::Program<PROGRAM_SIZE>) -> u32 {
 /// One recording's worth of processing: resolve settings, build the PIO
 /// program the SM would run, and turn a captured alternating left/right-slot
 /// FIFO chunk into the `i16` stream that goes on the wire.
-fn process_chunk(store: &ConfigStore, chunk: &[u32]) -> Vec<i16> {
+fn process_chunk(store: &mut ConfigStore, chunk: &[u32]) -> Vec<i16> {
     let settings = store.settings();
     // `Mic::apply` assembles this before enabling the state machine.
     let program = build_i2s_rx_program(settings.bits, settings.edge_flip);
@@ -150,7 +170,7 @@ fn chunk_with_low16_samples(samples: &[i16]) -> Vec<u32> {
 
 #[test]
 fn unconfigured_device_records_todays_proven_defaults() {
-    let store = ConfigStore::default();
+    let mut store = ConfigStore::default();
     let settings = store.settings();
 
     // No `config set` at all: every key reports the documented default and the
@@ -172,7 +192,7 @@ fn unconfigured_device_records_todays_proven_defaults() {
     // Gain 1 is a byte-for-byte no-op: the extracted samples are exactly the
     // top 16 bits of each left slot, with the undriven slots ignored.
     let chunk = chunk_with_samples(&[1000, 1002, 998, 1004]);
-    let stream = process_chunk(&store, &chunk);
+    let stream = process_chunk(&mut store, &chunk);
     assert_eq!(stream, [1000, 1002, 998, 1004]);
 }
 
@@ -181,7 +201,7 @@ fn captain_config_set_loop_changes_the_very_next_recording() {
     let mut store = ConfigStore::default();
     // The same captured words, processed before and after the reconfiguration.
     let chunk = chunk_with_samples(&[0x1234, 0x5678]);
-    let before = process_chunk(&store, &chunk);
+    let before = process_chunk(&mut store, &chunk);
 
     // A slot width that would under-clock the mic at the current rate is
     // refused at the console and leaves the store untouched...
@@ -229,7 +249,7 @@ fn captain_config_set_loop_changes_the_very_next_recording() {
     // The next recording uses the new slot width: the low 16 bits are now the
     // signal field, so the same captured words extract differently than they
     // did on the unconfigured device.
-    let after = process_chunk(&store, &chunk);
+    let after = process_chunk(&mut store, &chunk);
     // At 32 bits the extractor took the top 16 bits (`0x1234`/`0x5678`); at
     // 16 bits those sentinel left words have a zero low half, proving the
     // runtime slot width reached the extraction, not just the console.
@@ -245,14 +265,14 @@ fn ptt_gain_is_a_console_knob_over_a_dc_removed_amplifier() {
     let chunk = chunk_with_samples(&samples);
 
     // Default gain records the raw (DC-offset) samples unchanged.
-    assert_eq!(process_chunk(&store, &chunk), samples);
+    assert_eq!(process_chunk(&mut store, &chunk), samples);
 
     // `config set ptt_gain 4`: DC is subtracted first, then the deviation is
     // amplified x4. Mean is 1001, so deviations -1, +1, -3, +3 become -4, 4,
     // -12, 12 - the signal is amplified instead of the offset railing.
     store.set(GAIN_KEY, "4").expect("gain 4 is in range");
     assert_eq!(store.get(GAIN_KEY).as_deref(), Some("4"));
-    assert_eq!(process_chunk(&store, &chunk), [-4, 4, -12, 12]);
+    assert_eq!(process_chunk(&mut store, &chunk), [-4, 4, -12, 12]);
 
     // A gain outside the documented 1..=4096 is refused and does not stick.
     assert!(store.set(GAIN_KEY, "0").is_err());
@@ -261,14 +281,14 @@ fn ptt_gain_is_a_console_knob_over_a_dc_removed_amplifier() {
 
     // Back to 1: byte-for-byte identical to the un-gained capture again.
     store.set(GAIN_KEY, "1").expect("gain 1 is the no-op");
-    assert_eq!(process_chunk(&store, &chunk), samples);
+    assert_eq!(process_chunk(&mut store, &chunk), samples);
 
     // Saturation, not wrap: an extreme gain on a full-scale deviation clips
     // at the i16 rails (the mean of the alternating extremes is 0).
     store.set(GAIN_KEY, "4096").expect("gain 4096 is in range");
     let full_scale = chunk_with_samples(&[i16::MIN, i16::MAX, i16::MIN, i16::MAX]);
     assert_eq!(
-        process_chunk(&store, &full_scale),
+        process_chunk(&mut store, &full_scale),
         [i16::MIN, i16::MAX, i16::MIN, i16::MAX]
     );
 }
@@ -289,12 +309,12 @@ fn ptt_raw_gain_removes_dc_before_amplifying_and_leaves_slots_untouched() {
     // `ptt_raw` with no gain streams the unprocessed words exactly, so a
     // receiver gets the original bytes back.
     store.set(RAW_KEY, "1").expect("ptt_raw is 0/1");
-    assert_eq!(words_from_stream(&process_chunk(&store, &chunk)), chunk);
+    assert_eq!(words_from_stream(&process_chunk(&mut store, &chunk)), chunk);
 
     // With gain, the driven slots have their mean subtracted and are scaled
     // x16; the undriven slots keep their original bytes.
     store.set(GAIN_KEY, "16").expect("gain 16 is in range");
-    let gained = words_from_stream(&process_chunk(&store, &chunk));
+    let gained = words_from_stream(&process_chunk(&mut store, &chunk));
     assert_eq!(gained[0], 0); // mean-centred
     assert_eq!(gained[1], 0xDEAD_BEEF); // undriven slot untouched
     assert_eq!(gained[2], (2048i32 * 16) as u32);
@@ -326,9 +346,67 @@ fn config_remove_restores_the_default_for_the_next_recording() {
     store.remove(RAW_KEY);
     assert_eq!(store.settings(), MicSettings::default());
     assert_eq!(
-        process_chunk(&store, &chunk_with_samples(&[7, -7])),
+        process_chunk(&mut store, &chunk_with_samples(&[7, -7])),
         [7, -7]
     );
+}
+
+/// Regression for the console/store divergence: after `config rm` leaves a
+/// lone slot-width key whose pair is out of window, the console reports (and a
+/// recording uses) the default, so a later `config set ptt_rate` must not
+/// silently re-adopt the abandoned stored value.
+#[test]
+fn removed_pair_key_is_not_silently_re_adopted_by_a_later_set() {
+    let mut store = ConfigStore::default();
+
+    store.set(RATE_KEY, "32000").expect("legal");
+    store.set(BITS_KEY, "16").expect("legal");
+    assert_eq!(store.settings().bits, 16);
+
+    store.remove(RATE_KEY);
+
+    // `config get` must report the value the next recording would use: the
+    // out-of-window lone 16-bit key falls back to the default.
+    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+    assert_eq!(store.get(RATE_KEY).as_deref(), Some("16000"));
+    // ...and reconciliation must rewrite the stale stored key rather than just
+    // masking it, so the set below cannot re-adopt it.
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("32"));
+
+    store
+        .set(RATE_KEY, "32000")
+        .expect("32-bit @ 32 kHz is legal");
+    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+    let settings = store.settings();
+    assert_eq!(settings.bits, DEFAULT_BITS);
+    assert_eq!(settings.rate, 32_000);
+}
+
+/// The reporting invariant the captain's no-reflash loop relies on: every
+/// stored `ptt_*` key a `config get`/`config list` would print is exactly the
+/// value the next recording uses, even when the store started out stale with
+/// an out-of-window pair and a malformed value.
+#[test]
+fn store_reported_and_effective_values_agree_after_a_stale_store_is_reconciled() {
+    let mut store = ConfigStore::default();
+    // A store left stale (out-of-window lone slot width, malformed edge) as an
+    // older firmware or an interrupted probe could have left it.
+    store.entries.push((BITS_KEY.to_string(), "16".to_string()));
+    store
+        .entries
+        .push((EDGE_KEY.to_string(), "maybe".to_string()));
+
+    // Any mic resolution (get/list/recording) reconciles before reporting.
+    let settings = store.settings();
+    assert_eq!(settings, MicSettings::default());
+    for key in [BITS_KEY, RATE_KEY, EDGE_KEY, RAW_KEY, GAIN_KEY] {
+        if let Some(stored) = store.fetch(key) {
+            let effective = effective_setting(key, settings).unwrap();
+            assert_eq!(stored, effective, "{key}: stored and reported disagree");
+        }
+    }
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("32"));
+    assert_eq!(store.fetch(EDGE_KEY).as_deref(), Some("0"));
 }
 
 /// Prints a transcript of the captain's real workflow - `config set`, then
@@ -341,17 +419,17 @@ fn console_session_transcript_config_set_then_record() {
     let mut store = ConfigStore::default();
     let mut transcript = String::new();
 
-    fn show_get(store: &ConfigStore, key: &str, transcript: &mut String) {
+    fn show_get(store: &mut ConfigStore, key: &str, transcript: &mut String) {
         transcript.push_str(&format!(
             "$ config get {key}\n{}\n",
             store.get(key).unwrap_or_default()
         ));
     }
-    show_get(&store, BITS_KEY, &mut transcript);
-    show_get(&store, RATE_KEY, &mut transcript);
-    show_get(&store, EDGE_KEY, &mut transcript);
-    show_get(&store, RAW_KEY, &mut transcript);
-    show_get(&store, GAIN_KEY, &mut transcript);
+    show_get(&mut store, BITS_KEY, &mut transcript);
+    show_get(&mut store, RATE_KEY, &mut transcript);
+    show_get(&mut store, EDGE_KEY, &mut transcript);
+    show_get(&mut store, RAW_KEY, &mut transcript);
+    show_get(&mut store, GAIN_KEY, &mut transcript);
 
     // A value that would under-clock the mic is refused with the real message
     // the console prints, and is not stored.
@@ -375,7 +453,7 @@ fn console_session_transcript_config_set_then_record() {
         }
     }
     for key in [BITS_KEY, RATE_KEY, EDGE_KEY, GAIN_KEY] {
-        show_get(&store, key, &mut transcript);
+        show_get(&mut store, key, &mut transcript);
     }
 
     // Now "hold F1": the next recording resolves the stored settings, builds
@@ -383,7 +461,7 @@ fn console_session_transcript_config_set_then_record() {
     let settings = store.settings();
     let program = build_i2s_rx_program(settings.bits, settings.edge_flip);
     let chunk = chunk_with_low16_samples(&[1000, 1002, 998, 1004]);
-    let stream = process_chunk(&store, &chunk);
+    let stream = process_chunk(&mut store, &chunk);
 
     transcript.push_str(&format!(
         "--- hold F1: next recording ---\n\
