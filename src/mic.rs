@@ -102,6 +102,14 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
     let raw = config.fetch(RAW_KEY).await.ok().flatten();
     let gain = config.fetch(GAIN_KEY).await.ok().flatten();
+    // DIAGNOSTIC ONLY - DO NOT MERGE: report the raw stored ptt_* values and
+    // every reconcile write on the console, so it is directly observable
+    // whether a flash-store write actually fires on a near-default store at
+    // recording start. Revert before this ever touches the real PR.
+    print!(
+        "ptt-diag: stored bits={:?} rate={:?} edge={:?} raw={:?} gain={:?}\r\n",
+        bits, rate, edge, raw, gain
+    );
     let (resolved, fixes) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
@@ -109,9 +117,17 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
         raw.as_ref().map(|v| v.as_str()),
         gain.as_ref().map(|v| v.as_str()),
     );
+    if fixes.is_empty() {
+        print!("ptt-diag: no reconcile write this recording\r\n");
+    }
     for fix in &fixes {
         if let Ok(value) = TryInto::<StrValue>::try_into(fix.value.as_str()) {
-            let _ = config.store(fix.key, value).await;
+            match config.store(fix.key, value).await {
+                Ok(()) => print!("ptt-diag: reconcile WROTE {}={}\r\n", fix.key, fix.value),
+                Err(err) => {
+                    print!("ptt-diag: reconcile write {} failed: {:?}\r\n", fix.key, err)
+                }
+            }
         }
     }
     resolved
