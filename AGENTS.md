@@ -173,7 +173,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,
   `remove_dc_and_gain_words`/`remove_dc_and_gain_samples` (host-tested in `pcm_extract.rs`)
   subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating
-  arithmetic, in both paths. DC removal is essential because the SPH0645 sits on a large offset
+  arithmetic, in both paths. The raw-word path is slot-width aware: it sign-extends the configured
+  `bits`-wide field (its sign is at `bits - 1`, not 31) and clamps back into that field, so a
+  narrow `ptt_raw` slot cannot turn a negative sample into a large positive one. DC removal is
+  essential because the SPH0645 sits on a large offset
   (~-6113 in its 18-bit field on this hardware); multiplying the raw value directly would rail at
   any useful gain. `ptt_gain=1` is a byte-identical no-op. This knob is explicitly DIAGNOSTIC, not
   the production gain path: the SPH0645 is a fixed-sensitivity digital mic with no gain register

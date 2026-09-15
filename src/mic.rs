@@ -396,7 +396,7 @@ async fn capture_task(mut mic: Mic) {
                 // knob removes the driven slot's DC offset before amplifying,
                 // so it reveals signal rather than railing on the offset.
                 PTT_LEVEL.store(ac_rms_level_words(&raw, settings.bits), Ordering::Release);
-                remove_dc_and_gain_words(&mut raw, settings.gain);
+                remove_dc_and_gain_words(&mut raw, settings.bits, settings.gain);
                 PCM_RING.lock().await.write_u32_words(generation, &raw)
             } else {
                 // Keep only the even-indexed (left-slot) words and drop the

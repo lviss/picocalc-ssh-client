@@ -123,7 +123,7 @@ fn process_chunk(store: &mut ConfigStore, chunk: &[u32]) -> Vec<i16> {
 
     if settings.raw {
         let mut words = chunk.to_vec();
-        remove_dc_and_gain_words(&mut words, settings.gain);
+        remove_dc_and_gain_words(&mut words, settings.bits, settings.gain);
         words
             .iter()
             .flat_map(|w| [*w as u16 as i16, (*w >> 16) as u16 as i16])
@@ -320,6 +320,28 @@ fn ptt_raw_gain_removes_dc_before_amplifying_and_leaves_slots_untouched() {
     assert_eq!(gained[2], (2048i32 * 16) as u32);
     assert_eq!(gained[3], 0x1234_5678); // undriven slot untouched
     assert_eq!(gained[4], (-2048i32 * 16) as u32);
+}
+
+#[test]
+fn ptt_raw_narrow_slot_gain_uses_the_configured_field_width() {
+    let mut store = ConfigStore::default();
+    // The exact probe the finding calls out: a legal 16-bit slot at 32 kHz,
+    // raw passthrough, gain x2.
+    store.set(RATE_KEY, "32000").expect("legal");
+    store.set(BITS_KEY, "16").expect("16-bit @ 32 kHz is legal");
+    store.set(RAW_KEY, "1").expect("ptt_raw is 0/1");
+    store.set(GAIN_KEY, "2").expect("gain 2 is in range");
+
+    // A 16-bit slot delivers its samples zero-extended in the low 16 bits, so
+    // -100 arrives as 0x0000_FF9C with its sign at bit 15. The gain must centre
+    // on the field's true mean (133), not on the mean of the words' 32-bit
+    // interpretations (which would emit low halves of +21780 etc.).
+    let samples = [100i16, -100, 400];
+    let chunk = chunk_with_low16_samples(&samples);
+    let gained = words_from_stream(&process_chunk(&mut store, &chunk));
+    assert_eq!(gained[0] as u16 as i16, -66); // (100 - 133) * 2
+    assert_eq!(gained[2] as u16 as i16, -466); // (-100 - 133) * 2
+    assert_eq!(gained[4] as u16 as i16, 534); // (400 - 133) * 2
 }
 
 #[test]

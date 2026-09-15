@@ -92,6 +92,40 @@ pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
     }
 }
 
+/// Sign-extends the low `bits_per_channel_slot` bits of a captured slot word
+/// (the PIO leaves the slot's `bits`-wide two's-complement sample there, with
+/// its sign at bit `bits - 1`) to a signed value, so a narrow slot is
+/// interpreted at its true field width rather than as a full 32-bit word.
+fn slot_field_signed(word: u32, bits_per_channel_slot: u32) -> i32 {
+    if bits_per_channel_slot >= 32 {
+        word as i32
+    } else {
+        let shift = 32 - bits_per_channel_slot;
+        ((word << shift) as i32) >> shift
+    }
+}
+
+/// Signed range of a `bits_per_channel_slot`-wide two's-complement slot field.
+fn slot_field_range(bits_per_channel_slot: u32) -> (i64, i64) {
+    if bits_per_channel_slot >= 32 {
+        (i32::MIN as i64, i32::MAX as i64)
+    } else {
+        let half = 1i64 << (bits_per_channel_slot - 1);
+        (-half, half - 1)
+    }
+}
+
+/// Writes `value` back into `word`'s low `bits_per_channel_slot`-wide slot
+/// field, preserving any bits outside that field.
+fn write_slot_field(word: &mut u32, bits_per_channel_slot: u32, value: i32) {
+    if bits_per_channel_slot >= 32 {
+        *word = value as u32;
+    } else {
+        let mask = (1u32 << bits_per_channel_slot) - 1;
+        *word = (*word & !mask) | ((value as u32) & mask);
+    }
+}
+
 /// Removes the DC component from the driven (even-indexed/left-slot) raw I2S
 /// FIFO words, then applies a capture-time digital gain in place.
 ///
@@ -99,29 +133,35 @@ pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
 /// experiment. Subtracting the per-chunk mean *first* is essential: the
 /// SPH0645 sits on a large DC offset (~-6113 in its 18-bit field on the
 /// captain's hardware), so multiplying the raw value by any useful gain would
-/// rail immediately and reveal nothing. Each word is treated as a signed
-/// 32-bit sample, amplified with saturating arithmetic (so a large gain clips
-/// instead of wrapping into nonsense), and the undriven (odd-indexed/right-slot)
+/// rail immediately and reveal nothing. Each driven word's
+/// `bits_per_channel_slot`-wide field is sign-extended (its sign bit is at
+/// `bits_per_channel_slot - 1`, not 31, for a narrow slot), amplified with
+/// saturating arithmetic clamped to that field's range, and written back into
+/// that same field, so the scaled raw payload is the scaled version of the
+/// sample the PCM path would extract. The undriven (odd-indexed/right-slot)
 /// words are left untouched. A gain of `1` (the default) returns immediately,
 /// leaving every word byte-for-byte identical to the un-gained capture.
-pub fn remove_dc_and_gain_words(raw: &mut [u32], gain: u32) {
+pub fn remove_dc_and_gain_words(raw: &mut [u32], bits_per_channel_slot: u32, gain: u32) {
     if gain <= 1 {
         return;
     }
-    let gain = gain.min(i32::MAX as u32) as i32;
+    let bits = bits_per_channel_slot.clamp(1, 32);
+    let gain = gain.min(i32::MAX as u32) as i64;
     let mut sum: i64 = 0;
     let mut count: i64 = 0;
     for word in raw.iter().step_by(2) {
-        sum += *word as i32 as i64;
+        sum += slot_field_signed(*word, bits) as i64;
         count += 1;
     }
     if count == 0 {
         return;
     }
-    let mean = (sum / count) as i32;
+    let mean = sum / count;
+    let (min, max) = slot_field_range(bits);
     for word in raw.iter_mut().step_by(2) {
-        let ac = (*word as i32).saturating_sub(mean);
-        *word = ac.saturating_mul(gain) as u32;
+        let ac = slot_field_signed(*word, bits) as i64 - mean;
+        let scaled = ac.saturating_mul(gain).clamp(min, max) as i32;
+        write_slot_field(word, bits, scaled);
     }
 }
 
@@ -330,7 +370,7 @@ mod tests {
     fn gain_of_one_is_a_byte_for_byte_no_op_on_words() {
         let mut raw = [0xDEAD_BEEFu32, 0x0000_0000, 0x7FFF_FFFF];
         let original = raw;
-        remove_dc_and_gain_words(&mut raw, 1);
+        remove_dc_and_gain_words(&mut raw, 32, 1);
         assert_eq!(raw, original);
     }
 
@@ -346,7 +386,7 @@ mod tests {
             0x0000_0000,
             0xFFFF_E800u32,
         ];
-        remove_dc_and_gain_words(&mut raw, 16);
+        remove_dc_and_gain_words(&mut raw, 32, 16);
         assert_eq!(raw[0], 0);
         assert_eq!(raw[1], 0); // undriven slot untouched
         assert_eq!(raw[2], (2048i32 * 16) as u32);
@@ -360,10 +400,45 @@ mod tests {
         // from its extreme and must clamp, not wrap into a plausible-looking
         // but nonsense value. The undriven slot is untouched.
         let mut raw = [0x7FFF_FFFFu32, 0x0000_0000, 0x8000_0000u32];
-        remove_dc_and_gain_words(&mut raw, 4096);
+        remove_dc_and_gain_words(&mut raw, 32, 4096);
         assert_eq!(raw[0], i32::MAX as u32);
         assert_eq!(raw[1], 0);
         assert_eq!(raw[2], i32::MIN as u32);
+    }
+
+    #[test]
+    fn words_gain_sign_extends_the_configured_slot_width() {
+        // A 16-bit slot leaves its sample zero-extended in the low 16 bits, so
+        // the sign bit is bit 15, not bit 31. +100/-100/+400 must be centred
+        // and scaled around the field's true mean (133) - treating 0xFF9C as
+        // +65436 would centre on 21978 and produce a completely different
+        // payload.
+        let mut raw = [
+            0x0000_0064u32, // +100
+            0xFFFF_FFFFu32, // undriven sentinel
+            0x0000_FF9Cu32, // -100
+            0xFFFF_FFFFu32,
+            0x0000_0190u32, // +400
+        ];
+        remove_dc_and_gain_words(&mut raw, 16, 2);
+        assert_eq!(raw[0] as u16 as i16, -66); // (100 - 133) * 2
+        assert_eq!(raw[2] as u16 as i16, -466); // (-100 - 133) * 2
+        assert_eq!(raw[4] as u16 as i16, 534); // (400 - 133) * 2
+        // The undriven slots keep their original bytes.
+        assert_eq!(raw[1], 0xFFFF_FFFF);
+        assert_eq!(raw[3], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn words_gain_clamps_to_the_narrow_field_range_instead_of_wrapping() {
+        // At the i16 extremes with x2 the mean is 0, so doubling each sample
+        // would overflow the 16-bit field; it must clamp to the field's rails
+        // rather than wrap (0x7FFE * 2 masked would read -2).
+        let mut raw = [0x0000_7FFFu32, 0x0000_0000, 0x0000_8000u32];
+        remove_dc_and_gain_words(&mut raw, 16, 2);
+        assert_eq!(raw[0] as u16 as i16, i16::MAX);
+        assert_eq!(raw[1], 0);
+        assert_eq!(raw[2] as u16 as i16, i16::MIN);
     }
 
     #[test]
