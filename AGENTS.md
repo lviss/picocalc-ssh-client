@@ -232,13 +232,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   audio fix.
   The earlier "the mic appears to be converting" correction was itself too generous: the
   "~-35 dBFS RMS after DC removal" figure it rested on is glitch-dominated (that chunk-wide
-  statistic is ~91% the per-chunk glitch above), and re-analysis of the same capture with the
-  glitch excluded puts the windowed level at zero for essentially every chunk (the original
-  analysis put it at 874/874), so signal presence in that capture is UNPROVEN. Do not claim
-  working audio anywhere until one fresh capture containing deliberate speech or clapping,
-  analysed with the glitch-excluded windowed level, demonstrates it; judge audio quality from
-  such a deliberate capture converted with the `raw-to-wav.pl` helper (outside this repo), not
-  from offline statistics. An
+  statistic is ~91% the per-chunk glitch above), and re-analysis of `/ai/ptt-test-4.raw` with the
+  glitch excluded puts the windowed level at zero for essentially every chunk (874/874) - that
+  capture is a flat/silent negative control, not evidence of signal on its own. The decisive test
+  this called for - one fresh capture containing deliberate speech, analysed with the
+  glitch-excluded windowed level - has since been passed: the four real captures used to
+  calibrate `LEVEL_METER_FULL_SCALE` above are independently verified transcribable by both
+  openai-whisper and whisper.cpp, so the mic's audio path is proven to carry real speech for
+  those captures. The per-chunk capture glitch above remains a separate, still-open firmware
+  defect, unaffected by this. An
   earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
