@@ -125,7 +125,12 @@ class Transcript(unittest.TestCase):
 
 
 class FakeCommands:
-    """A temp directory holding fake ``whisper``/``tmux`` commands on PATH."""
+    """A temp directory holding fake ``whisper``/``tmux`` commands on PATH.
+
+    The tmux-related environment is scrubbed on entry so that whatever tmux
+    server the machine running the tests happens to have cannot influence them:
+    the helper's socket auto-detection then only ever sees these temp paths.
+    """
 
     def __init__(self, test_case):
         self.tmp = tempfile.TemporaryDirectory()
@@ -133,6 +138,8 @@ class FakeCommands:
         self.bin = self.dir / "bin"
         self.bin.mkdir()
         self.log = self.dir / "calls.log"
+        self.tmux_base = self.dir / "tmux-base"
+        self.tmux_base.mkdir()
         self.test_case = test_case
 
     def add(self, name, body):
@@ -141,18 +148,51 @@ class FakeCommands:
         path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return path
 
-    def calls(self):
+    def add_socket_aware_tmux(self, expected_socket):
+        """A fake tmux that answers only for ``expected_socket`` (or, with
+        ``expected_socket=""``, only when called without ``-S``) and logs every
+        invocation - a tmux server that exists on one socket and nowhere else.
+        """
+        self.add(
+            "tmux",
+            f'echo "$@" >> {self.log}\n'
+            "socket=\n"
+            'if [ "$1" = "-S" ]; then socket="$2"; shift 2; fi\n'
+            f'if [ -n "{expected_socket}" ] && [ "$socket" = "{expected_socket}" ]; then exit 0; fi\n'
+            f'if [ -z "{expected_socket}" ] && [ -z "$socket" ]; then exit 0; fi\n'
+            'echo "error connecting to $socket (No such file or directory)" >&2\n'
+            "exit 1\n",
+        )
+
+    def calls(self, include_probe=False):
+        """Every tmux invocation the helper made. The startup socket probe
+        (`list-sessions`) is left out unless asked for: it has its own test, and
+        including it everywhere only obscures the calls a test is about."""
         if not self.log.exists():
             return []
-        return self.log.read_text().splitlines()
+        lines = self.log.read_text().splitlines()
+        if include_probe:
+            return lines
+        return [line for line in lines if "list-sessions" not in line]
 
     def __enter__(self):
-        self.old_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{self.bin}{os.pathsep}{self.old_path}"
+        self.saved = {
+            name: os.environ.get(name)
+            for name in ("PATH", "TMUX", "TMUX_TMPDIR", "TMPDIR", "XDG_RUNTIME_DIR")
+        }
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{self.saved['PATH'] or ''}"
+        os.environ.pop("TMUX", None)
+        os.environ["TMUX_TMPDIR"] = str(self.tmux_base)
+        os.environ.pop("TMPDIR", None)
+        os.environ.pop("XDG_RUNTIME_DIR", None)
         return self
 
     def __exit__(self, *exc):
-        os.environ["PATH"] = self.old_path
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         self.tmp.cleanup()
         return False
 
@@ -200,7 +240,182 @@ class EndToEnd(unittest.TestCase):
                     "send-keys -t work -l -- hello world ",
                 ],
             )
+            # The socket probe runs once, at startup.
+            probes = [
+                line for line in fake.calls(include_probe=True) if "list-sessions" in line
+            ]
+            self.assertEqual(len(probes), 1)
             self.assertIn("typed 11 characters", stderr)
+
+    def test_a_configured_socket_is_passed_to_every_tmux_call(self):
+        # The captain's hardware finding: the SSH channel has no TMUX_TMPDIR,
+        # so a tmux server on a non-default socket needs `tmux -S <path>`.
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            fake.add("tmux", f'echo "$@" >> {fake.log}\n')
+            rc, _ = run_main(
+                [
+                    "--whisper",
+                    "whisper-fake",
+                    "--tmux-socket",
+                    "/run/user/1003/tmux-1003/default",
+                    "--enter",
+                ],
+                frame(samples([1])) + END,
+                fake,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                fake.calls(),
+                [
+                    "-S /run/user/1003/tmux-1003/default send-keys -l -- hi ",
+                    "-S /run/user/1003/tmux-1003/default send-keys Enter",
+                ],
+            )
+            self.assertEqual(
+                fake.calls(include_probe=True)[0],
+                "-S /run/user/1003/tmux-1003/default list-sessions",
+            )
+
+    def test_an_unreachable_socket_names_it_and_how_to_fix_it(self):
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            # A tmux that fails exactly the way a wrong socket does.
+            fake.add(
+                "tmux",
+                'echo "error connecting to $2 (No such file or directory)" >&2\n'
+                "exit 1\n",
+            )
+            rc, stderr = run_main(
+                ["--whisper", "whisper-fake", "--tmux-socket", "/nope/default"],
+                frame(samples([1])) + END,
+                fake,
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("warning: tmux list-sessions failed", stderr)
+            self.assertIn("tmux send-keys failed", stderr)
+            self.assertIn("[socket /nope/default]", stderr)
+            self.assertIn("tmux_socket = <path>", stderr)
+
+    def test_a_socket_under_xdg_runtime_dir_is_found_automatically(self):
+        # The hardware finding: the login's tmux lives under the systemd
+        # runtime directory, which the SSH channel's own environment does not
+        # have to mention. Firstmate's suggested preference, made safe by
+        # asking tmux itself whether a server is there before using it.
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            xdg = fake.dir / "xdg"
+            xdg.mkdir()
+            expected = str(xdg / f"tmux-{os.getuid()}" / "default")
+            fake.add_socket_aware_tmux(expected)
+            rc, stderr = run_main(
+                ["--whisper", "whisper-fake", "--tmux-target", "work"],
+                frame(samples([1])) + END,
+                fake,
+                env={"XDG_RUNTIME_DIR": str(xdg)},
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn(f"using tmux socket {expected}", stderr)
+            self.assertEqual(fake.calls(), [f"-S {expected} send-keys -t work -l -- hi "])
+
+    def test_a_socket_under_tmux_tmpdir_is_found_automatically(self):
+        # The captain's immediate workaround shape: a server whose socket is at
+        # $TMUX_TMPDIR/tmux-<uid>/default. Because that is what a tmux without
+        # `-S` uses too, no socket argument is needed once it is reachable.
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            base = fake.dir / "runtime"
+            base.mkdir()
+            expected = str(base / f"tmux-{os.getuid()}" / "default")
+            fake.add_socket_aware_tmux(expected)
+            rc, stderr = run_main(
+                ["--whisper", "whisper-fake", "--tmux-target", "work"],
+                frame(samples([1])) + END,
+                fake,
+                env={"TMUX_TMPDIR": str(base)},
+            )
+            self.assertEqual(rc, 0)
+            self.assertNotIn("no tmux server answered", stderr)
+            self.assertNotIn("using tmux socket", stderr)
+            self.assertEqual(fake.calls(), ["send-keys -t work -l -- hi "])
+
+    def test_the_tmux_environment_is_forwarded_to_the_child(self):
+        # tmux itself finds a socket under $TMUX_TMPDIR that the helper only has
+        # because the SSH exec environment passed it through.
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            fake.add("tmux", f'echo "env=$TMUX_TMPDIR $@ " >> {fake.log}\n')
+            rc, _ = run_main(
+                ["--whisper", "whisper-fake", "--tmux-target", "work"],
+                frame(samples([1])) + END,
+                fake,
+                env={"TMUX_TMPDIR": "/run/user/1003"},
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("env=/run/user/1003 ", fake.calls()[0])
+            self.assertIn("send-keys -t work -l -- hi", fake.calls()[0])
+
+    def test_nothing_answering_lists_the_candidates_and_the_fix(self):
+        with FakeCommands(self) as fake:
+            fake.add("whisper-fake", 'echo "hi"\n')
+            fake.add("tmux", 'echo "no server" >&2\nexit 1\n')
+            xdg = fake.dir / "xdg"
+            xdg.mkdir()
+            rc, stderr = run_main(
+                ["--whisper", "whisper-fake"],
+                frame(samples([1])) + END,
+                fake,
+                env={"XDG_RUNTIME_DIR": str(xdg)},
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("warning: no tmux server answered on", stderr)
+            self.assertIn(str(xdg / f"tmux-{os.getuid()}" / "default"), stderr)
+            self.assertIn("tmux_socket = <path>", stderr)
+
+    def test_socket_candidates_order(self):
+        config = ptt.Config({**ptt.DEFAULTS, "whisper": "w"}, None)
+        old = {name: os.environ.get(name) for name in ("TMUX", "TMUX_TMPDIR", "TMPDIR", "XDG_RUNTIME_DIR")}
+        os.environ["TMUX"] = "/run/tmux/current,123,0"
+        os.environ["TMUX_TMPDIR"] = "/run/user/1003"
+        os.environ["XDG_RUNTIME_DIR"] = "/run/user/1003"
+        os.environ.pop("TMPDIR", None)
+        try:
+            self.assertEqual(
+                ptt.socket_candidates(config),
+                [
+                    "/run/tmux/current",
+                    f"/run/user/1003/tmux-{os.getuid()}/default",
+                    f"{tempfile.gettempdir()}/tmux-{os.getuid()}/default",
+                ],
+            )
+            configured = ptt.Config(
+                {**ptt.DEFAULTS, "whisper": "w", "tmux_socket": "/a/sock"}, None
+            )
+            self.assertEqual(ptt.socket_candidates(configured), ["/a/sock"])
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_the_default_socket_matches_tmux_rules(self):
+        self.assertEqual(
+            ptt.default_tmux_socket(),
+            Path(tempfile.gettempdir()) / f"tmux-{os.getuid()}" / "default",
+        )
+        old = os.environ.get("TMUX_TMPDIR")
+        os.environ["TMUX_TMPDIR"] = "/run/user/base"
+        try:
+            self.assertEqual(
+                ptt.default_tmux_socket(),
+                Path("/run/user/base") / f"tmux-{os.getuid()}" / "default",
+            )
+        finally:
+            if old is None:
+                del os.environ["TMUX_TMPDIR"]
+            else:
+                os.environ["TMUX_TMPDIR"] = old
 
     def test_enter_flag_presses_enter_after_typing(self):
         with FakeCommands(self) as fake:
@@ -325,6 +540,7 @@ class ConfigPrecedence(unittest.TestCase):
                 "# a comment\n"
                 "whisper = from-file\n"
                 "tmux_target = file-target\n"
+                "tmux_socket = /file/socket\n"
                 "enter = yes\n"
                 "rate = 8000\n"
                 "bogus = ignored\n"
@@ -337,6 +553,7 @@ class ConfigPrecedence(unittest.TestCase):
                 resolved = ptt.resolve_config(args)
             self.assertEqual(resolved.whisper, "from-file")
             self.assertEqual(resolved.tmux_target, "flag-target")
+            self.assertEqual(resolved.tmux_socket, "/file/socket")
             self.assertTrue(resolved.enter)
             self.assertEqual(resolved.rate, 8000)
             self.assertEqual(resolved.timeout, ptt.DEFAULT_TIMEOUT)
@@ -344,14 +561,17 @@ class ConfigPrecedence(unittest.TestCase):
             self.assertIn("bogus", stderr.getvalue())
 
             os.environ["PICOCALC_PTT_WHISPER"] = "from-env"
+            os.environ["PICOCALC_PTT_TMUX_SOCKET"] = "/env/socket"
             try:
                 args = ptt.build_parser().parse_args(["--config", str(config)])
                 with contextlib.redirect_stderr(io.StringIO()):
                     resolved = ptt.resolve_config(args)
                 self.assertEqual(resolved.whisper, "from-env")
                 self.assertEqual(resolved.tmux_target, "file-target")
+                self.assertEqual(resolved.tmux_socket, "/env/socket")
             finally:
                 del os.environ["PICOCALC_PTT_WHISPER"]
+                del os.environ["PICOCALC_PTT_TMUX_SOCKET"]
 
 
 if __name__ == "__main__":

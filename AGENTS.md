@@ -337,7 +337,29 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `python3 tools/test_picocalc_ptt.py`; nothing else in the repo is Python). Its protocol is
   documented in that file's docstring and in `terminal_model/src/ptt_frame.rs`; one helper process
   runs per SSH session and transcribes each utterance on the device's zero-length end marker,
-  typing the text into tmux (`tmux send-keys -l`).
+  typing the text into tmux (`tmux send-keys -l`). The tmux hand-off is the one part of the chain
+  whose environment the SSH channel does not share with the interactive login: the exec'd helper
+  has no `TMUX`/`TMUX_TMPDIR` from the login, so a server started under a non-default socket
+  directory (the systemd runtime dir, e.g. `/run/user/1003/tmux-1003/default`, is the common case;
+  tmux 3.6a derives `<base>/tmux-<uid>/default` from `TMUX_TMPDIR` then `TMPDIR` then `/tmp`, and
+  ignores `XDG_RUNTIME_DIR` itself) is invisible to a bare `tmux` call - the captain hit exactly
+  this, with `tmux send-keys failed: error connecting to /tmp/tmux-1003/default`. The helper now
+  probes the candidates (`$TMUX`, then each of `TMUX_TMPDIR`/`TMPDIR`/`XDG_RUNTIME_DIR`/`/tmp` as
+  a base) with `tmux -S <path> list-sessions` at startup, uses the first that answers (passing no
+  `-S` when that is tmux's own default), takes an explicit `tmux_socket`/`--tmux-socket`/
+  `$PICOCALC_PTT_TMUX_SOCKET` over all of it, and reports the socket it tried plus the
+  `tmux display-message -p '#{socket_path}'` hint whenever a tmux call fails. `tools/test_picocalc_ptt.py`
+  covers all three paths, and its `FakeCommands` scrubs the tmux environment so the machine running
+  the tests cannot influence them. The device-side half of setting this up has its own sharp edges
+  worth telling anyone who documents it: `config get ptt_ssh_cmd` is the authoritative readout
+  (`src/config.rs` special-cases it to print the effective command, or `(disabled)` for an empty
+  stored value), while `config list` only dumps the stored 32-entry map and never resolves this key,
+  so it does not appear there at all at its default; the command is read **once per SSH session**
+  (`effective_ssh_audio_command` at session start), so a change needs a reconnect; `src/process.rs`
+  splits the console line on single spaces with no quote handling, so the value is set unquoted
+  (`config set ptt_ssh_cmd TMUX_TMPDIR=/run/user/1003 picocalc-ptt`) and quote characters would be
+  stored literally and break the remote shell; and stored values are `FixedString<128>`
+  (`src/config.rs`).
   Two sunset (the SSH stack) sharp edges shaped that design and must stay in mind for any future
   channel work: (1) `Channels::open` only reuses a slot that is `None`, and nothing frees a
   client-side channel slot after `channel_done`, so with `MAX_CHANNELS = 4` a client can open only

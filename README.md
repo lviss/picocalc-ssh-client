@@ -370,6 +370,7 @@ whisper = whisper-cli -m ~/models/ggml-base.en.bin -f %wav -nt -np
 # or, with openai-whisper:
 # whisper = whisper %wav --model base --output_format txt --output_dir %dir
 tmux_target = work     # optional; default is tmux's most recently used session
+tmux_socket = /run/user/1000/tmux-1000/default   # only if tmux's own socket is not found
 enter = no             # yes to also press Enter after typing
 ```
 
@@ -380,14 +381,38 @@ whisper.cpp's `-of` and openai-whisper's `--output_dir` write. The text is then
 typed into the target pane literally, with a trailing space (so consecutive
 dictations do not run together) and no newlines.
 
-Then hold `F1` and speak. The device runs `picocalc-ptt` as-is, so a different
-path or extra options go in `ptt_ssh_cmd`:
+The helper talks to tmux on its own default socket, and finds one started
+under a different `TMUX_TMPDIR` (the systemd runtime directory, for instance)
+by trying the usual places at startup. If it cannot reach your session it says
+so on the device, naming the socket it tried: configure `tmux_socket` with the
+path from `tmux display-message -p '#{socket_path}'` run inside your session, or
+put `TMUX_TMPDIR=<its base directory>` in `ptt_ssh_cmd`:
 
 ```bash
-$ config set ptt_ssh_cmd "/home/me/bin/picocalc-ptt --tmux-target work"
-$ config get ptt_ssh_cmd        # what the next session will run
+$ config set ptt_ssh_cmd TMUX_TMPDIR=/run/user/1003 picocalc-ptt
+```
+
+The device's own command line is split on single spaces and has no quote
+handling, so `ptt_ssh_cmd` is set **unquoted**, word by word, and the value
+may be at most 128 bytes: quote characters would be stored literally and then
+reach the remote shell as literal quotes.
+
+Then hold `F1` and speak. The device runs `picocalc-ptt` as-is, so a different
+path or extra options go in `ptt_ssh_cmd` - again unquoted:
+
+```bash
+$ config set ptt_ssh_cmd /home/me/bin/picocalc-ptt --tmux-target work
+$ config get ptt_ssh_cmd        # the command the next session will run
 $ config set ptt_ssh_cmd ""     # empty disables it: use the raw TCP host instead
 ```
+
+`config get ptt_ssh_cmd` is the authoritative readout: it prints the command
+the *next* SSH session will run, defaulting to `picocalc-ptt`, or `(disabled)`
+when the stored value is empty. `config list` only dumps the stored keys (a
+32-entry map) without resolving this one, so `ptt_ssh_cmd` is absent from it
+until it has actually been set. The command is resolved once, when a session
+starts, so changing `ptt_ssh_cmd` does not affect a session that is already
+connected - log out and reconnect (or reboot) before testing a new value.
 
 If the helper cannot be started or it exits, the device reports why on screen
 (its stderr is shown) and falls back to the raw TCP host for the rest of that

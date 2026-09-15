@@ -20,19 +20,33 @@ Protocol (authoritative encoder: ``terminal_model/src/ptt_frame.rs``):
   so an abruptly dropped session still delivers the words that made it, and
   then the helper exits.
 
-One helper process runs per SSH session for as long as that session lasts.
+One helper process runs per SSH session for as long as that session lasts. The
+device resolves the command it execs (``ptt_ssh_cmd``) once, when the session
+starts, and its console splits that setting on single spaces with no quote
+handling - so extra options are configured unquoted and word by word, with the
+whole value capped at 128 bytes.
 
 Configuration, in increasing priority: this file's defaults, a config file
 (``--config``, else ``$PICOCALC_PTT_CONFIG``, else
 ``$XDG_CONFIG_HOME/picocalc-ptt.conf`` or ``~/.config/picocalc-ptt.conf``),
-environment variables, then command-line flags. The config file is
-``key = value`` lines with ``#`` comments, using the long option names
-(``whisper``, ``tmux_target``, ``enter``, ``rate``, ``timeout``, ``log``)::
+environment variables, then command-line flags. The config file is ``key = value``
+lines with ``#`` comments, using the long option names
+(``whisper``, ``tmux_target``, ``tmux_socket``, ``enter``, ``rate``,
+``timeout``, ``log``)::
 
     # ~/.config/picocalc-ptt.conf
     whisper = whisper-cli -m ~/models/ggml-base.en.bin -f %wav -nt -np
     tmux_target = work
+    tmux_socket = /run/user/1000/tmux-1000/default
     enter = no
+
+The tmux calls run with tmux's own default socket unless ``tmux_socket`` (or
+``--tmux-socket``, or ``$PICOCALC_PTT_TMUX_SOCKET``) names one, in which case
+they use ``tmux -S <path>``. This session's SSH channel does *not* inherit the
+interactive login's ``TMUX``/``TMUX_TMPDIR``, so a tmux server started with a
+non-default socket directory is invisible to it: run ``tmux display-message -p
+'#{socket_path}'`` inside your session to see the socket path to configure.
+``TMUX_TMPDIR`` set in this process's environment is honoured by tmux itself.
 
 The whisper command is run through ``/bin/sh`` with ``%wav`` replaced by the
 capture's WAV path and ``%dir`` by the private working directory. If it has no
@@ -76,6 +90,7 @@ MAX_UTTERANCE_SECONDS = 90.0
 DEFAULTS = {
     "whisper": None,
     "tmux_target": None,
+    "tmux_socket": None,
     "enter": False,
     "rate": DEFAULT_RATE,
     "timeout": DEFAULT_TIMEOUT,
@@ -84,6 +99,7 @@ DEFAULTS = {
 ENV_KEYS = {
     "whisper": "PICOCALC_PTT_WHISPER",
     "tmux_target": "PICOCALC_PTT_TMUX",
+    "tmux_socket": "PICOCALC_PTT_TMUX_SOCKET",
     "enter": "PICOCALC_PTT_ENTER",
     "rate": "PICOCALC_PTT_RATE",
     "timeout": "PICOCALC_PTT_TIMEOUT",
@@ -97,6 +113,11 @@ class Config:
     def __init__(self, values: dict, log_path):
         self.whisper = values["whisper"]
         self.tmux_target = values["tmux_target"]
+        # As configured (`tmux_socket`/`--tmux-socket`/env), and as resolved at
+        # startup by `start_tmux` (which may find the server on another
+        # socket); "" means "let tmux use its own default".
+        self.tmux_socket = values["tmux_socket"]
+        self.tmux_socket_used = ""
         self.enter = bool(values["enter"])
         self.rate = int(values["rate"])
         self.timeout = float(values["timeout"])
@@ -274,6 +295,127 @@ def normalise_transcript(text: str) -> str:
     return " ".join(text.split())
 
 
+def default_tmux_socket() -> Path:
+    """Where tmux looks for its socket when it is not given ``-S``:
+    ``$TMUX_TMPDIR/tmux-<uid>/default``, falling back to ``$TMPDIR`` and then
+    ``/tmp`` for the base directory, exactly as tmux(1) does (verified against
+    tmux 3.6a). Used to report which socket the helper tried when tmux cannot
+    connect, and as the last auto-detection candidate.
+    """
+    base = os.environ.get("TMUX_TMPDIR") or tempfile.gettempdir()
+    return Path(base) / f"tmux-{os.getuid()}" / "default"
+
+
+def socket_candidates(config: Config) -> list:
+    """Socket paths the tmux server could be on, most specific first.
+
+    tmux derives its own socket from ``$TMUX_TMPDIR``/``$TMPDIR``/``/tmp``, none
+    of which this SSH channel necessarily shares with the interactive login -
+    a server started from a login whose ``TMUX_TMPDIR`` was the systemd runtime
+    directory is the case that prompted this. So the candidates are the session
+    tmux is actually in (``$TMUX``), then each base directory tmux could have
+    been given, then tmux's own default.
+    """
+    if config.tmux_socket:
+        return [config.tmux_socket]
+    candidates = []
+    session = os.environ.get("TMUX")
+    if session:
+        # TMUX is "<socket path>,<server pid>,<session id>".
+        candidates.append(session.split(",", 1)[0])
+    bases = []
+    for name in ("TMUX_TMPDIR", "TMPDIR", "XDG_RUNTIME_DIR"):
+        base = os.environ.get(name)
+        if base and base not in bases:
+            bases.append(base)
+    bases.append(tempfile.gettempdir())
+    for base in bases:
+        candidate = str(Path(base) / f"tmux-{os.getuid()}" / "default")
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def tmux_socket(config: Config) -> str:
+    """The socket path a tmux failure should be reported against: the resolved
+    one, the configured one, or tmux's own default.
+    """
+    return (
+        config.tmux_socket_used
+        or config.tmux_socket
+        or str(default_tmux_socket())
+    )
+
+
+def socket_hint() -> str:
+    """What to tell a user whose tmux socket could not be reached."""
+    return (
+        f"set `tmux_socket = <path>` in ~/.config/{PROGRAM}.conf (the path is "
+        "`tmux display-message -p '#{socket_path}'` inside your session), or "
+        "set TMUX_TMPDIR"
+    )
+
+
+def run_tmux(config: Config, args: list, what: str):
+    """Run one tmux command, returning ``(ok, message)``. The message on
+    failure names the socket that was tried and what to do about it.
+    """
+    command = ["tmux"]
+    if config.tmux_socket_used:
+        command += ["-S", config.tmux_socket_used]
+    command += args
+    try:
+        done = subprocess.run(command, capture_output=True)
+    except OSError as err:
+        return False, f"{what} failed: {err}"
+    if done.returncode == 0:
+        return True, ""
+    detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
+    reason = detail[-1] if detail else f"exit {done.returncode}"
+    return False, (
+        f"{what} failed: {reason} [socket {tmux_socket(config)}] - {socket_hint()}"
+    )
+
+
+def start_tmux(config: Config) -> None:
+    """Resolve and check the tmux socket once at startup, so a wrong one is
+    reported as a warning before a recording is transcribed and thrown away.
+
+    An explicitly configured socket is used as given. Otherwise the candidates
+    tmux itself could have used are probed in turn and the first socket a server
+    actually answers on wins, so a server under a non-default ``TMUX_TMPDIR``
+    (the systemd runtime directory, typically) is found without configuration.
+    """
+    if shutil.which("tmux") is None:
+        config.log("warning: tmux is not installed on this server")
+        return
+    if config.tmux_socket:
+        config.tmux_socket_used = config.tmux_socket
+        ok, message = run_tmux(config, ["list-sessions"], "tmux list-sessions")
+        if not ok:
+            config.log(f"warning: {message}")
+        return
+    candidates = socket_candidates(config)
+    for candidate in candidates:
+        command = ["tmux", "-S", candidate, "list-sessions"]
+        try:
+            answered = subprocess.run(command, capture_output=True).returncode == 0
+        except OSError:
+            answered = False
+        if answered:
+            # Only a socket tmux would not have found on its own is worth
+            # passing: the default keeps the plain, unqualified `tmux` calls.
+            if Path(candidate) != default_tmux_socket():
+                config.tmux_socket_used = candidate
+                config.log(f"using tmux socket {candidate}")
+            return
+    config.log(
+        "warning: no tmux server answered on "
+        + ", ".join(candidates)
+        + f" - {socket_hint()}"
+    )
+
+
 def type_into_tmux(config: Config, text: str) -> bool:
     if shutil.which("tmux") is None:
         config.log("tmux is not installed on this server")
@@ -282,21 +424,23 @@ def type_into_tmux(config: Config, text: str) -> bool:
     # separate words instead of running together. Leading dashes are safe
     # because `--` ends tmux's option parsing, and `-l` sends the text
     # literally rather than interpreting key names.
-    args = ["tmux", "send-keys"]
+    args = ["send-keys"]
     if config.tmux_target:
         args += ["-t", config.tmux_target]
     args += ["-l", "--", text + " "]
-    done = subprocess.run(args, capture_output=True)
-    if done.returncode != 0:
-        detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
-        config.log(f"tmux send-keys failed: {detail[-1] if detail else done.returncode}")
+    ok, message = run_tmux(config, args, "tmux send-keys")
+    if not ok:
+        config.log(message)
         return False
     if config.enter:
-        enter_args = ["tmux", "send-keys"]
+        enter_args = ["send-keys"]
         if config.tmux_target:
             enter_args += ["-t", config.tmux_target]
         enter_args += ["Enter"]
-        subprocess.run(enter_args, capture_output=True)
+        ok, message = run_tmux(config, enter_args, "tmux send-keys Enter")
+        if not ok:
+            config.log(message)
+            return False
     return True
 
 
@@ -351,6 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
         "the most recently used session)",
     )
     parser.add_argument(
+        "--tmux-socket",
+        metavar="PATH",
+        help="tmux server socket, used as `tmux -S PATH` (default: tmux's own "
+        "socket, e.g. $TMUX_TMPDIR/tmux-$(id -u)/default; see "
+        "`tmux display-message -p '#{socket_path}'` inside your session)",
+    )
+    parser.add_argument(
         "--enter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -390,6 +541,7 @@ def main(argv=None, stdin=None) -> int:
     stream = stdin if stdin is not None else sys.stdin.buffer
     limit = int(MAX_UTTERANCE_SECONDS * config.rate) * 2
     config.log(f"listening at {config.rate} Hz, whisper `{config.whisper}`")
+    start_tmux(config)
     for audio in read_utterances(stream, limit, config.log):
         transcribe_utterance(config, audio, args.save_audio)
     config.log("session ended")
