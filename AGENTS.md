@@ -218,6 +218,16 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   mismatch, not the underlying statistic, is why the meter looked dead on real hardware despite
   carrying real, transcribable audio. Re-derive the constant (see the doc comment on
   `LEVEL_METER_FULL_SCALE`) if the windowed-median formula in `pcm_extract.rs` ever changes.
+  The meter is computed on `ptt_upload_task` from the chunks it has already drained from the
+  ring (`mic::meter_level`), NOT in `capture_task`: the PIO RX FIFO is only 4 words deep
+  (`pico-sdk` `hardware/pio.h`; ~125 us of slack at 32 k words/s), so *any* per-chunk work added
+  between DMA pulls can starve the FIFO and silence capture. That was a hardware-confirmed
+  regression - `e9eebf4` (pre-meter) captured real speech, and `f3be4d4` (which adds only the
+  level meter) is silent/crickets - so the meter was moved off the hot path. `capture_task` now
+  only publishes the capture format the upload task's meter decode needs (`PTT_METER_RAW`/
+  `PTT_METER_BITS`) and deposits samples in the ring; the meter consequently reads post-`ptt_gain`
+  samples (identical to the mic's own level at the default gain of 1). Weigh any future per-chunk
+  work in `capture_task` against that 4-word FIFO budget.
   A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
   (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
   counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carries ~91%

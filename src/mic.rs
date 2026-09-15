@@ -32,7 +32,7 @@ use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
 use embassy_net::IpEndpoint;
@@ -53,12 +53,12 @@ use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
 use terminal_model::mic_config::{
-    BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
-    reconcile as reconcile_mic_settings, report_setting as report_mic_setting,
+    BITS_KEY, CHANNELS, DEFAULT_BITS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY,
+    RAW_KEY, reconcile as reconcile_mic_settings, report_setting as report_mic_setting,
     validate_setting_with_store as validate_mic_setting,
 };
 use terminal_model::pcm_extract::{
-    ac_rms_level, ac_rms_level_words, bit_clock_hz, extract_left_channel_pcm,
+    ac_rms_level, ac_rms_level_word_pairs, bit_clock_hz, extract_left_channel_pcm,
     remove_dc_and_gain_samples, remove_dc_and_gain_words,
 };
 
@@ -309,17 +309,43 @@ static OVERFLOW_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 /// set for the same reason as `OVERFLOW_NOTICE_GEN`.
 static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 
-/// Latest chunk's AC RMS level (in `i16` counts), for the on-screen level
-/// meter. Updated by `capture_task` once per chunk with integer-only work, and
-/// reset to 0 when a recording ends. The screen painter polls it, so the
-/// capture path never takes the screen lock.
+/// Latest drained chunk's AC RMS level (in `i16` counts), for the on-screen
+/// level meter. Updated by `ptt_upload_task` from the samples it has just
+/// drained (see [`meter_level`]), and reset to 0 when a recording ends. It is
+/// deliberately never written by `capture_task`: any per-chunk synchronous work
+/// between DMA pulls can starve the PIO RX FIFO and silence the capture (the
+/// confirmed level-meter regression), so the capture path only deposits samples
+/// in the ring and the meter is computed from them off that path. The screen
+/// painter polls this, so it never takes the capture path's lock either.
 static PTT_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Capture format of the recording the meter is currently reading: `true` while
+/// `capture_task` is running the `ptt_raw` passthrough, so the upload task knows
+/// whether a drained chunk holds PCM samples or the pair-encoded raw words
+/// [`ac_rms_level_word_pairs`] expects. Cosmetic state - at worst an
+/// overlapping utterance briefly meters in the other mode.
+static PTT_METER_RAW: AtomicBool = AtomicBool::new(false);
+/// Slot width of that recording, for the raw-word meter decode. Same cosmetic
+/// caveat as [`PTT_METER_RAW`].
+static PTT_METER_BITS: AtomicU32 = AtomicU32::new(DEFAULT_BITS);
 
 /// Current push-to-talk input level for the on-screen meter; 0 when idle.
 /// Deliberately the DC-removed (AC) level, so a mic sitting on its noise floor
 /// reads near zero instead of being pinned by its DC offset.
 pub fn level() -> u32 {
     PTT_LEVEL.load(Ordering::Acquire)
+}
+
+/// Level-meter value for a chunk the upload task just drained from the ring, in
+/// whichever capture format `capture_task` is currently running. Called from the
+/// upload task only, so the cost (a windowed median of integer RMS values) stays
+/// off the DMA capture path.
+fn meter_level(samples: &[i16]) -> u32 {
+    if PTT_METER_RAW.load(Ordering::Relaxed) {
+        ac_rms_level_word_pairs(samples, PTT_METER_BITS.load(Ordering::Relaxed))
+    } else {
+        ac_rms_level(samples)
+    }
 }
 
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -503,6 +529,11 @@ async fn capture_task(mut mic: Mic) {
         // clock starts, so a `config set ptt_*` affects this very utterance
         // (no rebuild, reflash or reboot).
         let settings = load_settings().await;
+        // Record the format the upload task's level meter must decode for this
+        // utterance. Two relaxed stores, no computation: the meter itself runs
+        // on the upload task so nothing heavy sits between DMA pulls.
+        PTT_METER_RAW.store(settings.raw, Ordering::Relaxed);
+        PTT_METER_BITS.store(settings.bits, Ordering::Relaxed);
         mic.apply(settings);
         mic.set_enabled(true);
         let started = Instant::now();
@@ -530,7 +561,6 @@ async fn capture_task(mut mic: Mic) {
                 // reproduces the exact unprocessed I2S word stream. The gain
                 // knob removes the driven slot's DC offset before amplifying,
                 // so it reveals signal rather than railing on the offset.
-                PTT_LEVEL.store(ac_rms_level_words(&raw, settings.bits), Ordering::Release);
                 remove_dc_and_gain_words(&mut raw, settings.bits, settings.gain);
                 PCM_RING.lock().await.write_u32_words(generation, &raw)
             } else {
@@ -544,10 +574,6 @@ async fn capture_task(mut mic: Mic) {
                 // shift).
                 let mut pcm = [0i16; SAMPLES_PER_CHUNK];
                 extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
-                // Publish the AC level for the overlay meter before applying
-                // gain, so the meter shows the mic's real input, not the
-                // diagnostic gain.
-                PTT_LEVEL.store(ac_rms_level(&pcm), Ordering::Release);
                 // `ptt_gain`: the captain's capture-time gain experiment,
                 // applied after DC removal so a useful gain reveals the AC
                 // signal instead of immediately railing on the offset.
@@ -645,6 +671,13 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
             if n == 0 {
                 break;
             }
+            // Meter the chunk here, on the upload task, from the samples just
+            // drained - never in `capture_task`, where any per-chunk work
+            // between DMA pulls can starve the PIO RX FIFO and silence the
+            // capture (the confirmed regression). The meter therefore tracks
+            // what the connection is actually draining (post-`ptt_gain`), which
+            // is identical to the mic's own level at the default gain of 1.
+            PTT_LEVEL.store(meter_level(&buf[..n]), Ordering::Release);
             if let Some(sock) = socket.as_mut()
                 && !send_chunk(sock, &buf[..n]).await
             {

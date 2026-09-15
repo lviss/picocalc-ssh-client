@@ -271,6 +271,23 @@ pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
     })
 }
 
+/// Level-meter value for a raw `ptt_raw` chunk exactly as the audio ring holds
+/// it: one little-endian `u32` word written as two `i16` halves (low half
+/// first, per `AudioRing::write_u32_words`), so rebuild each word and meter the
+/// driven (even-indexed) slot's sample field like [`ac_rms_level_words`].
+///
+/// This is the raw-mode half of the meter the upload task computes from the
+/// samples it has already drained, which is what keeps all level-meter work off
+/// the DMA capture path. A trailing half with no partner word is ignored.
+pub fn ac_rms_level_word_pairs(pairs: &[i16], bits_per_channel_slot: u32) -> u32 {
+    let count = (pairs.len() / 2).div_ceil(2);
+    windowed_ac_level(count, |i| {
+        let lo = pairs[i * 4] as u16 as u32;
+        let hi = pairs[i * 4 + 1] as u16 as u32;
+        slot_sample(lo | (hi << 16), bits_per_channel_slot) as i32
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +560,42 @@ mod tests {
             flat[2 * k] = (5000i32 << 16) as u32;
         }
         assert_eq!(ac_rms_level_words(&flat, 32), 0);
+    }
+
+    #[test]
+    fn pair_encoded_raw_words_meter_the_same_as_words() {
+        // The ring stores each raw word as its low i16 half then its high half,
+        // so metering the drained pairs must reproduce the word-based level -
+        // this is the upload task's raw-mode meter now that the meter is off
+        // the DMA capture path.
+        fn encode(words: &[u32]) -> [i16; 64] {
+            let mut pairs = [0i16; 64];
+            for (i, &word) in words.iter().enumerate() {
+                pairs[i * 2] = word as u16 as i16;
+                pairs[i * 2 + 1] = (word >> 16) as u16 as i16;
+            }
+            pairs
+        }
+        let mut raw = [0u32; 32];
+        for k in 0..16 {
+            let v: i32 = if k % 2 == 0 { 100 } else { -100 };
+            raw[2 * k] = (v << 16) as u32;
+        }
+        let pairs = encode(&raw);
+        assert_eq!(
+            ac_rms_level_word_pairs(&pairs, 32),
+            ac_rms_level_words(&raw, 32)
+        );
+        assert_eq!(ac_rms_level_word_pairs(&pairs, 32), 100);
+        // A flat driven slot is silence, and an odd trailing half is ignored
+        // rather than read out of bounds.
+        let mut flat = [0u32; 32];
+        for k in 0..16 {
+            flat[2 * k] = (5000i32 << 16) as u32;
+        }
+        let flat_pairs = encode(&flat);
+        assert_eq!(ac_rms_level_word_pairs(&flat_pairs, 32), 0);
+        assert_eq!(ac_rms_level_word_pairs(&flat_pairs[..63], 32), 0);
     }
 
     #[test]
