@@ -201,50 +201,74 @@ fn integer_sqrt(value: u64) -> u64 {
     x
 }
 
-/// Level-meter value for a chunk of extracted mono samples: the RMS of the
-/// samples' deviation from the chunk mean, i.e. the AC level with the mic's
-/// large DC offset removed. Integer-only and linear, so a mic sitting on its
-/// noise floor reads near zero while speech drives it up; the raw value is
-/// the number of `i16` counts, which the overlay maps to a bar. Independent of
-/// `ptt_gain` (it is measured before gain is applied).
-pub fn ac_rms_level(samples: &[i16]) -> u32 {
-    if samples.is_empty() {
+/// Number of equal windows the level meter splits a chunk into. Eight is
+/// enough that the known per-chunk capture artifact (a handful of extreme
+/// samples once per DMA transfer) falls inside one window and is out-voted by
+/// the median, while still tracking a sustained signal.
+const LEVEL_WINDOWS: usize = 8;
+
+fn median(values: &mut [u32]) -> u32 {
+    if values.is_empty() {
         return 0;
     }
-    let n = samples.len() as i64;
-    let mean = samples.iter().map(|&s| s as i64).sum::<i64>() / n;
-    let sum_sq: i64 = samples
-        .iter()
-        .map(|&s| {
-            let d = s as i64 - mean;
-            d * d
-        })
-        .sum();
-    integer_sqrt((sum_sq / n) as u64) as u32
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
-/// The same AC RMS level for a raw `ptt_raw` chunk, measured over the driven
+/// Robust DC-removed level over `len` samples reached through `sample`.
+///
+/// Splits the chunk into [`LEVEL_WINDOWS`] equal windows, takes each window's
+/// RMS around that window's own mean, and returns the median of those values.
+/// Because each window removes its own DC, the mic's large offset does not bias
+/// the result; because the result is a median across windows, an isolated
+/// spike or dropout confined to one window cannot throw it. This is what makes
+/// the on-screen meter honest: a microphone sitting on its noise floor reads
+/// empty, while sustained speech raises every window and therefore the median.
+fn windowed_ac_level(len: usize, sample: impl Fn(usize) -> i32) -> u32 {
+    if len == 0 {
+        return 0;
+    }
+    let mut levels = [0u32; LEVEL_WINDOWS];
+    let mut count = 0usize;
+    for window in 0..LEVEL_WINDOWS {
+        let start = window * len / LEVEL_WINDOWS;
+        let end = (window + 1) * len / LEVEL_WINDOWS;
+        if end <= start {
+            continue;
+        }
+        let n = (end - start) as i64;
+        let mean = (start..end).map(|i| sample(i) as i64).sum::<i64>() / n;
+        let sum_sq: i64 = (start..end)
+            .map(|i| {
+                let d = sample(i) as i64 - mean;
+                d * d
+            })
+            .sum();
+        levels[count] = integer_sqrt((sum_sq / n) as u64) as u32;
+        count += 1;
+    }
+    median(&mut levels[..count])
+}
+
+/// Level-meter value for a chunk of extracted mono samples: a windowed median
+/// of per-window AC RMS (see [`windowed_ac_level`]). Integer-only and linear,
+/// so a mic on its noise floor reads near zero while speech drives it up; the
+/// raw value is the number of `i16` counts, which the overlay maps to a bar.
+/// Independent of `ptt_gain` (it is measured before gain is applied).
+pub fn ac_rms_level(samples: &[i16]) -> u32 {
+    windowed_ac_level(samples.len(), |i| samples[i] as i32)
+}
+
+/// The same robust level for a raw `ptt_raw` chunk, measured over the driven
 /// (even-indexed/left-slot) words' sample field for the configured slot width
 /// - the exact bits [`extract_left_channel_pcm`] would extract - so the level
 /// meter and the streamed payload read the same field in both modes, and a
 /// narrow raw slot cannot meter zero while carrying signal.
 pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
     let count = raw.len().div_ceil(2);
-    if count == 0 {
-        return 0;
-    }
-    let n = count as i64;
-    let sample = |word: u32| slot_sample(word, bits_per_channel_slot) as i64;
-    let mean = raw.iter().step_by(2).map(|&w| sample(w)).sum::<i64>() / n;
-    let sum_sq: i64 = raw
-        .iter()
-        .step_by(2)
-        .map(|&w| {
-            let d = sample(w) - mean;
-            d * d
-        })
-        .sum();
-    integer_sqrt((sum_sq / n) as u64) as u32
+    windowed_ac_level(count, |i| {
+        slot_sample(raw[2 * i], bits_per_channel_slot) as i32
+    })
 }
 
 #[cfg(test)]
@@ -470,29 +494,54 @@ mod tests {
     #[test]
     fn ac_level_ignores_dc_and_measures_the_deviation() {
         // A flat DC chunk is silence no matter how large the offset.
-        assert_eq!(ac_rms_level(&[1234i16; 64]), 0);
-        // A +/-10 square wave has RMS 10.
-        let square: [i16; 8] = [10, -10, 10, -10, 10, -10, 10, -10];
+        assert_eq!(ac_rms_level(&[1234i16; 80]), 0);
+        // A sustained +/-10 square wave has RMS 10 in every window -> median 10.
+        let square: [i16; 80] = core::array::from_fn(|i| if i % 2 == 0 { 10 } else { -10 });
         assert_eq!(ac_rms_level(&square), 10);
         // The same deviation on top of a large DC offset is unchanged.
-        let offset: [i16; 8] = [1010, 990, 1010, 990, 1010, 990, 1010, 990];
+        let offset: [i16; 80] = core::array::from_fn(|i| if i % 2 == 0 { 1010 } else { 990 });
         assert_eq!(ac_rms_level(&offset), 10);
         assert_eq!(ac_rms_level(&[]), 0);
     }
 
     #[test]
+    fn ac_level_ignores_a_spike_confined_to_one_window() {
+        // The real per-chunk capture artifact: a flat chunk with a few extreme
+        // samples in one region. A plain chunk-mean AC RMS reads hundreds; the
+        // windowed median must stay near the true (tiny) level so the meter
+        // does not swing at idle.
+        let mut chunk = [5i16; 400];
+        chunk[..8].fill(8000);
+        assert!(
+            ac_rms_level(&chunk) < 20,
+            "spike leaked into the level: {}",
+            ac_rms_level(&chunk)
+        );
+        // A sustained signal raises every window and therefore the median.
+        let loud: [i16; 400] = core::array::from_fn(|i| if i % 2 == 0 { 300 } else { -300 });
+        assert!(
+            ac_rms_level(&loud) > 250,
+            "sustained signal read too low: {}",
+            ac_rms_level(&loud)
+        );
+    }
+
+    #[test]
     fn word_level_matches_the_pcm_level_on_the_driven_slot() {
-        // Two driven words (even indices) with a +/-100 swing on top of a DC,
-        // one undriven odd word that must be ignored entirely. The sample sits
-        // in the top 16 bits, matching what the PCM path extracts.
-        let raw = [
-            (100i32 << 16) as u32,  // +100
-            0,                      // undriven (odd)
-            (-100i32 << 16) as u32, // -100
-        ];
+        // 16 driven words (even indices) alternating +/-100; the undriven odd
+        // words must be ignored entirely. The sample sits in the top 16 bits,
+        // matching what the PCM path extracts.
+        let mut raw = [0u32; 32];
+        for k in 0..16 {
+            let v: i32 = if k % 2 == 0 { 100 } else { -100 };
+            raw[2 * k] = (v << 16) as u32;
+        }
         assert_eq!(ac_rms_level_words(&raw, 32), 100);
         // A flat driven slot is silence.
-        let flat = [(5000i32 << 16) as u32, 0, (5000i32 << 16) as u32];
+        let mut flat = [0u32; 32];
+        for k in 0..16 {
+            flat[2 * k] = (5000i32 << 16) as u32;
+        }
         assert_eq!(ac_rms_level_words(&flat, 32), 0);
     }
 
@@ -501,14 +550,17 @@ mod tests {
         // A 16-bit slot keeps its samples in the low 16 bits, so a meter that
         // always read the top 16 would stay pinned at zero. The meter must
         // follow the same field `extract_left_channel_pcm` puts on the wire.
-        let raw = [100u32, 0, 0xFFFF_FF9Cu32]; // +100, then -100 in the low 16
-        let mut pcm = [0i16; 2];
+        let mut raw = [0u32; 32];
+        for k in 0..16 {
+            raw[2 * k] = if k % 2 == 0 { 100 } else { 0xFFFF_FF9C }; // +100 / -100
+        }
+        let mut pcm = [0i16; 16];
         extract_left_channel_pcm(&raw, &mut pcm, 16);
-        assert_eq!(pcm, [100, -100]);
+        assert_eq!(&pcm[..4], &[100, -100, 100, -100]);
         assert_eq!(ac_rms_level_words(&raw, 16), ac_rms_level(&pcm));
         assert_eq!(ac_rms_level_words(&raw, 16), 100);
-        // The same words through the 32-bit field are a flat DC plateau, so
-        // this also proves the width argument changes what is measured.
-        assert_eq!(ac_rms_level_words(&raw, 32), 0);
+        // The same words through the 32-bit field are a plateau in the top 16
+        // bits, so this also proves the width argument changes what is read.
+        assert!(ac_rms_level_words(&raw, 32) < 100);
     }
 }

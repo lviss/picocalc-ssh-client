@@ -194,11 +194,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (SEL only selects the L/R slot), so any real gain/normalization belongs on the receiving /
   transcription side, where the audio is consumed - the device ships its native levels. The
   overlay also carries a realtime level meter while recording: `ac_rms_level`/
-  `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish the DC-removed AC RMS through
-  `mic::level()`, both reading the configured slot width's sample field (the same bits
-  `extract_left_channel_pcm` puts on the wire), so a narrow raw slot cannot meter zero while
-  carrying signal. `src/screen.rs`'s `draw_overlay` draws it as a bar when `mic::is_recording()`
-  (empty at the noise floor, red when pinned). Offline analysis was inconclusive about absolute
+  `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish a windowed median of per-window
+  AC RMS (8 windows, each window's own DC removed) through `mic::level()`, both reading the
+  configured slot width's sample field (the same bits `extract_left_channel_pcm` puts on the
+  wire), so a narrow raw slot cannot meter zero while carrying signal. `src/screen.rs`'s
+  `draw_overlay` draws it as a bar when `mic::is_recording()` (empty at the noise floor, red when
+  pinned). The windowed median is deliberate: a plain DC-removed AC RMS let the known per-chunk
+  capture artifact below dominate the bar and swing it full/empty at idle.
+  A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
+  (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
+  counts) at a near-fixed offset, with >50% of the chunk a flat plateau; the glitch carries ~91%
+  of the chunk's AC energy. It is present in the captured samples, so it is a firmware/I2S-path
+  defect that corrupts the streamed audio, not just a meter problem. Leading hypothesis to
+  confirm: the per-chunk DMA transfer boundary / RX-FIFO stall between `dma_pull` calls (the SM
+  fills the 8-deep FIFO and stalls while the capture task processes the previous chunk) - root
+  cause NOT confirmed and needs hardware. Do not treat the meter's robustness as an audio fix.
+  Offline analysis was inconclusive about absolute
   audio quality and the earlier "mic not converting" reading was over-generalized: the raw-mode
   capture was near-constant (that capture had no signal), while the production PCM captures carry
   real AC energy (~-35 dBFS RMS after DC removal) and the captain sees live changes. Judge audio
