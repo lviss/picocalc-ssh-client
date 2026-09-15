@@ -31,6 +31,10 @@ use terminal_model::pcm_extract::{
 #[derive(Default)]
 struct ConfigStore {
     entries: Vec<(String, String)>,
+    /// Simulates a flash write failure: `reconcile` computes the fixes but does
+    /// not apply them, so the store keeps the stale raw value, exactly as a
+    /// full `sequential_storage` region would.
+    fail_reconcile: bool,
 }
 
 impl ConfigStore {
@@ -45,9 +49,23 @@ impl ConfigStore {
         self.entries.retain(|(k, _)| k != key);
     }
 
-    /// Mirrors `mic::resolve_settings`: rewrites any stored `ptt_*` key that
+    /// The settings the raw stored values resolve to before the pair fallback -
+    /// i.e. the pair the store actually holds.
+    fn stored_settings(&self) -> MicSettings {
+        resolve(
+            self.fetch(BITS_KEY).as_deref(),
+            self.fetch(RATE_KEY).as_deref(),
+            self.fetch(EDGE_KEY).as_deref(),
+            self.fetch(RAW_KEY).as_deref(),
+            self.fetch(GAIN_KEY).as_deref(),
+        )
+        .raw
+    }
+
+    /// Mirrors `mic::read_and_reconcile`: rewrites any stored `ptt_*` key that
     /// no longer matches the effective setting, so the store and the reported/
-    /// effective values cannot diverge.
+    /// effective values cannot diverge. `fail_reconcile` simulates the write
+    /// failing, leaving the stale key in place.
     fn reconcile(&mut self) {
         let (_, fixes) = reconcile_settings(
             self.fetch(BITS_KEY).as_deref(),
@@ -56,6 +74,9 @@ impl ConfigStore {
             self.fetch(RAW_KEY).as_deref(),
             self.fetch(GAIN_KEY).as_deref(),
         );
+        if self.fail_reconcile {
+            return;
+        }
         for fix in fixes {
             match self.entries.iter_mut().find(|(k, _)| k == fix.key) {
                 Some((_, v)) => *v = fix.value,
@@ -79,10 +100,12 @@ impl ConfigStore {
     }
 
     /// `config set`: refuse an invalid mic value before it reaches the store,
-    /// and otherwise persist it (mirrors `config_command`'s `set` arm, which
-    /// validates before storing).
+    /// and otherwise persist it. Mirrors `mic::validate_config_setting`, which
+    /// validates the candidate against the pair the store actually holds after
+    /// the reconcile attempt - not the in-memory fallback.
     fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
-        validate_setting(self.settings(), key, value)?;
+        self.reconcile();
+        validate_setting(self.stored_settings(), key, value)?;
         match self.entries.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value.to_string(),
             None => self.entries.push((key.to_string(), value.to_string())),
@@ -429,6 +452,30 @@ fn store_reported_and_effective_values_agree_after_a_stale_store_is_reconciled()
     }
     assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("32"));
     assert_eq!(store.fetch(EDGE_KEY).as_deref(), Some("0"));
+}
+
+/// A reconciliation write can fail (e.g. `sequential_storage` reports full
+/// storage), so validation must describe the store that actually exists rather
+/// than an in-memory fix that never landed.
+#[test]
+fn validation_uses_the_stored_pair_when_a_reconcile_write_fails() {
+    let mut store = ConfigStore::default();
+    // A stale, out-of-window lone 16-bit slot that reconciliation would rewrite
+    // to the 32-bit default...
+    store.entries.push((BITS_KEY.to_string(), "16".to_string()));
+    // ...but the write fails, so the stale key stays in the store.
+    store.fail_reconcile = true;
+
+    // `config get` still reports the fallback the next recording would use
+    // while the store cannot be repaired.
+    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+
+    // A set is validated against the raw stored pair, so setting the rate to
+    // 16 kHz cannot quietly revive the 16-bit slot `config get` just reported
+    // as 32 (16 @ 16 kHz is out of the mic's clock window).
+    assert!(store.set(RATE_KEY, "16000").is_err());
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("16"));
+    assert_eq!(store.fetch(RATE_KEY), None);
 }
 
 /// Prints a transcript of the captain's real workflow - `config set`, then

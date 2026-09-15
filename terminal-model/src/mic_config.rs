@@ -102,9 +102,14 @@ impl MicSettings {
 }
 
 /// Effective settings plus whether an out-of-window stored pair had to be
-/// replaced by the default (so the caller can log it once per recording).
+/// replaced by the default (so the caller can log it once per recording), and
+/// the raw settings the individual stored values resolve to before that pair
+/// fallback (`raw.bits`/`raw.rate` are what the store actually holds, so a
+/// caller can validate a `config set` against the pair it will create even if
+/// a reconciliation write does not land).
 pub struct ResolvedSettings {
     pub settings: MicSettings,
+    pub raw: MicSettings,
     pub fell_back: bool,
 }
 
@@ -149,6 +154,7 @@ pub fn resolve(
             .filter(|g| (MIN_GAIN..=MAX_GAIN).contains(g))
             .unwrap_or(DEFAULT_GAIN),
     };
+    let raw = settings;
     let mut fell_back = false;
     if !mic_settings_valid(settings.bits, settings.rate) {
         settings.bits = DEFAULT_BITS;
@@ -157,6 +163,7 @@ pub fn resolve(
     }
     ResolvedSettings {
         settings,
+        raw,
         fell_back,
     }
 }

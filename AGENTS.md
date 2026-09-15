@@ -58,13 +58,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   "recording..." indicator): it's a paint-time-only flag that never touches `lines`/`scrollback`,
   composited on top each frame in `src/screen.rs`'s `update_display` / `draw_overlay`.
   `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real, possibly-changed
-  cell content underneath from scratch rather than needing a save/restore buffer. Auto-dismiss
-  timing (`embassy_time::Instant`) lives on the `Screen` wrapper in `src/screen.rs`
-  (`overlay_expiry`, checked in `Screen::update_display`), not in `ScreenModel`, since
-  `terminal-model` is host-portable and has no clock. Always show overlays through a `Screen`
-  helper: `Screen::show_battery_overlay` arms that timer, while `Screen::show_overlay` (used by
-  `src/mic.rs` for the recording indicator) clears any leftover `overlay_expiry`, so an earlier
-  timed overlay cannot prematurely dismiss a newer non-timed one.
+  cell content underneath from scratch rather than needing a save/restore buffer. The
+  overlay/auto-dismiss state machine itself (`overlay`, a persistent-overlay slot to restore,
+  and an absolute `u64` millisecond deadline) lives in `ScreenModel` and is host-tested; it takes
+  `now_ms` from the caller, so `terminal-model` stays clock-free and `src/screen.rs`'s `Screen`
+  wrapper just passes `Instant::now().as_millis()`. Always show overlays through a `Screen`
+  helper: `Screen::show_battery_overlay` calls `ScreenModel::show_timed_overlay` (battery readout,
+  3 s), while `Screen::show_overlay` (used by `src/mic.rs` for the recording indicator) marks a
+  persistent overlay. `ScreenModel::tick_overlay` dismisses only an expired *timed* overlay and
+  restores the persistent one it covered (or clears if there was none), so a power-button press
+  before or during a recording cannot leave the "recording..." indicator (and the level meter)
+  cleared for the rest of the utterance.
 - Despite the caution above about the root package not building for the host target: this repo's
   installed toolchain does carry a prebuilt `thumbv8m.main-none-eabihf` std, so
   `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully
@@ -166,7 +170,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   store, `config get`/`config list`, and the next recording cannot diverge - otherwise a
   `ptt_rate`/`ptt_bits` key left stale by `config rm` could be silently re-adopted by a later
   `config set`. Concurrently, `config list` overlays the effective values for the `ptt_*` keys.
-  The program itself is built at run time by
+  `ResolvedSettings::raw` exposes the pre-fallback pair, and `src/mic.rs` validates a `config set`
+  against the pair the store actually holds after the reconcile attempt (raw for any key whose
+  rewrite failed), logging - not discarding - a failed rewrite, so the agreement guarantee does
+  not rest on an unconfirmed flash write. The program itself is built at run time by
   `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
   the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
   words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width.

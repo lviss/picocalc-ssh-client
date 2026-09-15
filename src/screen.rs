@@ -47,7 +47,6 @@ const OVERLAY_DURATION: Duration = Duration::from_secs(3);
 pub struct Screen {
     model: ScreenModel,
     parser: vte::Parser,
-    overlay_expiry: Option<Instant>,
 }
 
 impl Deref for Screen {
@@ -68,7 +67,6 @@ impl Screen {
         Self {
             model: ScreenModel::default(),
             parser: vte::Parser::new(),
-            overlay_expiry: None,
         }
     }
 
@@ -88,26 +86,23 @@ impl Screen {
 
     /// Show `text` as a transient overlay on top of whatever is currently on
     /// screen; it auto-dismisses after `OVERLAY_DURATION` without corrupting the
-    /// underlying terminal buffer.
+    /// underlying terminal buffer, restoring any overlay it covered.
     pub fn show_battery_overlay(&mut self, text: String) {
-        self.model.show_overlay(text);
-        self.overlay_expiry = Some(Instant::now() + OVERLAY_DURATION);
+        self.model.show_timed_overlay(
+            text,
+            Instant::now().as_millis(),
+            OVERLAY_DURATION.as_millis(),
+        );
     }
 
     /// Show `text` as an overlay that stays until it is explicitly cleared,
     /// cancelling any auto-dismiss left over from a previous overlay.
     pub fn show_overlay(&mut self, text: String) {
         self.model.show_overlay(text);
-        self.overlay_expiry = None;
     }
 
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
-        if let Some(expiry) = self.overlay_expiry
-            && Instant::now() >= expiry
-        {
-            self.overlay_expiry = None;
-            self.model.clear_overlay();
-        }
+        self.model.tick_overlay(Instant::now().as_millis());
         update_display(&mut self.model, display);
     }
 }

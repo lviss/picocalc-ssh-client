@@ -31,6 +31,7 @@ use crate::config::{CONFIG, StrValue};
 use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
@@ -95,7 +96,13 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 /// falls back to the default rather than silently mis-clocking the mic. A
 /// stored key that no longer matches its effective value is rewritten, so the
 /// store, `config get`/`list`, and the next recording all agree.
-async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
+///
+/// Returns both the effective settings and the settings the store actually
+/// holds afterwards. The two differ only when a reconciliation write fails, in
+/// which case the failed key keeps its raw stored value; the second is the
+/// pair a `config set` must validate against, so validation never rests on an
+/// unconfirmed write. A failed write is logged rather than discarded.
+async fn read_and_reconcile() -> (MicSettings, terminal_model::mic_config::ResolvedSettings) {
     let mut config = CONFIG.get().lock().await;
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
     let rate = config.fetch(RATE_KEY).await.ok().flatten();
@@ -109,12 +116,31 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
         raw.as_ref().map(|v| v.as_str()),
         gain.as_ref().map(|v| v.as_str()),
     );
+    let mut stored = resolved.settings;
+    let mut failures: Vec<(&'static str, String)> = Vec::new();
     for fix in &fixes {
-        if let Ok(value) = TryInto::<StrValue>::try_into(fix.value.as_str()) {
-            let _ = config.store(fix.key, value).await;
+        let result = match TryInto::<StrValue>::try_into(fix.value.as_str()) {
+            Ok(value) => config.store(fix.key, value).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            match fix.key {
+                BITS_KEY => stored.bits = resolved.raw.bits,
+                RATE_KEY => stored.rate = resolved.raw.rate,
+                _ => {}
+            }
+            failures.push((fix.key, alloc::format!("{err:?}")));
         }
     }
-    resolved
+    drop(config);
+    for (key, err) in &failures {
+        print!("ptt: failed to reconcile {key} ({err}), store may disagree\r\n");
+    }
+    (stored, resolved)
+}
+
+async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
+    read_and_reconcile().await.1
 }
 
 /// Settings for the recording about to start, logging if a stored value had to
@@ -131,8 +157,8 @@ pub async fn load_settings() -> MicSettings {
 /// settings, so an out-of-window or malformed value is refused at the console
 /// rather than stored. Keys this module does not own return `Ok(())`.
 pub async fn validate_config_setting(key: &str, value: &str) -> Result<(), String> {
-    let current = resolve_settings().await.settings;
-    validate_mic_setting(current, key, value)
+    let (stored, _) = read_and_reconcile().await;
+    validate_mic_setting(stored, key, value)
 }
 
 /// Effective value of a `ptt_*` setting for `config get`; `None` for keys this

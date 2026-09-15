@@ -200,6 +200,13 @@ pub struct ScreenModel {
     /// over the framebuffer each frame while set, and `clear_overlay` forces a
     /// full repaint from the untouched cell data so dismissal is invisible.
     pub overlay: Option<String>,
+    /// A non-timed overlay (e.g. the recording indicator) that a timed overlay
+    /// may temporarily cover, to be restored when that timed overlay expires.
+    overlay_restore: Option<String>,
+    /// Absolute millisecond deadline of the active timed overlay, if any. The
+    /// caller supplies the clock (see `tick_overlay`), keeping this model
+    /// host-portable.
+    overlay_deadline_ms: Option<u64>,
     /// Counts `scroll_up` invocations directly. Test-only: with `max_scrollback`
     /// now correctly sized to the real heap budget (including outer-container
     /// overhead) it can be smaller than a test's total feed count, so inferring
@@ -247,6 +254,8 @@ impl Default for ScreenModel {
             cols,
             full_repaint: true,
             overlay: None,
+            overlay_restore: None,
+            overlay_deadline_ms: None,
             #[cfg(test)]
             scroll_up_calls: 0,
         }
@@ -330,17 +339,47 @@ impl ScreenModel {
         }
     }
 
-    /// Show `text` as an overlay. Purely a paint-time overlay flag - the cell
+    /// Show `text` as an overlay that stays until it is explicitly cleared or
+    /// covered by a timed overlay. Purely a paint-time overlay flag - the cell
     /// buffer is never touched, so any host output that lands underneath while
     /// it's showing is preserved untouched.
     pub fn show_overlay(&mut self, text: String) {
+        self.overlay_restore = Some(text.clone());
         self.overlay = Some(text);
+        self.overlay_deadline_ms = None;
+    }
+
+    /// Show `text` as a timed overlay (e.g. the battery readout) that
+    /// auto-dismisses at `now_ms + duration_ms`, restoring whatever non-timed
+    /// overlay it covered (or clearing entirely if there was none).
+    pub fn show_timed_overlay(&mut self, text: String, now_ms: u64, duration_ms: u64) {
+        self.overlay = Some(text);
+        self.overlay_deadline_ms = Some(now_ms.saturating_add(duration_ms));
+    }
+
+    /// Applies the active timed overlay's deadline against `now_ms`: on expiry
+    /// the non-timed overlay it covered is restored, or the overlay is cleared
+    /// if there was none. A no-op while no timed overlay is active.
+    pub fn tick_overlay(&mut self, now_ms: u64) {
+        let Some(deadline) = self.overlay_deadline_ms else {
+            return;
+        };
+        if now_ms < deadline {
+            return;
+        }
+        self.overlay_deadline_ms = None;
+        match self.overlay_restore.clone() {
+            Some(text) => self.overlay = Some(text),
+            None => self.clear_overlay(),
+        }
     }
 
     /// Hide the overlay and force a full repaint so the real, possibly-changed
     /// cell contents underneath it are redrawn exactly as they'd look had the
     /// overlay never been shown.
     pub fn clear_overlay(&mut self) {
+        self.overlay_restore = None;
+        self.overlay_deadline_ms = None;
         if self.overlay.take().is_some() {
             self.full_repaint = true;
         }
@@ -748,6 +787,62 @@ mod tests {
 
         assert!(model.overlay.is_none());
         assert!(!model.full_repaint);
+    }
+
+    // Recording-then-battery ordering: a power-button battery readout taken
+    // while the button is still held must cover the recording overlay for its
+    // own 3 s and then hand the screen back to it (and therefore the level
+    // meter) rather than dismissing the recording indicator mid-utterance.
+    #[test]
+    fn timed_overlay_restores_the_recording_overlay_on_expiry() {
+        let mut model = ScreenModel::default();
+        model.show_overlay(alloc::string::String::from("recording..."));
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
+
+        model.show_timed_overlay(alloc::string::String::from("Battery: 87%"), 1_000, 3_000);
+        assert_eq!(model.overlay.as_deref(), Some("Battery: 87%"));
+        model.tick_overlay(3_999);
+        assert_eq!(model.overlay.as_deref(), Some("Battery: 87%"));
+
+        model.tick_overlay(4_000);
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
+
+        // A second battery readout while the recording is still live restores
+        // it again.
+        model.show_timed_overlay(alloc::string::String::from("Battery: 86%"), 5_000, 3_000);
+        model.tick_overlay(8_000);
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
+
+        // Ending the recording clears it for good.
+        model.clear_overlay();
+        assert!(model.overlay.is_none());
+    }
+
+    #[test]
+    fn lone_timed_overlay_clears_on_expiry() {
+        let mut model = ScreenModel::default();
+        model.full_repaint = false;
+        model.show_timed_overlay(alloc::string::String::from("Battery: 50%"), 0, 3_000);
+        assert_eq!(model.overlay.as_deref(), Some("Battery: 50%"));
+
+        model.tick_overlay(2_999);
+        assert_eq!(model.overlay.as_deref(), Some("Battery: 50%"));
+
+        model.tick_overlay(3_000);
+        assert!(model.overlay.is_none());
+        assert!(model.full_repaint);
+    }
+
+    #[test]
+    fn persistent_overlay_cancels_a_pending_timer() {
+        let mut model = ScreenModel::default();
+        model.show_timed_overlay(alloc::string::String::from("Battery: 87%"), 0, 3_000);
+
+        // A recording starting after the battery readout replaces it for good:
+        // the stale battery deadline must not clear the recording indicator.
+        model.show_overlay(alloc::string::String::from("recording..."));
+        model.tick_overlay(3_000);
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
     }
 
     // Regression test for the heap-exhaustion crash investigated in
