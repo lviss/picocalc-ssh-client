@@ -350,7 +350,9 @@ windowed level, demonstrates it.
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
 refused with the allowed range. `config get` and `config list` report the value
 the next recording will actually use (a stored key that no longer matches is
-rewritten so store, report, and effective value agree), and `config rm`
+rewritten so store, report, and effective value agree; the slot width and rate
+are rewritten together, so a partially failed repair cannot clock the mic
+differently than reported), and `config rm`
 restores the default. If that rewrite cannot land (e.g. the config region is
 full), the console flags the key as `unreconciled` alongside the stale value the
 store still holds, and a `config set` that would make that stale value effective

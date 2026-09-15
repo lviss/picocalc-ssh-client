@@ -184,6 +184,24 @@ fn stored_fix(key: &'static str, settings: MicSettings) -> StoredValueFix {
     }
 }
 
+/// The `ptt_bits`/`ptt_rate` repair, which must be applied as one unit: the
+/// two keys decide the mic clock jointly, so writing only one can leave the
+/// pair valid but different from the effective pair the console reported. A
+/// caller writes `rate` first and then `bits`, and if either write fails must
+/// leave the pair as the store already held it.
+///
+/// Writing `rate` first is what keeps the pair safe mid-repair: whenever both
+/// keys need rewriting the effective pair is the 32-bit/16 kHz default, and the
+/// intermediate `{stored_bits, 16000}` pair either resolves to that same
+/// default or stays out of window (a stored slot width below 32-bit cannot
+/// clock legally at 16 kHz), so a failed second write cannot change what the
+/// next recording resolves to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClockPairFix {
+    pub bits: String,
+    pub rate: String,
+}
+
 /// Resolves the raw stored values and reports every stored `ptt_*` key whose
 /// value differs from the effective setting, with the canonical value to write
 /// back. An out-of-window slot/rate pair makes both stored keys "used"
@@ -191,22 +209,38 @@ fn stored_fix(key: &'static str, settings: MicSettings) -> StoredValueFix {
 /// silently re-adopt a key the console already reported as default. Applying
 /// the returned fixes leaves store, reports and effective settings in
 /// agreement.
+///
+/// The slot-width and sample-rate keys are returned as a single [`ClockPairFix`]
+/// whenever both need rewriting, because they are one clock decision: applying
+/// them independently could leave the pair valid but different from what was
+/// reported (e.g. repairing `ptt_bits` to 32 while a stored 32 kHz rate is
+/// still legal clocks the mic at 32 kHz instead of the reported 16 kHz).
 pub fn reconcile(
     bits: Option<&str>,
     rate: Option<&str>,
     edge: Option<&str>,
     raw: Option<&str>,
     gain: Option<&str>,
-) -> (ResolvedSettings, Vec<StoredValueFix>) {
+) -> (ResolvedSettings, Vec<StoredValueFix>, Option<ClockPairFix>) {
     let resolved = resolve(bits, rate, edge, raw, gain);
     let effective = resolved.settings;
     let mut fixes = Vec::new();
-    if bits.is_some() && bits.and_then(parse_u32) != Some(effective.bits) {
-        fixes.push(stored_fix(BITS_KEY, effective));
-    }
-    if rate.is_some() && rate.and_then(parse_u32) != Some(effective.rate) {
-        fixes.push(stored_fix(RATE_KEY, effective));
-    }
+    let bits_stale = bits.is_some() && bits.and_then(parse_u32) != Some(effective.bits);
+    let rate_stale = rate.is_some() && rate.and_then(parse_u32) != Some(effective.rate);
+    let clock_pair = if bits_stale && rate_stale {
+        Some(ClockPairFix {
+            bits: format!("{}", effective.bits),
+            rate: format!("{}", effective.rate),
+        })
+    } else {
+        if bits_stale {
+            fixes.push(stored_fix(BITS_KEY, effective));
+        }
+        if rate_stale {
+            fixes.push(stored_fix(RATE_KEY, effective));
+        }
+        None
+    };
     if edge.is_some() && edge.and_then(parse_bool) != Some(effective.edge_flip) {
         fixes.push(stored_fix(EDGE_KEY, effective));
     }
@@ -221,7 +255,7 @@ pub fn reconcile(
     {
         fixes.push(stored_fix(GAIN_KEY, effective));
     }
-    (resolved, fixes)
+    (resolved, fixes, clock_pair)
 }
 
 /// Console report for a `ptt_*` key, used by `config get`/`config list`.
@@ -559,7 +593,7 @@ mod tests {
         // An out-of-window pair (8-bit @ 32 kHz) plus a malformed edge and an
         // out-of-range gain: every one of those stored keys is not what the
         // next recording uses, so each must be reported for rewriting.
-        let (resolved, fixes) = reconcile(
+        let (resolved, fixes, clock_pair) = reconcile(
             Some("8"),
             Some("32000"),
             Some("maybe"),
@@ -572,9 +606,14 @@ mod tests {
         assert!(!resolved.settings.edge_flip);
         assert!(resolved.settings.raw);
         assert_eq!(resolved.settings.gain, DEFAULT_GAIN);
+        // Both clock keys are stale, so they come back as one atomic unit
+        // rather than as two independently-applied keys.
+        let pair = clock_pair.expect("an out-of-window pair needs a clock repair");
+        assert_eq!(pair.bits, "32");
+        assert_eq!(pair.rate, "16000");
         let keys: Vec<&str> = fixes.iter().map(|f| f.key).collect();
-        assert!(keys.contains(&BITS_KEY));
-        assert!(keys.contains(&RATE_KEY));
+        assert!(!keys.contains(&BITS_KEY));
+        assert!(!keys.contains(&RATE_KEY));
         assert!(keys.contains(&EDGE_KEY));
         assert!(keys.contains(&GAIN_KEY));
         // A valid stored value is left alone.
@@ -588,15 +627,28 @@ mod tests {
     }
 
     #[test]
+    fn only_one_stale_clock_key_is_a_single_fix() {
+        // A lone 8-bit slot at the default rate: writing the one key lands on
+        // the valid default pair, so it does not need the atomic pair repair.
+        let (resolved, fixes, clock_pair) = reconcile(Some("8"), None, None, None, None);
+        assert!(resolved.fell_back);
+        assert!(clock_pair.is_none());
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].key, BITS_KEY);
+        assert_eq!(fixes[0].value, "32");
+    }
+
+    #[test]
     fn reconcile_leaves_a_consistent_store_untouched() {
         // A legal stored pair with legal non-clock keys is exactly what the
         // next recording uses, so nothing needs rewriting.
-        let (resolved, fixes) =
+        let (resolved, fixes, clock_pair) =
             reconcile(Some("16"), Some("32000"), Some("1"), Some("1"), Some("256"));
         assert!(!resolved.fell_back);
         assert_eq!(resolved.settings.bits, 16);
         assert_eq!(resolved.settings.rate, 32_000);
         assert!(fixes.is_empty());
+        assert!(clock_pair.is_none());
 
         // A consistent store reports exactly its effective values.
         assert_eq!(
@@ -614,9 +666,10 @@ mod tests {
         // A stale 16-bit slot that reconciliation could not rewrite: the
         // recording uses the 32-bit default, but the console must also show
         // the stale stored value so a later set cannot surprise the user.
-        let (resolved, fixes) = reconcile(Some("16"), None, None, None, None);
+        let (resolved, fixes, clock_pair) = reconcile(Some("16"), None, None, None, None);
         assert!(resolved.fell_back);
         assert_eq!(resolved.settings.bits, DEFAULT_BITS);
+        assert!(clock_pair.is_none());
         assert_eq!(fixes.len(), 1);
         let report = report_setting(BITS_KEY, resolved.settings, Some("16")).unwrap();
         assert!(report.starts_with("32"), "{report}");

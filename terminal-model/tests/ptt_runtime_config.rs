@@ -51,6 +51,19 @@ impl ConfigStore {
         self.entries.retain(|(k, _)| k != key);
     }
 
+    /// Whether a reconciliation write for `key` succeeds in this simulated
+    /// store.
+    fn can_write(&self, key: &str) -> bool {
+        !self.fail_reconcile && !self.fail_writes.contains(&key)
+    }
+
+    fn put(&mut self, key: &str, value: &str) {
+        match self.entries.iter_mut().find(|(k, _)| k == key) {
+            Some((_, v)) => *v = value.to_string(),
+            None => self.entries.push((key.to_string(), value.to_string())),
+        }
+    }
+
     /// The settings the raw stored values resolve to before the pair fallback -
     /// i.e. the pair the store actually holds.
     fn stored_settings(&self) -> MicSettings {
@@ -66,34 +79,45 @@ impl ConfigStore {
 
     /// Mirrors `mic::read_and_reconcile`: applies the rewrites it can, then
     /// re-resolves the store it is actually left holding and returns the keys
-    /// that still diverge (with the value the store holds). A rewrite that
-    /// lands can change the pair's validity, so only the resolution of the
-    /// final store state is what the next recording and the console describe.
+    /// that still diverge (with the value the store holds). The slot width and
+    /// sample rate are applied as one atomic pair - rate first, the slot width
+    /// skipped if the rate write failed, the rate restored if the slot width
+    /// write failed - so a partial repair cannot change the effective pair.
     fn reconcile(&mut self) -> Vec<(String, String)> {
-        let (_, fixes) = reconcile_settings(
+        let (_, fixes, clock_pair) = reconcile_settings(
             self.fetch(BITS_KEY).as_deref(),
             self.fetch(RATE_KEY).as_deref(),
             self.fetch(EDGE_KEY).as_deref(),
             self.fetch(RAW_KEY).as_deref(),
             self.fetch(GAIN_KEY).as_deref(),
         );
-        for fix in fixes {
-            if self.fail_reconcile || self.fail_writes.contains(&fix.key) {
-                continue;
-            }
-            match self.entries.iter_mut().find(|(k, _)| k == fix.key) {
-                Some((_, v)) => *v = fix.value,
-                None => self.entries.push((fix.key.to_string(), fix.value)),
+        if let Some(pair) = clock_pair {
+            if self.can_write(RATE_KEY) {
+                let original_rate = self.fetch(RATE_KEY);
+                self.put(RATE_KEY, &pair.rate);
+                if self.can_write(BITS_KEY) {
+                    self.put(BITS_KEY, &pair.bits);
+                } else {
+                    match original_rate {
+                        Some(value) => self.put(RATE_KEY, &value),
+                        None => self.remove(RATE_KEY),
+                    }
+                }
             }
         }
-        let (_, remaining) = reconcile_settings(
+        for fix in fixes {
+            if self.can_write(fix.key) {
+                self.put(fix.key, &fix.value);
+            }
+        }
+        let (_, remaining, remaining_pair) = reconcile_settings(
             self.fetch(BITS_KEY).as_deref(),
             self.fetch(RATE_KEY).as_deref(),
             self.fetch(EDGE_KEY).as_deref(),
             self.fetch(RAW_KEY).as_deref(),
             self.fetch(GAIN_KEY).as_deref(),
         );
-        remaining
+        let mut unreconciled: Vec<(String, String)> = remaining
             .iter()
             .map(|fix| {
                 (
@@ -101,7 +125,18 @@ impl ConfigStore {
                     self.fetch(fix.key).unwrap_or_else(|| fix.value.clone()),
                 )
             })
-            .collect()
+            .collect();
+        if let Some(pair) = remaining_pair {
+            unreconciled.push((
+                BITS_KEY.to_string(),
+                self.fetch(BITS_KEY).unwrap_or(pair.bits),
+            ));
+            unreconciled.push((
+                RATE_KEY.to_string(),
+                self.fetch(RATE_KEY).unwrap_or(pair.rate),
+            ));
+        }
+        unreconciled
     }
 
     /// The effective settings a recording started right now would use, exactly
@@ -530,45 +565,76 @@ fn failed_reconcile_write_is_reported_and_cannot_be_silently_reactivated() {
     assert_eq!(store.settings().bits, DEFAULT_BITS);
 }
 
-/// The console must report the resolution of the store reconciliation actually
-/// leaves behind, not the pre-write one: a rewrite that lands can change the
-/// pair's validity, which makes the pre-write fallback stale. Trace: a lone
-/// 8-bit slot whose rewrite keeps failing, then `ptt_rate 32000`, then a read
-/// where the bits rewrite lands and the rate rewrite fails leaves a valid
-/// `{32, 32000}` pair - the console and the next recording must both say
-/// `32000`, not the pre-write fallback `16000`.
+/// The slot width and sample rate are one clock decision and must be repaired
+/// atomically: a partial repair cannot leave the pair valid but different from
+/// what the console reported. Trace: an out-of-window 8-bit/32 kHz pair, then a
+/// read where the slot-width rewrite would land but the rate rewrite does not -
+/// the slot width must not be written, so the pair stays out of window and the
+/// effective pair stays the 32/16000 default the console reported.
 #[test]
-fn report_and_effective_use_the_store_left_behind_by_reconciliation() {
+fn clock_pair_repair_is_atomic_and_cannot_flip_the_effective_pair() {
     let mut store = ConfigStore::default();
-    // A lone 8-bit slot whose rewrite keeps failing; 8 @ 16 kHz is out of
-    // window, so the effective pair is the 32/16000 default.
+    // An out-of-window pair: 8 * 32000 * 2 = 512 kHz, below the 1.024 MHz floor.
     store.entries.push((BITS_KEY.to_string(), "8".to_string()));
-    store.fail_writes.push(BITS_KEY);
-    let reported = store.get(BITS_KEY).expect("ptt_bits is owned");
-    assert!(reported.starts_with("32"), "{reported}");
-    assert!(reported.contains('8'), "{reported}");
-
-    // The captain sets the rate to 32000; 8 @ 32000 is still out of window, so
-    // this stays the fallback pair while the stale 8-bit slot is stored.
     store
-        .set(RATE_KEY, "32000")
-        .expect("8 @ 32000 stays out of window");
+        .entries
+        .push((RATE_KEY.to_string(), "32000".to_string()));
+
+    // Both clock rewrites fail on the first reconcile: the console reports the
+    // fallback pair and the stale pair stays stored.
+    store.fail_writes.push(BITS_KEY);
+    store.fail_writes.push(RATE_KEY);
+    assert!(store.get(BITS_KEY).unwrap().starts_with("32"));
+    assert!(store.get(RATE_KEY).unwrap().starts_with("16000"));
+    assert_eq!(store.settings().bits, DEFAULT_BITS);
+    assert_eq!(store.settings().rate, DEFAULT_RATE_HZ);
     assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("8"));
     assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
 
-    // Now the bits rewrite lands (8 -> 32) while the rate rewrite fails. The
-    // store is left holding the valid 32/32000 pair, so that - not the
-    // pre-write 16000 fallback - is what the console and the recording report.
+    // On the next attempt the slot-width rewrite would land but the rate
+    // rewrite still fails. Because the pair is written rate-first and
+    // atomically, the slot width must not be written: the pair's validity, and
+    // therefore the effective pair the console reports and the next recording
+    // uses, cannot change as a side effect.
     store.fail_writes.clear();
     store.fail_writes.push(RATE_KEY);
-    let reported = store.get(RATE_KEY).expect("ptt_rate is owned");
-    assert_eq!(reported, "32000", "{reported}");
-    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
     let settings = store.settings();
     assert_eq!(settings.bits, DEFAULT_BITS);
-    assert_eq!(settings.rate, 32_000);
-    assert_eq!(settings.bclk_hz(), 2_048_000);
-    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+    assert_eq!(settings.rate, DEFAULT_RATE_HZ);
+    assert_eq!(settings.bclk_hz(), 1_024_000);
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("8"));
+    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
+    assert!(
+        store.get(BITS_KEY).unwrap().starts_with("32"),
+        "console changed the effective slot width"
+    );
+
+    // Once the rate write is allowed, both keys are written and the store
+    // resolves to the repaired default pair.
+    store.fail_writes.clear();
+    let settings = store.settings();
+    assert_eq!(settings.bits, DEFAULT_BITS);
+    assert_eq!(settings.rate, DEFAULT_RATE_HZ);
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("32"));
+    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("16000"));
+}
+
+/// If the slot-width write fails after the rate write landed, the rate is
+/// restored, so neither key of the pair is left changed by the partial repair.
+#[test]
+fn clock_pair_rolls_back_a_partial_repair() {
+    let mut store = ConfigStore::default();
+    store.entries.push((BITS_KEY.to_string(), "8".to_string()));
+    store
+        .entries
+        .push((RATE_KEY.to_string(), "32000".to_string()));
+    store.fail_writes.push(BITS_KEY);
+
+    let settings = store.settings();
+    assert_eq!(settings.bits, DEFAULT_BITS);
+    assert_eq!(settings.rate, DEFAULT_RATE_HZ);
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("8"));
+    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
 }
 
 /// Prints a transcript of the captain's real workflow - `config set`, then

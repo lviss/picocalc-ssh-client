@@ -172,15 +172,18 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `reconcile` also rewrites any stored key that no longer matches its effective value, so the
   store, `config get`/`config list`, and the next recording cannot diverge - otherwise a
   `ptt_rate`/`ptt_bits` key left stale by `config rm` could be silently re-adopted by a later
-  `config set`. Concurrently, `config list` overlays the effective values for the `ptt_*` keys.
-  `ResolvedSettings::raw` exposes the pre-fallback pair. `src/mic.rs` re-reads and re-resolves the
-  store after applying its rewrites, so a landed fix that changes the pair's validity is reflected
-  in the report, validation, and the next recording alike. If a reconcile rewrite fails,
-  `src/mic.rs` prints the failure and `config get`/`list` report that key as `unreconciled` next to
-  the stale value the store still holds; `validate_setting_with_store` (terminal-model) refuses a
-  clock-key `config set` that would make the stale value effective again (a set that leaves the
-  pair out of window, or that repairs it to the reported value, is allowed), so reported and
-  effective values cannot diverge silently even when the store cannot be rewritten. The program
+  `config set`. The slot-width and sample-rate keys are returned as a single `ClockPairFix` and
+  written as one atomic pair (rate first, the slot width skipped if the rate write fails, the rate
+  restored if the slot width write fails), so a partial repair can never leave the pair valid but
+  different from what `config get` reported. Concurrently, `config list` overlays the effective
+  values for the `ptt_*` keys. `ResolvedSettings::raw` exposes the pre-fallback pair. `src/mic.rs`
+  re-reads and re-resolves the store after applying its rewrites, so the reported, stored and
+  effective values all describe the state the store is actually left in. If a reconcile rewrite
+  fails, `src/mic.rs` prints the failure and `config get`/`list` report that key as `unreconciled`
+  next to the stale value the store still holds; `validate_setting_with_store` (terminal-model)
+  refuses a clock-key `config set` that would make the stale value effective again (a set that
+  leaves the pair out of window, or that repairs it to the reported value, is allowed), so reported
+  and effective values cannot diverge silently even when the store cannot be rewritten. The program
   itself is built at run time by `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`)
   because `pio_asm!` bakes the loop count and edge in at compile time; `capture_task` keeps only the
   even-indexed/left-slot

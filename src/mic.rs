@@ -27,7 +27,7 @@
 //! raw FIFO words under `ptt_raw=1`).
 
 use crate::Irqs;
-use crate::config::{CONFIG, StrValue};
+use crate::config::{CONFIG, Configuration, StrValue};
 use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
@@ -108,6 +108,21 @@ struct StoreOutcome {
     unreconciled: Vec<UnreconciledKey>,
 }
 
+/// Writes one `ptt_*` setting through the config store, converting the console
+/// string into the fixed-size stored value and reporting a write or conversion
+/// failure as text.
+async fn store_setting(
+    config: &mut Configuration,
+    key: &'static str,
+    value: &str,
+) -> Result<(), String> {
+    let value: StrValue = value.try_into().map_err(|err| alloc::format!("{err:?}"))?;
+    config
+        .store(key, value)
+        .await
+        .map_err(|err| alloc::format!("{err:?}"))
+}
+
 /// Reads the `ptt_*` mic keys and resolves them against their defaults via
 /// [`terminal_model::mic_config::reconcile`]: a missing or malformed individual
 /// value falls back to its own default, and an out-of-window slot/rate pair
@@ -115,12 +130,12 @@ struct StoreOutcome {
 /// stored key that no longer matches its effective value is rewritten, so the
 /// store, `config get`/`list`, and the next recording all agree.
 ///
-/// The store is then re-read and re-resolved: a rewrite that lands can change
-/// the pair's validity (e.g. repairing a lone 8-bit slot makes a stored rate
-/// legal again), so only the resolution of the state the store is actually
-/// left in is what the next recording uses. The returned `stored`/`resolved`
-/// and the unreconciled list all describe that same final state, and a failed
-/// write is printed and reported, never discarded.
+/// The slot width and sample rate are rewritten as one atomic pair (see
+/// [`terminal_model::mic_config::ClockPairFix`]), so a partial clock repair can
+/// never leave the pair valid but different from what the console reported. The
+/// store is then re-read and re-resolved, so `stored`/`resolved` and the
+/// unreconciled list all describe the state the store is actually left in, and
+/// a failed write is printed and reported, never discarded.
 async fn read_and_reconcile() -> StoreOutcome {
     let mut config = CONFIG.get().lock().await;
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
@@ -128,7 +143,7 @@ async fn read_and_reconcile() -> StoreOutcome {
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
     let raw = config.fetch(RAW_KEY).await.ok().flatten();
     let gain = config.fetch(GAIN_KEY).await.ok().flatten();
-    let (_, fixes) = reconcile_mic_settings(
+    let (_, fixes, clock_pair) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
@@ -136,13 +151,26 @@ async fn read_and_reconcile() -> StoreOutcome {
         gain.as_ref().map(|v| v.as_str()),
     );
     let mut write_errors: Vec<(&'static str, String)> = Vec::new();
+    if let Some(pair) = &clock_pair {
+        // The rate is written first, so any intermediate pair stays out of
+        // window. If it fails the slot width is not written at all, and if the
+        // slot width write then fails the rate is restored, so neither key of
+        // the pair is left changed on a partial repair.
+        match store_setting(&mut config, RATE_KEY, &pair.rate).await {
+            Ok(()) => {
+                if let Err(err) = store_setting(&mut config, BITS_KEY, &pair.bits).await {
+                    if let Some(original) = &rate {
+                        let _ = store_setting(&mut config, RATE_KEY, original.as_str()).await;
+                    }
+                    write_errors.push((BITS_KEY, err));
+                }
+            }
+            Err(err) => write_errors.push((RATE_KEY, err)),
+        }
+    }
     for fix in &fixes {
-        let result = match TryInto::<StrValue>::try_into(fix.value.as_str()) {
-            Ok(value) => config.store(fix.key, value).await,
-            Err(err) => Err(err),
-        };
-        if let Err(err) = result {
-            write_errors.push((fix.key, alloc::format!("{err:?}")));
+        if let Err(err) = store_setting(&mut config, fix.key, &fix.value).await {
+            write_errors.push((fix.key, err));
         }
     }
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
@@ -150,7 +178,7 @@ async fn read_and_reconcile() -> StoreOutcome {
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
     let raw = config.fetch(RAW_KEY).await.ok().flatten();
     let gain = config.fetch(GAIN_KEY).await.ok().flatten();
-    let (resolved, remaining) = reconcile_mic_settings(
+    let (resolved, remaining, remaining_pair) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
@@ -172,6 +200,22 @@ async fn read_and_reconcile() -> StoreOutcome {
             stored: stored
                 .map(|v| alloc::format!("{v}"))
                 .unwrap_or_else(|| fix.value.clone()),
+        });
+    }
+    if let Some(pair) = &remaining_pair {
+        unreconciled.push(UnreconciledKey {
+            key: BITS_KEY,
+            stored: bits
+                .as_ref()
+                .map(|v| alloc::format!("{v}"))
+                .unwrap_or_else(|| pair.bits.clone()),
+        });
+        unreconciled.push(UnreconciledKey {
+            key: RATE_KEY,
+            stored: rate
+                .as_ref()
+                .map(|v| alloc::format!("{v}"))
+                .unwrap_or_else(|| pair.rate.clone()),
         });
     }
     drop(config);
