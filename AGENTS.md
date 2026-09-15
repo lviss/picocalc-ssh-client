@@ -66,9 +66,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   helper: `Screen::show_battery_overlay` calls `ScreenModel::show_timed_overlay` (battery readout,
   3 s), while `Screen::show_overlay` (used by `src/mic.rs` for the recording indicator) marks a
   persistent overlay. `ScreenModel::tick_overlay` dismisses only an expired *timed* overlay and
-  restores the persistent one it covered (or clears if there was none), so a power-button press
-  before or during a recording cannot leave the "recording..." indicator (and the level meter)
-  cleared for the rest of the utterance.
+  restores the persistent one it covered (or clears if there was none), forcing a full repaint
+  so the wider/taller previous box's pixels are erased; replacing an already-shown overlay with
+  different text forces the same repaint (showing one where none was present stays a pure
+  paint-time flag). So a power-button press before or during a recording cannot leave the
+  "recording..." indicator (and the level meter) cleared or partially overdrawn for the rest of
+  the utterance.
 - Despite the caution above about the root package not building for the host target: this repo's
   installed toolchain does carry a prebuilt `thumbv8m.main-none-eabihf` std, so
   `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully

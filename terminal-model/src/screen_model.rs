@@ -345,7 +345,7 @@ impl ScreenModel {
     /// it's showing is preserved untouched.
     pub fn show_overlay(&mut self, text: String) {
         self.overlay_restore = Some(text.clone());
-        self.overlay = Some(text);
+        self.replace_overlay(text);
         self.overlay_deadline_ms = None;
     }
 
@@ -353,13 +353,25 @@ impl ScreenModel {
     /// auto-dismisses at `now_ms + duration_ms`, restoring whatever non-timed
     /// overlay it covered (or clearing entirely if there was none).
     pub fn show_timed_overlay(&mut self, text: String, now_ms: u64, duration_ms: u64) {
-        self.overlay = Some(text);
+        self.replace_overlay(text);
         self.overlay_deadline_ms = Some(now_ms.saturating_add(duration_ms));
+    }
+
+    /// Installs `text` as the composited overlay. Replacing an already-shown
+    /// overlay with different text forces a full repaint, since the previous
+    /// box may be wider/taller and its pixels would otherwise stay around it.
+    fn replace_overlay(&mut self, text: String) {
+        if self.overlay.is_some() && self.overlay.as_deref() != Some(text.as_str()) {
+            self.full_repaint = true;
+        }
+        self.overlay = Some(text);
     }
 
     /// Applies the active timed overlay's deadline against `now_ms`: on expiry
     /// the non-timed overlay it covered is restored, or the overlay is cleared
-    /// if there was none. A no-op while no timed overlay is active.
+    /// if there was none. Restoring forces a full repaint, like dismissal, so
+    /// the wider/taller timed overlay's pixels are erased from the frame. A
+    /// no-op while no timed overlay is active.
     pub fn tick_overlay(&mut self, now_ms: u64) {
         let Some(deadline) = self.overlay_deadline_ms else {
             return;
@@ -369,7 +381,10 @@ impl ScreenModel {
         }
         self.overlay_deadline_ms = None;
         match self.overlay_restore.clone() {
-            Some(text) => self.overlay = Some(text),
+            Some(text) => {
+                self.overlay = Some(text);
+                self.full_repaint = true;
+            }
             None => self.clear_overlay(),
         }
     }
@@ -816,6 +831,46 @@ mod tests {
         // Ending the recording clears it for good.
         model.clear_overlay();
         assert!(model.overlay.is_none());
+    }
+
+    // A restored persistent overlay can be narrower than the timed one it
+    // replaced, so the expiry must force a full repaint or the wider timed
+    // box's edges stay on the framebuffer for the rest of the utterance.
+    #[test]
+    fn timed_overlay_expiry_forces_a_repaint_when_it_restores_a_persistent_overlay() {
+        let mut model = ScreenModel::default();
+        model.show_overlay(alloc::string::String::from("recording..."));
+        model.show_timed_overlay(
+            alloc::string::String::from("Battery: 100% (charging)"),
+            0,
+            3_000,
+        );
+        model.full_repaint = false;
+
+        model.tick_overlay(3_000);
+
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
+        assert!(model.full_repaint);
+    }
+
+    // The replacement direction is the same class: a narrower overlay taking
+    // over a wider one must repaint the frame so the wider box's edges are
+    // erased, while showing an overlay where none was present stays a pure
+    // paint-time flag (see `show_overlay_does_not_touch_cell_buffer_or_...`).
+    #[test]
+    fn replacing_an_overlay_forces_a_repaint_to_erase_the_old_box() {
+        let mut model = ScreenModel::default();
+        model.show_timed_overlay(
+            alloc::string::String::from("Battery: 100% (charging)"),
+            0,
+            3_000,
+        );
+        model.full_repaint = false;
+
+        model.show_overlay(alloc::string::String::from("recording..."));
+
+        assert_eq!(model.overlay.as_deref(), Some("recording..."));
+        assert!(model.full_repaint);
     }
 
     #[test]
