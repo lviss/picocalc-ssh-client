@@ -337,7 +337,14 @@ turns red if the input is pinned) - making "hold `F1` and speak" the quickest
 "is the mic hearing anything?" check. Note: a separate, real per-chunk capture
 glitch (a few extreme samples once per 25 ms DMA transfer) is still present in
 the streamed audio; the windowed median keeps it from dominating the meter,
-but it is a firmware/I2S-path defect that remains open (see `AGENTS.md`).
+but it is a firmware/I2S-path defect that remains open (see `AGENTS.md`). The
+mic's audio path is **not** yet proven to carry speech: the "~-35 dBFS after DC
+removal" figure from earlier captures is glitch-dominated, and with the glitch
+excluded the windowed level is zero for essentially every chunk of the capture
+analysed so far (the original analysis put it at 874/874), so signal presence
+there is unproven. Do not claim working audio until one fresh capture
+containing deliberate speech or clapping, analysed with the glitch-excluded
+windowed level, demonstrates it.
 
 `ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is

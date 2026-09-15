@@ -203,18 +203,25 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   capture artifact below dominate the bar and swing it full/empty at idle.
   A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
   (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
-  counts) at a near-fixed offset, with >50% of the chunk a flat plateau; the glitch carries ~91%
-  of the chunk's AC energy. It is present in the captured samples, so it is a firmware/I2S-path
-  defect that corrupts the streamed audio, not just a meter problem. Leading hypothesis to
-  confirm: the per-chunk DMA transfer boundary / RX-FIFO stall between `dma_pull` calls (the SM
-  fills the 8-deep FIFO and stalls while the capture task processes the previous chunk) - root
-  cause NOT confirmed and needs hardware. Do not treat the meter's robustness as an audio fix.
-  Offline analysis was inconclusive about absolute
-  audio quality and the earlier "mic not converting" reading was over-generalized: the raw-mode
-  capture was near-constant (that capture had no signal), while the production PCM captures carry
-  real AC energy (~-35 dBFS RMS after DC removal) and the captain sees live changes. Judge audio
-  quality from a fresh deliberate capture converted with the `raw-to-wav.pl` helper (outside this
-  repo), not from the offline statistics alone. An
+  counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carries ~91%
+  of the chunk's AC energy. In `/ai/ptt-test-4.raw` the peak-deviation index is ~7 in the first
+  chunk, ~12 for the next few, and then ~59-60 for the rest of the capture: it steps early (a
+  ~48-sample jump from ~12 to ~59-60) and then stays put rather than drifting smoothly. It is
+  present in the captured samples, so it is a firmware/I2S-path defect that corrupts the streamed
+  audio, not just a meter problem.
+  Leading hypothesis to confirm: the per-chunk DMA transfer boundary / RX-FIFO stall between `dma_pull`
+  calls (the SM fills the 8-deep FIFO and stalls while the capture task processes the previous
+  chunk) - root cause NOT confirmed and needs hardware. Do not treat the meter's robustness as an
+  audio fix.
+  The earlier "the mic appears to be converting" correction was itself too generous: the
+  "~-35 dBFS RMS after DC removal" figure it rested on is glitch-dominated (that chunk-wide
+  statistic is ~91% the per-chunk glitch above), and re-analysis of the same capture with the
+  glitch excluded puts the windowed level at zero for essentially every chunk (the original
+  analysis put it at 874/874), so signal presence in that capture is UNPROVEN. Do not claim
+  working audio anywhere until one fresh capture containing deliberate speech or clapping,
+  analysed with the glitch-excluded windowed level, demonstrates it; judge audio quality from
+  such a deliberate capture converted with the `raw-to-wav.pl` helper (outside this repo), not
+  from offline statistics. An
   earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
