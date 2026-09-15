@@ -82,6 +82,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   flip-link` is a no-op confirming this; add `/home/ai/.cargo/bin` to `PATH` rather than
   reinstalling). If `flip-link` is genuinely absent and can't be installed (no network/build
   tools), that's a linker availability gap, not a code problem, if it's the only failure.
+- flip-link places static `.bss` directly above the embassy executor stack, so the two compete
+  for the same RP2350 SRAM: every byte of new static `.bss` comes off the usable stack, and
+  `src/main.rs`'s `DISPLAY_BUFFER_SIZE` (`320 * 3 * 64`, the display SPI interface's batching
+  buffer, deliberately a 61 KiB batch rather than a full 307 KiB framebuffer) is the load-bearing
+  knob that sets it. This is not cosmetic: the PTT work's ~28 KiB of static `.bss` (the PCM ring
+  plus the two embassy task pools) had taken the stack from ~70 KiB on `main`'s 307 KiB-buffer
+  build down to ~45 KiB, which is what overflowed the deep SSH connect/KEX path; the 61 KiB batch
+  restored it to ~282 KiB (the region above `_stack_start` in the linked ELF). Re-measure that
+  region (e.g. read `_stack_start` from the `.elf` after `make image`) before enlarging the
+  display buffer, adding another task pool, or growing any other static `.bss`, and keep the
+  batch at least this generous unless the measurement says otherwise.
 - `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
   computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
   (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and

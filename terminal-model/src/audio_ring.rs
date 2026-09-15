@@ -42,6 +42,10 @@ pub struct WriteResult {
 pub struct AudioRing<const N: usize> {
     samples: [i16; N],
     generations: [u32; N],
+    /// Whether the sample at the same index is the low `i16` half of a raw
+    /// `u32` word (`write_u32_words`); always `false` for plain PCM samples.
+    /// Eviction uses it to drop a raw word whole rather than splitting it.
+    low_half: [bool; N],
     /// Index of the oldest buffered sample.
     head: usize,
     /// Number of valid samples currently buffered (`<= N`).
@@ -59,6 +63,7 @@ impl<const N: usize> AudioRing<N> {
         Self {
             samples: [0; N],
             generations: [0; N],
+            low_half: [false; N],
             head: 0,
             len: 0,
             newest_generation: 0,
@@ -101,7 +106,7 @@ impl<const N: usize> AudioRing<N> {
     /// reader has moved on, and buffering it would only orphan samples ahead
     /// of live audio.
     pub fn write(&mut self, generation: u32, samples: &[i16]) -> WriteResult {
-        self.write_iter(generation, samples.iter().copied())
+        self.write_iter(generation, samples.iter().copied().map(|s| (s, false)))
     }
 
     /// Appends the little-endian 16-bit halves of each raw I2S FIFO word,
@@ -113,18 +118,30 @@ impl<const N: usize> AudioRing<N> {
     /// second buffer. Stale-generation handling and overflow reporting match
     /// [`Self::write`].
     pub fn write_u32_words(&mut self, generation: u32, words: &[u32]) -> WriteResult {
-        self.write_iter(
-            generation,
-            words
-                .iter()
-                .flat_map(|&word| [word as u16 as i16, (word >> 16) as u16 as i16]),
-        )
+        if generation < self.newest_generation {
+            return WriteResult {
+                dropped: 0,
+                first_drop: false,
+            };
+        }
+        self.newest_generation = generation;
+        let mut dropped = 0;
+        for &word in words {
+            // Make room for a whole word before writing either of its halves,
+            // so overflow can never leave one half at the head without its
+            // partner. Reading such a split word would misalign the `ptt_raw`
+            // level meter, which pairs the drained halves back into words.
+            self.evict_until_room_for(2, &mut dropped);
+            self.push(word as u16 as i16, true, generation);
+            self.push((word >> 16) as u16 as i16, false, generation);
+        }
+        self.finish_write(generation, dropped)
     }
 
     fn write_iter(
         &mut self,
         generation: u32,
-        samples: impl IntoIterator<Item = i16>,
+        samples: impl IntoIterator<Item = (i16, bool)>,
     ) -> WriteResult {
         if generation < self.newest_generation {
             return WriteResult {
@@ -134,17 +151,37 @@ impl<const N: usize> AudioRing<N> {
         }
         self.newest_generation = generation;
         let mut dropped = 0;
-        for sample in samples {
-            if self.len == N {
+        for (sample, low_half) in samples {
+            self.evict_until_room_for(1, &mut dropped);
+            self.push(sample, low_half, generation);
+        }
+        self.finish_write(generation, dropped)
+    }
+
+    /// Discards the oldest samples until at least `needed` more fit. A raw
+    /// word is dropped as a unit (both `i16` halves) whenever the head is one
+    /// of its halves, so a word's halves are never split across the head; a
+    /// non-word PCM sample is dropped singly.
+    fn evict_until_room_for(&mut self, needed: usize, dropped: &mut usize) {
+        while self.len > 0 && self.len + needed > N {
+            let drop = if self.low_half[self.head] { 2 } else { 1 };
+            for _ in 0..drop.min(self.len) {
                 self.head = (self.head + 1) % N;
                 self.len -= 1;
-                dropped += 1;
+                *dropped += 1;
             }
-            let tail = (self.head + self.len) % N;
-            self.samples[tail] = sample;
-            self.generations[tail] = generation;
-            self.len += 1;
         }
+    }
+
+    fn push(&mut self, sample: i16, low_half: bool, generation: u32) {
+        let tail = (self.head + self.len) % N;
+        self.samples[tail] = sample;
+        self.generations[tail] = generation;
+        self.low_half[tail] = low_half;
+        self.len += 1;
+    }
+
+    fn finish_write(&mut self, generation: u32, dropped: usize) -> WriteResult {
         let first_drop = dropped > 0 && self.last_drop_generation != Some(generation);
         if dropped > 0 {
             self.last_drop_generation = Some(generation);
@@ -393,6 +430,34 @@ mod tests {
         // [0x0002, 0x0001, 0x0004, 0x0003]; the oldest two are dropped.
         assert_eq!(out[0], 0x0004u16 as i16);
         assert_eq!(out[1], 0x0003u16 as i16);
+    }
+
+    /// An odd capacity makes the naive one-`i16`-at-a-time eviction drop an
+    /// odd number of halves, which would leave the head on a word's high half.
+    /// Raw-word overflow must instead drop whole words, so the drained stream
+    /// always pairs back into the original words (what the `ptt_raw` meter
+    /// relies on).
+    #[test]
+    fn word_overflow_never_leaves_a_split_word_at_the_head() {
+        let mut ring = AudioRing::<5>::new();
+        let words = [
+            0x1111_2222u32,
+            0x3333_4444u32,
+            0x5555_6666u32,
+            0x7777_8888u32,
+        ];
+        for &word in &words {
+            ring.write_u32_words(1, &[word]);
+        }
+
+        let mut out = [0i16; 8];
+        let n = ring.read(1, &mut out);
+        assert_eq!(n, 4);
+        let mut rebuilt = [0u32; 2];
+        for (i, word) in rebuilt.iter_mut().enumerate() {
+            *word = (out[2 * i] as u16 as u32) | ((out[2 * i + 1] as u16 as u32) << 16);
+        }
+        assert_eq!(rebuilt, [words[2], words[3]]);
     }
 
     #[test]

@@ -254,7 +254,9 @@ fn windowed_ac_level(len: usize, sample: impl Fn(usize) -> i32) -> u32 {
 /// of per-window AC RMS (see [`windowed_ac_level`]). Integer-only and linear,
 /// so a mic on its noise floor reads near zero while speech drives it up; the
 /// raw value is the number of `i16` counts, which the overlay maps to a bar.
-/// Independent of `ptt_gain` (it is measured before gain is applied).
+/// Tracks `ptt_gain`: the firmware computes it on the upload task from the
+/// samples `remove_dc_and_gain_samples` already processed, so a non-default
+/// diagnostic gain scales the meter exactly as it scales the streamed audio.
 pub fn ac_rms_level(samples: &[i16]) -> u32 {
     windowed_ac_level(samples.len(), |i| samples[i] as i32)
 }
@@ -278,7 +280,10 @@ pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
 ///
 /// This is the raw-mode half of the meter the upload task computes from the
 /// samples it has already drained, which is what keeps all level-meter work off
-/// the DMA capture path. A trailing half with no partner word is ignored.
+/// the DMA capture path. It assumes `pairs[0]` is the low half of a word:
+/// `AudioRing` writes whole raw words and drops them whole on overflow, so a
+/// drained stream never starts on a word's high half. A trailing half with no
+/// partner word is ignored.
 pub fn ac_rms_level_word_pairs(pairs: &[i16], bits_per_channel_slot: u32) -> u32 {
     let count = (pairs.len() / 2).div_ceil(2);
     windowed_ac_level(count, |i| {
@@ -615,5 +620,50 @@ mod tests {
         // The same words through the 32-bit field are a plateau in the top 16
         // bits, so this also proves the width argument changes what is read.
         assert!(ac_rms_level_words(&raw, 32) < 100);
+    }
+
+    /// The raw meter pairs the drained `i16` halves back into `u32` words, so
+    /// it depends on the ring never splitting a word across its head. An odd
+    /// ring capacity is exactly where the old one-sample eviction left an odd
+    /// number of halves and shifted the pairing, making the meter read the
+    /// undriven slot (or a half-swapped mashup) instead of the driven one.
+    /// Here the drained stream must stay whole words and the meter must read
+    /// the driven slots' real level.
+    #[test]
+    fn raw_meter_stays_aligned_across_a_word_overflow() {
+        use crate::audio_ring::AudioRing;
+
+        // Alternating driven (+100/-100) and undriven (0) slots, as a chunk of
+        // a `ptt_raw` capture would carry at a 32-bit slot.
+        let words: [u32; 40] = core::array::from_fn(|i| {
+            if i % 2 == 0 {
+                let sample: i16 = if (i / 2) % 2 == 0 { 100 } else { -100 };
+                (sample as u16 as u32) << 16
+            } else {
+                0
+            }
+        });
+        // 65 samples holds 32 whole words; the odd capacity is what made the
+        // old one-sample-at-a-time eviction drop an odd number of halves.
+        let mut ring = AudioRing::<65>::new();
+        for &word in &words {
+            ring.write_u32_words(1, &[word]);
+        }
+
+        let mut pairs = [0i16; 64];
+        let n = ring.read(1, &mut pairs);
+        assert_eq!(n, 64, "the ring should hold 32 whole words");
+
+        // The drain must start on a word's low half, not a split high half.
+        let held: &[u32] = &words[words.len() - 32..];
+        assert_eq!(pairs[0] as u16, held[0] as u16);
+        assert_eq!(pairs[1] as u16, (held[0] >> 16) as u16);
+
+        let driven: [i16; 16] = core::array::from_fn(|k| slot_sample(held[2 * k], 32));
+        assert_eq!(
+            ac_rms_level_word_pairs(&pairs[..n], 32),
+            ac_rms_level(&driven)
+        );
+        assert_eq!(ac_rms_level_word_pairs(&pairs[..n], 32), 100);
     }
 }
