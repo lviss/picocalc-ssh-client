@@ -173,14 +173,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   store, `config get`/`config list`, and the next recording cannot diverge - otherwise a
   `ptt_rate`/`ptt_bits` key left stale by `config rm` could be silently re-adopted by a later
   `config set`. Concurrently, `config list` overlays the effective values for the `ptt_*` keys.
-  `ResolvedSettings::raw` exposes the pre-fallback pair. If a reconcile rewrite fails, `src/mic.rs`
-  prints the failure and `config get`/`list` report that key as `unreconciled` next to the stale
-  value the store still holds; `validate_setting_with_store` (terminal-model) refuses a clock-key
-  `config set` that would make the stale value effective again (a set that leaves the pair out of
-  window, or that repairs it to the reported value, is allowed), so reported and effective values
-  cannot diverge silently even when the store cannot be rewritten. The program itself is built at run
-  time by `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
-  the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
+  `ResolvedSettings::raw` exposes the pre-fallback pair. `src/mic.rs` re-reads and re-resolves the
+  store after applying its rewrites, so a landed fix that changes the pair's validity is reflected
+  in the report, validation, and the next recording alike. If a reconcile rewrite fails,
+  `src/mic.rs` prints the failure and `config get`/`list` report that key as `unreconciled` next to
+  the stale value the store still holds; `validate_setting_with_store` (terminal-model) refuses a
+  clock-key `config set` that would make the stale value effective again (a set that leaves the
+  pair out of window, or that repairs it to the reported value, is allowed), so reported and
+  effective values cannot diverge silently even when the store cannot be rewritten. The program
+  itself is built at run time by `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`)
+  because `pio_asm!` bakes the loop count and edge in at compile time; `capture_task` keeps only the
+  even-indexed/left-slot
   words, and `extract_left_channel_pcm` reduces each to its slot-width-aware 16-bit sample (see that
   function's doc for the exact shift, including the left-justified sub-16-bit case).
   `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,

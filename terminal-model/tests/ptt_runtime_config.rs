@@ -31,10 +31,12 @@ use terminal_model::pcm_extract::{
 #[derive(Default)]
 struct ConfigStore {
     entries: Vec<(String, String)>,
-    /// Simulates a flash write failure: `reconcile` computes the fixes but does
-    /// not apply them, so the store keeps the stale raw value, exactly as a
-    /// full `sequential_storage` region would.
+    /// Simulates every reconciliation write failing, as a full
+    /// `sequential_storage` region would.
     fail_reconcile: bool,
+    /// Simulates a write failure for specific keys only, so a partial
+    /// reconciliation (some rewrites land, others do not) can be exercised.
+    fail_writes: Vec<&'static str>,
 }
 
 impl ConfigStore {
@@ -62,12 +64,11 @@ impl ConfigStore {
         .raw
     }
 
-    /// Mirrors `mic::read_and_reconcile`: rewrites any stored `ptt_*` key that
-    /// no longer matches the effective setting, so the store and the reported/
-    /// effective values cannot diverge. `fail_reconcile` simulates the write
-    /// failing, leaving the stale key in place; the keys that could not be
-    /// rewritten (with the value the store still holds) are returned, exactly
-    /// as `mic::read_and_reconcile` surfaces them.
+    /// Mirrors `mic::read_and_reconcile`: applies the rewrites it can, then
+    /// re-resolves the store it is actually left holding and returns the keys
+    /// that still diverge (with the value the store holds). A rewrite that
+    /// lands can change the pair's validity, so only the resolution of the
+    /// final store state is what the next recording and the console describe.
     fn reconcile(&mut self) -> Vec<(String, String)> {
         let (_, fixes) = reconcile_settings(
             self.fetch(BITS_KEY).as_deref(),
@@ -76,23 +77,31 @@ impl ConfigStore {
             self.fetch(RAW_KEY).as_deref(),
             self.fetch(GAIN_KEY).as_deref(),
         );
-        if self.fail_reconcile {
-            let mut failed = Vec::new();
-            for fix in &fixes {
-                failed.push((
-                    fix.key.to_string(),
-                    self.fetch(fix.key).unwrap_or_else(|| fix.value.clone()),
-                ));
-            }
-            return failed;
-        }
         for fix in fixes {
+            if self.fail_reconcile || self.fail_writes.contains(&fix.key) {
+                continue;
+            }
             match self.entries.iter_mut().find(|(k, _)| k == fix.key) {
                 Some((_, v)) => *v = fix.value,
                 None => self.entries.push((fix.key.to_string(), fix.value)),
             }
         }
-        Vec::new()
+        let (_, remaining) = reconcile_settings(
+            self.fetch(BITS_KEY).as_deref(),
+            self.fetch(RATE_KEY).as_deref(),
+            self.fetch(EDGE_KEY).as_deref(),
+            self.fetch(RAW_KEY).as_deref(),
+            self.fetch(GAIN_KEY).as_deref(),
+        );
+        remaining
+            .iter()
+            .map(|fix| {
+                (
+                    fix.key.to_string(),
+                    self.fetch(fix.key).unwrap_or_else(|| fix.value.clone()),
+                )
+            })
+            .collect()
     }
 
     /// The effective settings a recording started right now would use, exactly
@@ -519,6 +528,47 @@ fn failed_reconcile_write_is_reported_and_cannot_be_silently_reactivated() {
     store.set(RATE_KEY, "32000").expect("legal once reconciled");
     assert_eq!(store.get(RATE_KEY).as_deref(), Some("32000"));
     assert_eq!(store.settings().bits, DEFAULT_BITS);
+}
+
+/// The console must report the resolution of the store reconciliation actually
+/// leaves behind, not the pre-write one: a rewrite that lands can change the
+/// pair's validity, which makes the pre-write fallback stale. Trace: a lone
+/// 8-bit slot whose rewrite keeps failing, then `ptt_rate 32000`, then a read
+/// where the bits rewrite lands and the rate rewrite fails leaves a valid
+/// `{32, 32000}` pair - the console and the next recording must both say
+/// `32000`, not the pre-write fallback `16000`.
+#[test]
+fn report_and_effective_use_the_store_left_behind_by_reconciliation() {
+    let mut store = ConfigStore::default();
+    // A lone 8-bit slot whose rewrite keeps failing; 8 @ 16 kHz is out of
+    // window, so the effective pair is the 32/16000 default.
+    store.entries.push((BITS_KEY.to_string(), "8".to_string()));
+    store.fail_writes.push(BITS_KEY);
+    let reported = store.get(BITS_KEY).expect("ptt_bits is owned");
+    assert!(reported.starts_with("32"), "{reported}");
+    assert!(reported.contains('8'), "{reported}");
+
+    // The captain sets the rate to 32000; 8 @ 32000 is still out of window, so
+    // this stays the fallback pair while the stale 8-bit slot is stored.
+    store
+        .set(RATE_KEY, "32000")
+        .expect("8 @ 32000 stays out of window");
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("8"));
+    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
+
+    // Now the bits rewrite lands (8 -> 32) while the rate rewrite fails. The
+    // store is left holding the valid 32/32000 pair, so that - not the
+    // pre-write 16000 fallback - is what the console and the recording report.
+    store.fail_writes.clear();
+    store.fail_writes.push(RATE_KEY);
+    let reported = store.get(RATE_KEY).expect("ptt_rate is owned");
+    assert_eq!(reported, "32000", "{reported}");
+    assert_eq!(store.fetch(RATE_KEY).as_deref(), Some("32000"));
+    let settings = store.settings();
+    assert_eq!(settings.bits, DEFAULT_BITS);
+    assert_eq!(settings.rate, 32_000);
+    assert_eq!(settings.bclk_hz(), 2_048_000);
+    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
 }
 
 /// Prints a transcript of the captain's real workflow - `config set`, then

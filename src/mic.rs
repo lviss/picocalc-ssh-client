@@ -90,19 +90,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
-/// A stored `ptt_*` key whose reconciliation rewrite failed, so the store still
-/// holds a value the next recording will not use.
+/// A stored `ptt_*` key the final store state still does not resolve to its
+/// effective value, with the value the store holds.
 struct UnreconciledKey {
     key: &'static str,
     stored: String,
-    error: String,
 }
 
 /// Outcome of reading and reconciling the stored `ptt_*` keys.
 struct StoreOutcome {
-    /// What the store actually holds: `resolved.settings` except that a clock
-    /// key whose rewrite failed keeps its raw stored value.
+    /// The pair the store actually holds after reconciliation (raw values for
+    /// any key that could not be rewritten).
     stored: MicSettings,
+    /// The resolution of that final store state - exactly what the next
+    /// recording uses and what `config get`/`list` report.
     resolved: terminal_model::mic_config::ResolvedSettings,
     unreconciled: Vec<UnreconciledKey>,
 }
@@ -114,12 +115,12 @@ struct StoreOutcome {
 /// stored key that no longer matches its effective value is rewritten, so the
 /// store, `config get`/`list`, and the next recording all agree.
 ///
-/// Returns both the effective settings and the settings the store actually
-/// holds afterwards. The two differ only when a reconciliation write fails, in
-/// which case the failed key keeps its raw stored value; the second is the
-/// pair a `config set` must not let become effective, so validation never rests
-/// on an unconfirmed write. A failed write is printed and reported, never
-/// discarded.
+/// The store is then re-read and re-resolved: a rewrite that lands can change
+/// the pair's validity (e.g. repairing a lone 8-bit slot makes a stored rate
+/// legal again), so only the resolution of the state the store is actually
+/// left in is what the next recording uses. The returned `stored`/`resolved`
+/// and the unreconciled list all describe that same final state, and a failed
+/// write is printed and reported, never discarded.
 async fn read_and_reconcile() -> StoreOutcome {
     let mut config = CONFIG.get().lock().await;
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
@@ -127,52 +128,67 @@ async fn read_and_reconcile() -> StoreOutcome {
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
     let raw = config.fetch(RAW_KEY).await.ok().flatten();
     let gain = config.fetch(GAIN_KEY).await.ok().flatten();
-    let (resolved, fixes) = reconcile_mic_settings(
+    let (_, fixes) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
         raw.as_ref().map(|v| v.as_str()),
         gain.as_ref().map(|v| v.as_str()),
     );
-    let mut stored = resolved.settings;
-    let mut unreconciled: Vec<UnreconciledKey> = Vec::new();
+    let mut write_errors: Vec<(&'static str, String)> = Vec::new();
     for fix in &fixes {
         let result = match TryInto::<StrValue>::try_into(fix.value.as_str()) {
             Ok(value) => config.store(fix.key, value).await,
             Err(err) => Err(err),
         };
         if let Err(err) = result {
-            match fix.key {
-                BITS_KEY => stored.bits = resolved.raw.bits,
-                RATE_KEY => stored.rate = resolved.raw.rate,
-                _ => {}
-            }
-            let original = match fix.key {
-                BITS_KEY => bits.clone(),
-                RATE_KEY => rate.clone(),
-                EDGE_KEY => edge.clone(),
-                RAW_KEY => raw.clone(),
-                GAIN_KEY => gain.clone(),
-                _ => None,
-            };
-            unreconciled.push(UnreconciledKey {
-                key: fix.key,
-                stored: original
-                    .map(|v| alloc::format!("{v}"))
-                    .unwrap_or_else(|| fix.value.clone()),
-                error: alloc::format!("{err:?}"),
-            });
+            write_errors.push((fix.key, alloc::format!("{err:?}")));
         }
+    }
+    let bits = config.fetch(BITS_KEY).await.ok().flatten();
+    let rate = config.fetch(RATE_KEY).await.ok().flatten();
+    let edge = config.fetch(EDGE_KEY).await.ok().flatten();
+    let raw = config.fetch(RAW_KEY).await.ok().flatten();
+    let gain = config.fetch(GAIN_KEY).await.ok().flatten();
+    let (resolved, remaining) = reconcile_mic_settings(
+        bits.as_ref().map(|v| v.as_str()),
+        rate.as_ref().map(|v| v.as_str()),
+        edge.as_ref().map(|v| v.as_str()),
+        raw.as_ref().map(|v| v.as_str()),
+        gain.as_ref().map(|v| v.as_str()),
+    );
+    let mut unreconciled: Vec<UnreconciledKey> = Vec::new();
+    for fix in &remaining {
+        let stored = match fix.key {
+            BITS_KEY => bits.as_ref(),
+            RATE_KEY => rate.as_ref(),
+            EDGE_KEY => edge.as_ref(),
+            RAW_KEY => raw.as_ref(),
+            GAIN_KEY => gain.as_ref(),
+            _ => None,
+        };
+        unreconciled.push(UnreconciledKey {
+            key: fix.key,
+            stored: stored
+                .map(|v| alloc::format!("{v}"))
+                .unwrap_or_else(|| fix.value.clone()),
+        });
     }
     drop(config);
     for failed in &unreconciled {
-        print!(
-            "ptt: failed to reconcile {} ({}) - store still holds {}; console reports flag it\r\n",
-            failed.key, failed.error, failed.stored
-        );
+        match write_errors.iter().find(|(key, _)| *key == failed.key) {
+            Some((_, err)) => print!(
+                "ptt: failed to reconcile {} ({}) - store still holds {}; console reports flag it\r\n",
+                failed.key, err, failed.stored
+            ),
+            None => print!(
+                "ptt: {} store is unreconciled (still holds {}); console reports flag it\r\n",
+                failed.key, failed.stored
+            ),
+        }
     }
     StoreOutcome {
-        stored,
+        stored: resolved.raw,
         resolved,
         unreconciled,
     }
