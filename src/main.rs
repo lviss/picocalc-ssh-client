@@ -204,8 +204,19 @@ async fn main(spawner: Spawner) {
     let rst = Output::new(rst, Level::Low);
     // dcx: 0 = command, 1 = data
 
-    // display interface abstraction from SPI and DC
-    const DISPLAY_BUFFER_SIZE: usize = 320 * 3 * 320;
+    // Display interface abstraction from SPI and DC.
+    //
+    // This is the interface's SPI *batching* buffer, not a framebuffer:
+    // mipidsi's `SpiInterface` only requires it to hold at least one pixel and
+    // uses it to group pixels into larger SPI writes (its docs say "the buffer
+    // should be at least big enough to hold a few pixels"). A full-frame buffer
+    // therefore buys transfer speed only, at a large RAM cost - and that RAM is
+    // shared with the executor stack, because flip-link places `.bss` directly
+    // above it. The push-to-talk work added ~26 KiB of static `.bss` (the PCM
+    // ring plus two task pools), shrinking that stack from ~70 KiB to ~45 KiB
+    // and overflowing the deep SSH connect path. A generous 64-pixel-row batch
+    // keeps screen updates fast while leaving the stack ample headroom.
+    const DISPLAY_BUFFER_SIZE: usize = 320 * 3 * 64;
     static DISPLAY_BUFFER: StaticCell<[u8; DISPLAY_BUFFER_SIZE]> = StaticCell::new();
     let di = SpiInterface::new(
         display_spi,
