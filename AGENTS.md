@@ -96,7 +96,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   says otherwise. Current readings for the `pimoroni2w` release ELF: `_stack_start`=0x20046948
   (~281.8 KiB) before PTT-over-SSH, 0x20045a88 (~278.6 KiB) after it - that feature's fixed
   `AUDIO_QUEUE` (3 audio frames, `src/net.rs`) plus the larger `ptt_upload_task` future cost ~3.2
-  KiB of headroom, which is the whole of its `.bss` footprint.
+  KiB of headroom, which is the whole of its `.bss` footprint. The two chips do differ by a
+  little: re-measured after this work, the source gives `_stack_start`=0x20045a88 (~278.6 KiB) on
+  `pico2w` and 0x200459f8 (~278.5 KiB) on `pimoroni2w`, so always name the chip with the reading
+  (the 0x20045a88 figure above was originally recorded as pimoroni2w's).
+- `make image` embeds the image version (reported by `picotool info -a`, and used in the `.uf2`
+  filename) from `build.rs`'s `PICOCALC_CI_TAG`, which `build.rs` computes by running `git show -s`
+  itself when it runs. `build.rs` asks cargo to `rerun-if-changed=memory.x` only, so an incremental
+  build whose only change since the last one is the commit (docs-only commit, or a commit made
+  after an earlier build) reuses the old build-script output and embeds the *previous* commit's tag
+  - `touch build.rs` (or a clean build) before `make image` whenever the artifact must name the
+  current HEAD. CI is unaffected: it always builds from a fresh target directory.
 - `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
   computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
   (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and
