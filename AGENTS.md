@@ -208,7 +208,16 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   wire), so a narrow raw slot cannot meter zero while carrying signal. `src/screen.rs`'s
   `draw_overlay` draws it as a bar when `mic::is_recording()` (empty at the noise floor, red when
   pinned). The windowed median is deliberate: a plain DC-removed AC RMS let the known per-chunk
-  capture artifact below dominate the bar and swing it full/empty at idle.
+  capture artifact below dominate the bar and swing it full/empty at idle. `src/screen.rs`'s
+  `LEVEL_METER_FULL_SCALE` is calibrated against the windowed-median statistic's real measured
+  range on four confirmed-good real captures (independently verified transcribable by both
+  openai-whisper and whisper.cpp) rather than a synthetic tone: the original 512 was sized against
+  `ac_level_ignores_a_spike_confined_to_one_window`'s 100%-duty-cycle `loud` test fixture, which
+  reads far higher than real speech ever does at the same peak amplitude (real speech has silence
+  between words/syllables, so most 25ms windows sit well under a sustained tone's RMS) - that
+  mismatch, not the underlying statistic, is why the meter looked dead on real hardware despite
+  carrying real, transcribable audio. Re-derive the constant (see the doc comment on
+  `LEVEL_METER_FULL_SCALE`) if the windowed-median formula in `pcm_extract.rs` ever changes.
   A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
   (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
   counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carries ~91%

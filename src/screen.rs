@@ -286,10 +286,20 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
 
 /// Height of the push-to-talk level-meter bar, in pixels.
 const LEVEL_METER_HEIGHT: u32 = 8;
-/// AC RMS level (`i16` counts) that fills the meter. `mic::level` already
-/// removes the mic's DC offset, so its noise floor (~2 counts) reads empty
-/// while speech (hundreds of counts) visibly fills the bar.
-const LEVEL_METER_FULL_SCALE: u32 = 512;
+/// AC RMS level (`i16` counts) that fills the meter. Calibrated against the
+/// windowed-median statistic's actual measured range on four confirmed-good
+/// real captures (independently verified transcribable by both openai-whisper
+/// and whisper.cpp): per-recording median levels of 5-10, 90th-percentile
+/// levels of 32-79, and peaks of 118-307. The original value of 512 was
+/// calibrated against a synthetic 100%-duty-cycle test tone (see
+/// `ac_level_ignores_a_spike_confined_to_one_window`'s `loud` fixture in
+/// `pcm_extract.rs`) rather than real speech; real speech has silence between
+/// words and syllables, so a 25ms window's own median-of-8-sub-window RMS
+/// reads far lower than a sustained tone at the same peak amplitude ever
+/// would. That mismatch - not the underlying statistic, which is correctly
+/// glitch-robust - is why the meter stayed visually near-empty on real
+/// hardware despite carrying real, transcribable audio.
+const LEVEL_METER_FULL_SCALE: u32 = 150;
 
 fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut PicoCalcDisplay) {
     const PADDING_X: i32 = 10;
