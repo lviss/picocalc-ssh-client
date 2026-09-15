@@ -9,4 +9,5 @@ pub mod key_dispatch;
 pub mod keyfile;
 pub mod mic_config;
 pub mod pcm_extract;
+pub mod ptt_frame;
 pub mod screen_model;

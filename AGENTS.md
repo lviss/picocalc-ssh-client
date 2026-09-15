@@ -89,10 +89,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   knob that sets it. This is not cosmetic: the PTT work's ~28 KiB of static `.bss` (the PCM ring
   plus the two embassy task pools) had taken the stack from ~70 KiB on `main`'s 307 KiB-buffer
   build down to ~45 KiB, which is what overflowed the deep SSH connect/KEX path; the 61 KiB batch
-  restored it to ~282 KiB (the region above `_stack_start` in the linked ELF). Re-measure that
-  region (e.g. read `_stack_start` from the `.elf` after `make image`) before enlarging the
-  display buffer, adding another task pool, or growing any other static `.bss`, and keep the
-  batch at least this generous unless the measurement says otherwise.
+  restored it to ~282 KiB (measured as `_stack_start` - 0x20000000 in the linked ELF, i.e. the
+  stack region below the statics). Re-measure that region (e.g. read `_stack_start` with `nm` from
+  the `.elf` after `make image`) before enlarging the display buffer, adding another task pool, or
+  growing any other static `.bss`, and keep the batch at least this generous unless the measurement
+  says otherwise. Current readings for the `pimoroni2w` release ELF: `_stack_start`=0x20046948
+  (~281.8 KiB) before PTT-over-SSH, 0x20045a88 (~278.6 KiB) after it - that feature's fixed
+  `AUDIO_QUEUE` (3 audio frames, `src/net.rs`) plus the larger `ptt_upload_task` future cost ~3.2
+  KiB of headroom, which is the whole of its `.bss` footprint.
 - `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
   computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
   (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and
@@ -308,8 +312,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   joystick/gamepad-bearing variant of this same keyboard co-processor protocol, not this device -
   treat that whole code group as suspect for any future key binding on this hardware. Destination
   is `config set ptt_host`/`config set ptt_port` (plain `sequential_storage` keys, no
-  special-casing needed in `config.rs`). Wire format (needed by anything implementing the
-  receiving side): one TCP connection per utterance, opened on button press and closed on release;
+  special-casing needed in `config.rs`), *or* the SSH session's audio channel when one is up - see
+  the push-to-talk-over-SSH entry below for that transport and how the two are chosen.
+  Wire format for the TCP sink (needed by anything implementing the receiving side): one TCP
+  connection per utterance, opened on button press and closed on release;
   each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
   16-bit little-endian mono PCM at the configured `ptt_rate` (default 16 kHz; the rate is not
   signaled on the wire, so the receiver must be told it out of band). With `ptt_raw=1` the payload
@@ -317,7 +323,38 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   unprocessed at the default `ptt_gain=1`; at a higher gain the driven slots are DC-removed and
   scaled first - see the `ptt_gain` note above); a receiver should concatenate frame payloads
   before parsing words (frame boundaries are upload-side, not word-aligned). No handshake, no
-  other framing.
+  other framing. Both sinks frame identically through `terminal_model/src/ptt_frame.rs` (host-
+  tested); they differ only in what ends an utterance - the TCP sink closes its connection, the
+  SSH channel stays open and gets a zero-length frame instead.
+- Push-to-talk can also ride the *existing* SSH session (`src/net.rs`'s `ssh_audio_branch`,
+  `ssh_audio_send`, `pump_audio`), which is the preferred transport whenever a session is up:
+  `mic.rs`'s `serve_utterance` asks `net::ssh_audio_available()` once per utterance and only falls
+  back to the `ptt_host`/`ptt_port` TCP sink when it is false. The audio goes over a **second SSH
+  channel of the same connection** - no new connection, no listening port anywhere, no extra
+  credential - which `exec`s the server-side helper (`config set ptt_ssh_cmd`, default
+  `picocalc-ptt`; an empty value disables the transport). The helper lives in this repo at
+  `tools/picocalc-ptt` (Python 3 stdlib only, tests in `tools/test_picocalc_ptt.py`, run with
+  `python3 tools/test_picocalc_ptt.py`; nothing else in the repo is Python). Its protocol is
+  documented in that file's docstring and in `terminal_model/src/ptt_frame.rs`; one helper process
+  runs per SSH session and transcribes each utterance on the device's zero-length end marker,
+  typing the text into tmux (`tmux send-keys -l`).
+  Two sunset (the SSH stack) sharp edges shaped that design and must stay in mind for any future
+  channel work: (1) `Channels::open` only reuses a slot that is `None`, and nothing frees a
+  client-side channel slot after `channel_done`, so with `MAX_CHANNELS = 4` a client can open only
+  a few channels per connection - hence *one* audio channel per session, not one per utterance,
+  which is also why the end-of-utterance marker exists at all; (2) `CliEvent::SessionExit` carries
+  no channel number, so with two session channels an exit event cannot be attributed - the ticker
+  therefore only ends the session on it when `ssh_audio_available()` is false, and otherwise relies
+  on the interactive channel's own EOF (`ssh_channel_task`), which is what makes a missing or
+  crashing helper print a message and fall back to TCP instead of tearing the user's terminal
+  down. `ssh_audio_branch` is an arm of the session's `select` and must never return while the
+  session lives: when the audio channel dies it drains `AUDIO_QUEUE` forever instead.
+  The handoff is a fixed `Channel<CS, AudioFrame, 3>` of encoded frames (never heap):
+  `ssh_audio_available()` is set only after the ticker has sent the helper's `exec` request (so
+  audio can never be written before the process exists) and is cleared by `AudioReadyGuard` when
+  the branch stops pumping; a frame that cannot be queued within `AUDIO_SEND_TIMEOUT` (1 s) makes
+  `ssh_audio_send` return false, and the recording's drain loop then drops the rest of that
+  utterance while still metering it, exactly as a broken TCP connection does.
 - `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
   It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
   DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected

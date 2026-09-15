@@ -18,7 +18,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
-*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a configurable network host (see below) for off-device transcription.
+*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a server-side helper over the SSH session (which transcribes it with Whisper and types it into your tmux pane), or to a configurable TCP host (see below).
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -331,16 +331,90 @@ entirely by the keyboard co-processor and doesn't involve this firmware.
 ### Push-to-Talk Voice Capture
 
 Hold `F1` (plain, no modifiers - see `src/keyboard.rs` if you want to rebind
-it to a different key) to capture microphone audio and stream it to a
-network host of your choice — for
-example, a companion process on your SSH server that runs speech-to-text and
-injects the resulting text into your session. Configure the destination
-before using it:
+it to a different key) to capture microphone audio. Where it goes depends on
+whether an SSH session is up:
+
+*   With an SSH session active, the audio travels down that *same* connection
+    to a companion process on the server, which transcribes it and types the
+    text into your tmux session. This is the transport to use for dictation,
+    and it needs no configuration on the device at all.
+*   Otherwise it is streamed to a plain TCP host you configure with
+    `ptt_host`/`ptt_port`, as it was before dictation existed.
+
+#### Transcribing into your tmux session
+
+While an SSH session is connected, `F1` opens a *second SSH channel* on that
+same connection, runs `tools/picocalc-ptt` on it, and streams the audio
+there:
+
+```
+PicoCalc --(ssh terminal channel)------------------------> your shell in tmux
+         --(ssh audio channel: exec picocalc-ptt)--> whisper --> tmux send-keys
+```
+
+Nothing new listens on the server, and nothing new is authenticated: the audio
+rides the connection the device already has, and the helper runs as you, with
+your permissions, exactly as your shell does. A port forward was the
+alternative, but either direction needs a listening socket (on the server, or
+on the device), and this firmware's SSH stack (`sunset`) implements no
+forwarding at all - so a channel on the session is both the lighter change and
+the smaller security surface.
+
+To set it up, copy `tools/picocalc-ptt` to the server, put it somewhere on
+your non-interactive `PATH` (for example `/usr/local/bin`), make it
+executable, and point it at whisper in `~/.config/picocalc-ptt.conf`:
+
+```ini
+# ~/.config/picocalc-ptt.conf
+whisper = whisper-cli -m ~/models/ggml-base.en.bin -f %wav -nt -np
+# or, with openai-whisper:
+# whisper = whisper %wav --model base --output_format txt --output_dir %dir
+tmux_target = work     # optional; default is tmux's most recently used session
+enter = no             # yes to also press Enter after typing
+```
+
+`%wav` is replaced by the capture's WAV path and `%dir` by a private working
+directory. The transcript is read from the command's standard output, or from
+`%dir/picocalc-ptt.txt` when it printed nothing there - which is what both
+whisper.cpp's `-of` and openai-whisper's `--output_dir` write. The text is then
+typed into the target pane literally, with a trailing space (so consecutive
+dictations do not run together) and no newlines.
+
+Then hold `F1` and speak. The device runs `picocalc-ptt` as-is, so a different
+path or extra options go in `ptt_ssh_cmd`:
 
 ```bash
+$ config set ptt_ssh_cmd "/home/me/bin/picocalc-ptt --tmux-target work"
+$ config get ptt_ssh_cmd        # what the next session will run
+$ config set ptt_ssh_cmd ""     # empty disables it: use the raw TCP host instead
+```
+
+If the helper cannot be started or it exits, the device reports why on screen
+(its stderr is shown) and falls back to the raw TCP host for the rest of that
+session. The helper needs Python 3 plus your whisper command, and nothing else.
+Run `tools/picocalc-ptt --help` for its options and
+`python3 tools/test_picocalc_ptt.py` for its tests, which need neither whisper
+nor tmux.
+
+#### Streaming to a raw TCP host
+
+For capturing to a receiver of your own (a laptop on the same network, another
+transcription setup), disable the SSH helper and configure the destination:
+
+```bash
+$ config set ptt_ssh_cmd ""
 $ config set ptt_host mymachine.example.com
 $ config set ptt_port 9000
 ```
+
+The receiver gets one TCP connection per utterance, opened when you press
+`F1` and closed when you release it: a 4-byte little-endian byte count, then
+that many bytes of audio, repeated. By default the audio is mono 16-bit
+little-endian PCM at `ptt_rate` (16 kHz), which the wire does not signal, so
+the receiver has to be told the rate out of band; see AGENTS.md for the
+authoritative contract.
+
+#### Microphone bring-up and diagnostics
 
 For bringing up a new microphone there are also optional debug settings. They
 take effect on the *next* recording without a rebuild or reflash, and default to
@@ -390,14 +464,16 @@ store still holds, and a `config set` that would make that stale value effective
 again is refused rather than silently changing the reported setting.
 
 A small "recording..." overlay is shown while the button is held.
-Transcription itself is not implemented by this firmware — it only captures
-and streams raw audio; see AGENTS.md for the wire format a receiving process
-needs to speak, and README-DEVICE.md for the mic's I2S pin wiring.
+Transcription is not implemented by this firmware — it only captures and
+streams raw audio; see AGENTS.md for the wire format a receiving process
+needs to speak, README-DEVICE.md for the mic's I2S pin wiring, and
+`tools/picocalc-ptt` for the transcribing end of the SSH transport.
 
 > [!NOTE]
 > This requires a digital I2S microphone wired to the pins documented in
-> README-DEVICE.md. It streams audio unencrypted over a plain TCP
-> connection; only use it on a network you trust.
+> README-DEVICE.md. The SSH transport is encrypted, being part of the SSH
+> session; the `ptt_host`/`ptt_port` fallback streams audio unencrypted over a
+> plain TCP connection, so only use that on a network you trust.
 
 ### Local Commands
 

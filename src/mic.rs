@@ -1,7 +1,9 @@
 //! Push-to-talk voice capture: a PIO-driven I2S RX driver for a digital mic
 //! wired to the expansion-header pins freed by dropping the slow PSRAM path
 //! (see AGENTS.md and `psram.rs`), plus the task that streams captured audio
-//! to a configurable network host.
+//! to a configurable destination: the SSH session's audio channel when one is
+//! up (see `crate::net`), and otherwise the raw TCP host `ptt_host`/`ptt_port`
+//! names.
 //!
 //! Audio is staged between the capture and upload tasks in a fixed,
 //! allocation-free static ring buffer (`terminal_model::audio_ring`), not on
@@ -21,10 +23,12 @@
 //! back to the default rather than silently mis-clocking the mic.
 //!
 //! Wire format: see AGENTS.md's push-to-talk entry for the authoritative
-//! framing contract a receiving process must speak (one TCP connection per
-//! utterance, opened on button press and closed on release; a 4-byte
-//! little-endian length prefix per frame, then mono PCM at `ptt_rate` - or the
-//! raw FIFO words under `ptt_raw=1`).
+//! framing contract a receiving process must speak, and
+//! [`terminal_model::ptt_frame`] for the encoder both transports use: a 4-byte
+//! little-endian length prefix per frame, then mono PCM at `ptt_rate` (or the
+//! raw FIFO words under `ptt_raw=1`). The transports differ only in how an
+//! utterance ends: the TCP sink closes its connection, while the SSH channel -
+//! which stays open for the whole session - sends a zero-length frame.
 
 use crate::Irqs;
 use crate::config::{CONFIG, Configuration, StrValue};
@@ -61,6 +65,7 @@ use terminal_model::pcm_extract::{
     ac_rms_level, ac_rms_level_word_pairs, bit_clock_hz, extract_left_channel_pcm,
     remove_dc_and_gain_samples, remove_dc_and_gain_words,
 };
+use terminal_model::ptt_frame;
 
 extern crate alloc;
 
@@ -68,6 +73,10 @@ extern crate alloc;
 /// 20-50 ms guidance. A chunk is a fixed number of samples, so a non-default
 /// `ptt_rate` changes its duration but not the buffer sizes.
 const SAMPLES_PER_CHUNK: usize = DEFAULT_RATE_HZ as usize / 40;
+/// Bytes of the wire frame one capture chunk is sent as: the length prefix plus
+/// the samples, per `terminal_model::ptt_frame`. The SSH session sizes its
+/// fixed audio queue with this, so the two cannot drift apart.
+pub const WIRE_FRAME_BYTES: usize = ptt_frame::frame_bytes(SAMPLES_PER_CHUNK);
 /// Capacity of the shared capture/upload ring, in `i16` samples: 2048 samples
 /// at 16 kHz is 128 ms of audio, enough to absorb ordinary connection-setup
 /// and scheduling jitter without being a meaningful memory cost. This buffer
@@ -599,21 +608,24 @@ async fn capture_task(mut mic: Mic) {
     }
 }
 
-/// Sends one wire frame: a 4-byte little-endian byte count, then the samples.
-/// Uses only fixed stack buffers (no heap) so the upload hot path cannot
-/// allocate.
+/// Sends one wire frame (`terminal_model::ptt_frame`) on a TCP connection: the
+/// 4-byte little-endian byte count, then the samples. Uses only fixed stack
+/// buffers (no heap), and sends the samples in batches rather than building the
+/// whole frame first, so the upload task's storage stays small.
 async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
     const BATCH_SAMPLES: usize = 64;
-    let byte_len = (chunk.len() * 2) as u32;
-    if socket.write_all(&byte_len.to_le_bytes()).await.is_err() {
+    let Some(len) = ptt_frame::len_bytes(chunk.len() * 2) else {
+        return false;
+    };
+    if socket.write_all(&len).await.is_err() {
         return false;
     }
     let mut bytes = [0u8; BATCH_SAMPLES * 2];
     for batch in chunk.chunks(BATCH_SAMPLES) {
-        for (i, sample) in batch.iter().enumerate() {
-            bytes[i * 2..i * 2 + 2].copy_from_slice(&sample.to_le_bytes());
-        }
-        if socket.write_all(&bytes[..batch.len() * 2]).await.is_err() {
+        let Some(n) = ptt_frame::encode_samples(&mut bytes, batch) else {
+            return false;
+        };
+        if socket.write_all(&bytes[..n]).await.is_err() {
             return false;
         }
     }
@@ -647,12 +659,25 @@ async fn emit_pending_notices() {
 /// nor be mistaken for this one's end. With no socket (connect failed or
 /// timed out) the samples are discarded instead, so the ring is still drained
 /// and the recording always terminates.
+///
+/// The destination is chosen once per utterance: the SSH session's audio
+/// channel when it is up (see [`crate::net::ssh_audio_available`]), because
+/// that is the transport that can reach a helper running on the machine the
+/// user is typing into, and otherwise the raw TCP sink
+/// `ptt_host`/`ptt_port` describes. If the chosen sink fails mid-recording the
+/// rest of that utterance is drained and metered but dropped, as it was for a
+/// broken TCP connection before the SSH transport existed.
 async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) {
-    let mut socket = match with_timeout(CONNECT_TIMEOUT, connect_for_upload(tx_buf, rx_buf)).await {
-        Ok(socket) => socket,
-        Err(_) => {
-            print!("ptt: connect timed out, dropping recording\r\n");
-            None
+    let mut ssh = crate::net::ssh_audio_available();
+    let mut socket = if ssh {
+        None
+    } else {
+        match with_timeout(CONNECT_TIMEOUT, connect_for_upload(tx_buf, rx_buf)).await {
+            Ok(socket) => socket,
+            Err(_) => {
+                print!("ptt: connect timed out, dropping recording\r\n");
+                None
+            }
         }
     };
 
@@ -678,7 +703,17 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
             // what the connection is actually draining (post-`ptt_gain`), which
             // is identical to the mic's own level at the default gain of 1.
             PTT_LEVEL.store(meter_level(&buf[..n]), Ordering::Release);
-            if let Some(sock) = socket.as_mut()
+            if ssh {
+                // The session's audio channel, carrying this utterance's
+                // frames on the connection the interactive session already
+                // has. `false` means it stopped taking them (the session ended
+                // or its helper went away), which also covers the channel
+                // becoming unavailable between chunks.
+                if !crate::net::ssh_audio_send(&buf[..n]).await {
+                    print!("ptt: ssh audio channel unavailable, dropping rest\r\n");
+                    ssh = false;
+                }
+            } else if let Some(sock) = socket.as_mut()
                 && !send_chunk(sock, &buf[..n]).await
             {
                 print!("ptt: send failed, dropping rest of recording\r\n");
@@ -700,7 +735,16 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
     }
     emit_pending_notices().await;
 
-    // `socket` drops here, closing the TCP connection, which is this wire
+    if ssh {
+        // The SSH channel stays open for the whole session, so the end of this
+        // utterance has to be marked in band (a zero-length frame) rather than
+        // by closing anything - unlike the TCP transport below, whose
+        // end-of-utterance signal is the connection closing as `socket` drops.
+        if !crate::net::ssh_audio_end_of_utterance().await {
+            print!("ptt: ssh audio channel unavailable, dropping utterance end\r\n");
+        }
+    }
+    // `socket` drops here, closing the TCP connection, which is that wire
     // format's end-of-utterance signal to the receiver.
 }
 
@@ -714,6 +758,8 @@ async fn ptt_upload_task() {
         // Serve every utterance exactly once, in order. Generations are
         // contiguous, so once `CURRENT_GEN` has reached one it exists and must
         // be served - even if it was superseded before its connect resolved.
+        // Which sink that is (the SSH session's audio channel or a TCP
+        // connection) is decided per utterance in `serve_utterance`.
         while next_generation > CURRENT_GEN.load(Ordering::Acquire) {
             UPLOAD_START_SIGNAL.wait().await;
         }
@@ -745,7 +791,8 @@ async fn connect_for_upload<'a>(
         )
     };
     let (Ok(Some(host)), Ok(Some(port))) = (host, port) else {
-        print!("ptt: set ptt_host and ptt_port to stream recordings\r\n");
+        print!("ptt: set ptt_host and ptt_port, or use an ssh session,\r\n");
+        print!("     to stream recordings\r\n");
         return None;
     };
     let Ok(port) = port.as_str().parse::<u16>() else {
