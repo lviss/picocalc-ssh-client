@@ -10,6 +10,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use terminal_model::key_dispatch::{PttAction, PttTransition, ptt_action};
 
 static BATTERY_PCT: AtomicU8 = AtomicU8::new(0xff);
 
@@ -328,7 +329,35 @@ pub async fn keyboard_reader(
 
         if let Some(key) = keyboard.process().await {
             log::info!("key == {key:?}");
-            if key.state == KeyState::Pressed {
+            // Push-to-talk: hold plain F1 (no modifiers) to record; release
+            // to send. Arming and stopping are deliberately independent
+            // checks, implemented by `terminal_model::key_dispatch::ptt_action`
+            // so the decision table can be unit-tested off-target. Arming
+            // requires no modifiers, so Ctrl+F1 falls through to the reboot
+            // shortcut below instead of starting a recording. Stopping only
+            // requires that a recording is active - it does not re-check
+            // modifiers, because a Released report for F1 must always end the
+            // recording regardless of what modifiers are held at that instant
+            // (e.g. Ctrl pressed while F1 was already down). Relies on the same
+            // reliable `Hold`/`Released` state reporting that `modifier_flag`
+            // above already depends on; rebinding to a different key means
+            // changing the `Key::F1` check passed to `ptt_action` here.
+            let transition = match key.state {
+                KeyState::Pressed => PttTransition::Pressed,
+                KeyState::Released => PttTransition::Released,
+                KeyState::Idle | KeyState::Hold => PttTransition::Other,
+            };
+            let ptt = ptt_action(
+                key.key == Key::F1,
+                transition,
+                key.modifiers == Modifiers::NONE,
+                crate::mic::is_recording(),
+            );
+            if ptt == PttAction::Start {
+                crate::mic::start_recording().await;
+            } else if ptt == PttAction::Stop {
+                crate::mic::stop_recording().await;
+            } else if key.state == KeyState::Pressed {
                 match key.key {
                     Key::F5 if key.modifiers == Modifiers::CTRL => {
                         reboot_bootsel();
