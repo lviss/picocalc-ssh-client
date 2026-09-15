@@ -5,7 +5,7 @@
 //! same public entry points the firmware calls, in the same order, so the
 //! captain's actual workflow is exercised as a whole:
 //!
-//! * `validate_setting` is `src/config.rs`'s `config set` guard;
+//! * `validate_setting_with_store` is `src/config.rs`'s `config set` guard;
 //! * `resolve` is `mic::load_settings`, which runs at the start of *every*
 //!   recording so a change takes effect on the next utterance;
 //! * `build_i2s_rx_program` is what `Mic::apply` assembles for the settings;
@@ -20,7 +20,7 @@ use pio::{Instruction, InstructionOperands, SetDestination};
 use terminal_model::i2s_program::{PROGRAM_SIZE, build_i2s_rx_program};
 use terminal_model::mic_config::{
     BITS_KEY, DEFAULT_BITS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
-    effective_setting, reconcile as reconcile_settings, resolve, validate_setting,
+    reconcile as reconcile_settings, report_setting, resolve, validate_setting_with_store,
 };
 use terminal_model::pcm_extract::{
     extract_left_channel_pcm, remove_dc_and_gain_samples, remove_dc_and_gain_words,
@@ -65,8 +65,10 @@ impl ConfigStore {
     /// Mirrors `mic::read_and_reconcile`: rewrites any stored `ptt_*` key that
     /// no longer matches the effective setting, so the store and the reported/
     /// effective values cannot diverge. `fail_reconcile` simulates the write
-    /// failing, leaving the stale key in place.
-    fn reconcile(&mut self) {
+    /// failing, leaving the stale key in place; the keys that could not be
+    /// rewritten (with the value the store still holds) are returned, exactly
+    /// as `mic::read_and_reconcile` surfaces them.
+    fn reconcile(&mut self) -> Vec<(String, String)> {
         let (_, fixes) = reconcile_settings(
             self.fetch(BITS_KEY).as_deref(),
             self.fetch(RATE_KEY).as_deref(),
@@ -75,7 +77,14 @@ impl ConfigStore {
             self.fetch(GAIN_KEY).as_deref(),
         );
         if self.fail_reconcile {
-            return;
+            let mut failed = Vec::new();
+            for fix in &fixes {
+                failed.push((
+                    fix.key.to_string(),
+                    self.fetch(fix.key).unwrap_or_else(|| fix.value.clone()),
+                ));
+            }
+            return failed;
         }
         for fix in fixes {
             match self.entries.iter_mut().find(|(k, _)| k == fix.key) {
@@ -83,12 +92,12 @@ impl ConfigStore {
                 None => self.entries.push((fix.key.to_string(), fix.value)),
             }
         }
+        Vec::new()
     }
 
-    /// The settings a recording started right now would use, exactly as
-    /// `mic::resolve_settings` computes them from the store.
-    fn settings(&mut self) -> MicSettings {
-        self.reconcile();
+    /// The effective settings a recording started right now would use, exactly
+    /// as `mic::resolve_settings` computes them from the store.
+    fn effective(&self) -> MicSettings {
         resolve(
             self.fetch(BITS_KEY).as_deref(),
             self.fetch(RATE_KEY).as_deref(),
@@ -99,13 +108,20 @@ impl ConfigStore {
         .settings
     }
 
+    /// The settings a recording started right now would use.
+    fn settings(&mut self) -> MicSettings {
+        self.reconcile();
+        self.effective()
+    }
+
     /// `config set`: refuse an invalid mic value before it reaches the store,
     /// and otherwise persist it. Mirrors `mic::validate_config_setting`, which
-    /// validates the candidate against the pair the store actually holds after
-    /// the reconcile attempt - not the in-memory fallback.
+    /// refuses a set that would let an unreconciled stale clock key become
+    /// effective (validating against the effective pair, the value the console
+    /// reported).
     fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         self.reconcile();
-        validate_setting(self.stored_settings(), key, value)?;
+        validate_setting_with_store(self.stored_settings(), self.effective(), key, value)?;
         match self.entries.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value.to_string(),
             None => self.entries.push((key.to_string(), value.to_string())),
@@ -113,9 +129,15 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// `config get`: the value the next recording will actually use.
+    /// `config get`: the value the next recording will actually use, with any
+    /// stale stored value a failed reconcile left behind named alongside it.
     fn get(&mut self, key: &str) -> Option<String> {
-        effective_setting(key, self.settings())
+        let unreconciled = self.reconcile();
+        let stale = unreconciled
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str());
+        report_setting(key, self.effective(), stale)
     }
 }
 
@@ -446,7 +468,7 @@ fn store_reported_and_effective_values_agree_after_a_stale_store_is_reconciled()
     assert_eq!(settings, MicSettings::default());
     for key in [BITS_KEY, RATE_KEY, EDGE_KEY, RAW_KEY, GAIN_KEY] {
         if let Some(stored) = store.fetch(key) {
-            let effective = effective_setting(key, settings).unwrap();
+            let effective = report_setting(key, settings, None).unwrap();
             assert_eq!(stored, effective, "{key}: stored and reported disagree");
         }
     }
@@ -455,10 +477,11 @@ fn store_reported_and_effective_values_agree_after_a_stale_store_is_reconciled()
 }
 
 /// A reconciliation write can fail (e.g. `sequential_storage` reports full
-/// storage), so validation must describe the store that actually exists rather
-/// than an in-memory fix that never landed.
+/// storage). The console must then report the effective value the next
+/// recording uses *and* flag the stale stored value, and a `config set` must
+/// never let that stale value become effective.
 #[test]
-fn validation_uses_the_stored_pair_when_a_reconcile_write_fails() {
+fn failed_reconcile_write_is_reported_and_cannot_be_silently_reactivated() {
     let mut store = ConfigStore::default();
     // A stale, out-of-window lone 16-bit slot that reconciliation would rewrite
     // to the 32-bit default...
@@ -466,16 +489,36 @@ fn validation_uses_the_stored_pair_when_a_reconcile_write_fails() {
     // ...but the write fails, so the stale key stays in the store.
     store.fail_reconcile = true;
 
-    // `config get` still reports the fallback the next recording would use
-    // while the store cannot be repaired.
-    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+    // `config get` reports the effective value the next recording uses (32)
+    // but names the stale stored 16 rather than pretending the store agreed.
+    let reported = store.get(BITS_KEY).expect("ptt_bits is owned");
+    assert!(reported.starts_with("32"), "{reported}");
+    assert!(reported.contains("unreconciled"), "{reported}");
+    assert!(reported.contains("16"), "{reported}");
 
-    // A set is validated against the raw stored pair, so setting the rate to
-    // 16 kHz cannot quietly revive the 16-bit slot `config get` just reported
-    // as 32 (16 @ 16 kHz is out of the mic's clock window).
-    assert!(store.set(RATE_KEY, "16000").is_err());
-    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("16"));
+    // The exact divergence the earlier fix missed: setting ptt_rate to 32000
+    // would make 16 @ 32000 a legal pair, silently changing the effective slot
+    // width from the reported 32 to 16. It must be refused, and the store must
+    // be unchanged.
+    let refused = store
+        .set(RATE_KEY, "32000")
+        .expect_err("activating the stale 16-bit slot must be refused");
+    assert!(refused.contains(RATE_KEY), "{refused}");
     assert_eq!(store.fetch(RATE_KEY), None);
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("16"));
+    assert_eq!(store.settings().bits, DEFAULT_BITS);
+
+    // Repairing ptt_bits to the reported value is allowed, and makes the store
+    // consistent again so the console no longer has to flag it.
+    store
+        .set(BITS_KEY, "32")
+        .expect("repair to the reported value");
+    assert_eq!(store.fetch(BITS_KEY).as_deref(), Some("32"));
+    assert_eq!(store.get(BITS_KEY).as_deref(), Some("32"));
+    // The recovered store can now be reconfigured normally.
+    store.set(RATE_KEY, "32000").expect("legal once reconciled");
+    assert_eq!(store.get(RATE_KEY).as_deref(), Some("32000"));
+    assert_eq!(store.settings().bits, DEFAULT_BITS);
 }
 
 /// Prints a transcript of the captain's real workflow - `config set`, then

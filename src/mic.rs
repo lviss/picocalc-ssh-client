@@ -54,8 +54,8 @@ use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
 use terminal_model::mic_config::{
     BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY, RAW_KEY,
-    effective_setting as mic_effective_setting, reconcile as reconcile_mic_settings,
-    validate_setting as validate_mic_setting,
+    reconcile as reconcile_mic_settings, report_setting as report_mic_setting,
+    validate_setting_with_store as validate_mic_setting,
 };
 use terminal_model::pcm_extract::{
     ac_rms_level, ac_rms_level_words, bit_clock_hz, extract_left_channel_pcm,
@@ -90,6 +90,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 
+/// A stored `ptt_*` key whose reconciliation rewrite failed, so the store still
+/// holds a value the next recording will not use.
+struct UnreconciledKey {
+    key: &'static str,
+    stored: String,
+    error: String,
+}
+
+/// Outcome of reading and reconciling the stored `ptt_*` keys.
+struct StoreOutcome {
+    /// What the store actually holds: `resolved.settings` except that a clock
+    /// key whose rewrite failed keeps its raw stored value.
+    stored: MicSettings,
+    resolved: terminal_model::mic_config::ResolvedSettings,
+    unreconciled: Vec<UnreconciledKey>,
+}
+
 /// Reads the `ptt_*` mic keys and resolves them against their defaults via
 /// [`terminal_model::mic_config::reconcile`]: a missing or malformed individual
 /// value falls back to its own default, and an out-of-window slot/rate pair
@@ -100,9 +117,10 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
 /// Returns both the effective settings and the settings the store actually
 /// holds afterwards. The two differ only when a reconciliation write fails, in
 /// which case the failed key keeps its raw stored value; the second is the
-/// pair a `config set` must validate against, so validation never rests on an
-/// unconfirmed write. A failed write is logged rather than discarded.
-async fn read_and_reconcile() -> (MicSettings, terminal_model::mic_config::ResolvedSettings) {
+/// pair a `config set` must not let become effective, so validation never rests
+/// on an unconfirmed write. A failed write is printed and reported, never
+/// discarded.
+async fn read_and_reconcile() -> StoreOutcome {
     let mut config = CONFIG.get().lock().await;
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
     let rate = config.fetch(RATE_KEY).await.ok().flatten();
@@ -117,7 +135,7 @@ async fn read_and_reconcile() -> (MicSettings, terminal_model::mic_config::Resol
         gain.as_ref().map(|v| v.as_str()),
     );
     let mut stored = resolved.settings;
-    let mut failures: Vec<(&'static str, String)> = Vec::new();
+    let mut unreconciled: Vec<UnreconciledKey> = Vec::new();
     for fix in &fixes {
         let result = match TryInto::<StrValue>::try_into(fix.value.as_str()) {
             Ok(value) => config.store(fix.key, value).await,
@@ -129,18 +147,39 @@ async fn read_and_reconcile() -> (MicSettings, terminal_model::mic_config::Resol
                 RATE_KEY => stored.rate = resolved.raw.rate,
                 _ => {}
             }
-            failures.push((fix.key, alloc::format!("{err:?}")));
+            let original = match fix.key {
+                BITS_KEY => bits.clone(),
+                RATE_KEY => rate.clone(),
+                EDGE_KEY => edge.clone(),
+                RAW_KEY => raw.clone(),
+                GAIN_KEY => gain.clone(),
+                _ => None,
+            };
+            unreconciled.push(UnreconciledKey {
+                key: fix.key,
+                stored: original
+                    .map(|v| alloc::format!("{v}"))
+                    .unwrap_or_else(|| fix.value.clone()),
+                error: alloc::format!("{err:?}"),
+            });
         }
     }
     drop(config);
-    for (key, err) in &failures {
-        print!("ptt: failed to reconcile {key} ({err}), store may disagree\r\n");
+    for failed in &unreconciled {
+        print!(
+            "ptt: failed to reconcile {} ({}) - store still holds {}; console reports flag it\r\n",
+            failed.key, failed.error, failed.stored
+        );
     }
-    (stored, resolved)
+    StoreOutcome {
+        stored,
+        resolved,
+        unreconciled,
+    }
 }
 
 async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
-    read_and_reconcile().await.1
+    read_and_reconcile().await.resolved
 }
 
 /// Settings for the recording about to start, logging if a stored value had to
@@ -155,17 +194,27 @@ pub async fn load_settings() -> MicSettings {
 
 /// Validates a `config set ptt_*` request against the currently effective
 /// settings, so an out-of-window or malformed value is refused at the console
-/// rather than stored. Keys this module does not own return `Ok(())`.
+/// rather than stored. A set that would let a stale stored clock value (one a
+/// failed reconciliation rewrite could not fix) become effective is also
+/// refused, so the reported and effective values cannot diverge silently. Keys
+/// this module does not own return `Ok(())`.
 pub async fn validate_config_setting(key: &str, value: &str) -> Result<(), String> {
-    let (stored, _) = read_and_reconcile().await;
-    validate_mic_setting(stored, key, value)
+    let outcome = read_and_reconcile().await;
+    validate_mic_setting(outcome.stored, outcome.resolved.settings, key, value)
 }
 
 /// Effective value of a `ptt_*` setting for `config get`; `None` for keys this
-/// module does not own. Shows the default when the key is unset.
+/// module does not own. Shows the default when the key is unset. When a
+/// reconciliation rewrite failed, the report names the stale stored value too,
+/// so the console cannot claim the store agrees when it does not.
 pub async fn effective_setting(key: &str) -> Option<String> {
-    let settings = resolve_settings().await.settings;
-    mic_effective_setting(key, settings)
+    let outcome = read_and_reconcile().await;
+    let stale = outcome
+        .unreconciled
+        .iter()
+        .find(|failed| failed.key == key)
+        .map(|failed| failed.stored.as_str());
+    report_mic_setting(key, outcome.resolved.settings, stale)
 }
 
 /// Samples captured by `capture_task`, drained by `ptt_upload_task`. A fixed

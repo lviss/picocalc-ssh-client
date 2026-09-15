@@ -224,6 +224,25 @@ pub fn reconcile(
     (resolved, fixes)
 }
 
+/// Console report for a `ptt_*` key, used by `config get`/`config list`.
+/// Normally this is the effective setting (the value the next recording uses).
+/// When a reconciliation rewrite could not land, `unreconciled_stored` is the
+/// value the store still holds for that key, and the report names both: the
+/// console never presents the fallback as if the store agreed, so a later
+/// accepted `config set` cannot change the reported value without the user
+/// having been shown the stale one.
+pub fn report_setting(
+    key: &str,
+    settings: MicSettings,
+    unreconciled_stored: Option<&str>,
+) -> Option<String> {
+    let effective = effective_setting(key, settings)?;
+    Some(match unreconciled_stored {
+        Some(stored) => format!("{effective} (unreconciled: stored {stored})"),
+        None => effective,
+    })
+}
+
 /// Effective value of a `ptt_*` setting for `config get`, so an unset key
 /// reports the value the next recording would actually use. `None` for keys
 /// this module does not own.
@@ -282,6 +301,66 @@ pub fn validate_setting(current: MicSettings, key: &str, value: &str) -> Result<
             candidate.bclk_hz(),
             MIN_MIC_BCLK_HZ,
             MAX_MIC_BCLK_HZ,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether setting `key` to `value` would change the *other* clock key's
+/// effective value, i.e. let a stored clock value that reconciliation could
+/// not rewrite (and that `config get` therefore did not report) become live
+/// again. A malformed value never counts (it is refused by
+/// [`validate_setting`]), and neither does a value that leaves the pair out of
+/// window or that repairs it. This is the exact condition that let a stale
+/// `ptt_bits=16` reappear when `ptt_rate` was later set to 32000.
+fn set_changes_other_clock_key(
+    store: MicSettings,
+    effective: MicSettings,
+    key: &str,
+    value: &str,
+) -> bool {
+    let mut candidate = store;
+    match key {
+        BITS_KEY => match parse_u32(value) {
+            Some(bits) => candidate.bits = bits,
+            None => return false,
+        },
+        RATE_KEY => match parse_u32(value) {
+            Some(rate) => candidate.rate = rate,
+            None => return false,
+        },
+        _ => return false,
+    }
+    let (bits, rate) = if mic_settings_valid(candidate.bits, candidate.rate) {
+        (candidate.bits, candidate.rate)
+    } else {
+        (DEFAULT_BITS, DEFAULT_RATE_HZ)
+    };
+    match key {
+        BITS_KEY => rate != effective.rate,
+        RATE_KEY => bits != effective.bits,
+        _ => false,
+    }
+}
+
+/// `config set` guard that keeps the reported, stored and effective values
+/// from diverging silently when a reconciliation rewrite failed. `store` is the
+/// pair the store actually holds (raw values for any key that could not be
+/// rewritten) and `effective` is what the next recording uses and what
+/// `config get` reported. A normal set (store and effective already agree) is
+/// unaffected; a repair set (`config set ptt_bits <reported>`) is allowed; only
+/// a set that would re-activate the stale clock value is refused, with the
+/// stale key named.
+pub fn validate_setting_with_store(
+    store: MicSettings,
+    effective: MicSettings,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    validate_setting(effective, key, value)?;
+    if set_changes_other_clock_key(store, effective, key, value) {
+        return Err(format!(
+            "{key} refused: the stored mic clock is unreconciled (a rewrite failed), and this change would re-activate a stored value the console did not report; set ptt_bits/ptt_rate to their reported values first"
         ));
     }
     Ok(())
@@ -518,5 +597,79 @@ mod tests {
         assert_eq!(resolved.settings.bits, 16);
         assert_eq!(resolved.settings.rate, 32_000);
         assert!(fixes.is_empty());
+
+        // A consistent store reports exactly its effective values.
+        assert_eq!(
+            report_setting(BITS_KEY, resolved.settings, None).as_deref(),
+            Some("16")
+        );
+        assert_eq!(
+            report_setting(RATE_KEY, resolved.settings, None).as_deref(),
+            Some("32000")
+        );
+    }
+
+    #[test]
+    fn report_names_both_the_effective_value_and_the_unreconciled_stored_one() {
+        // A stale 16-bit slot that reconciliation could not rewrite: the
+        // recording uses the 32-bit default, but the console must also show
+        // the stale stored value so a later set cannot surprise the user.
+        let (resolved, fixes) = reconcile(Some("16"), None, None, None, None);
+        assert!(resolved.fell_back);
+        assert_eq!(resolved.settings.bits, DEFAULT_BITS);
+        assert_eq!(fixes.len(), 1);
+        let report = report_setting(BITS_KEY, resolved.settings, Some("16")).unwrap();
+        assert!(report.starts_with("32"), "{report}");
+        assert!(report.contains("unreconciled"), "{report}");
+        assert!(report.contains("16"), "{report}");
+        // Keys this module does not own have no report.
+        assert_eq!(report_setting("ptt_host", resolved.settings, None), None);
+    }
+
+    #[test]
+    fn a_set_that_would_reactivate_a_stale_clock_key_is_refused() {
+        // The store holds a stale 16-bit slot (no rate); the effective pair is
+        // the 32/16000 default the console reported.
+        let store = MicSettings {
+            bits: 16,
+            rate: DEFAULT_RATE_HZ,
+            ..MicSettings::default()
+        };
+        let effective = MicSettings::default();
+
+        // Setting ptt_rate to 32000 would make 16 @ 32000 legal and silently
+        // change the effective slot width from 32 to 16: refuse, naming the
+        // key, rather than resurrecting the stale value.
+        let err = validate_setting_with_store(store, effective, RATE_KEY, "32000")
+            .expect_err("must refuse the resurrection");
+        assert!(err.contains(RATE_KEY), "{err}");
+
+        // A value that leaves the pair out of window does not activate the
+        // stale key and is allowed (16 @ 16 kHz is still out of window).
+        assert!(validate_setting_with_store(store, effective, RATE_KEY, "16000").is_ok());
+
+        // Repairing ptt_bits to the reported value is also allowed.
+        assert!(validate_setting_with_store(store, effective, BITS_KEY, "32").is_ok());
+
+        // A consistent store is unaffected by the guard: the captain's normal
+        // ordered probe still works.
+        let consistent = MicSettings::default();
+        assert!(validate_setting_with_store(consistent, consistent, RATE_KEY, "32000").is_ok());
+        let changed = MicSettings {
+            rate: 32_000,
+            ..MicSettings::default()
+        };
+        assert!(validate_setting_with_store(changed, changed, BITS_KEY, "16").is_ok());
+    }
+
+    #[test]
+    fn a_set_that_changes_the_reporters_own_key_is_still_governed_by_the_window() {
+        // Setting a clock key on a consistent store is a normal parameter
+        // change, not a resurrection, and must keep working.
+        let current = MicSettings::default();
+        assert!(validate_setting_with_store(current, current, RATE_KEY, "32000").is_ok());
+        assert!(validate_setting_with_store(current, current, BITS_KEY, "32").is_ok());
+        // An out-of-window value is still refused by the normal path.
+        assert!(validate_setting_with_store(current, current, BITS_KEY, "16").is_err());
     }
 }

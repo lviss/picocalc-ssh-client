@@ -350,8 +350,11 @@ windowed level, demonstrates it.
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
 refused with the allowed range. `config get` and `config list` report the value
 the next recording will actually use (a stored key that no longer matches is
-rewritten, so store, report, and effective value cannot diverge), and
-`config rm` restores the default.
+rewritten so store, report, and effective value agree), and `config rm`
+restores the default. If that rewrite cannot land (e.g. the config region is
+full), the console flags the key as `unreconciled` alongside the stale value the
+store still holds, and a `config set` that would make that stale value effective
+again is refused rather than silently changing the reported setting.
 
 A small "recording..." overlay is shown while the button is held.
 Transcription itself is not implemented by this firmware — it only captures
