@@ -155,8 +155,10 @@ they persist across reboots.
 
 The device can generate its own Ed25519 keypair and use it to authenticate,
 so you don't need to type (or store) a password at all. The private key is
-generated on-device and never leaves it; only the public key needs to be
-shared.
+generated on-device and never leaves it on its own; only the public key needs
+to be shared. It can be explicitly exported to an SD card for backup — see
+[Backing up and restoring the private key](#backing-up-and-restoring-the-private-key-on-the-sd-card)
+below.
 
 ```bash
 # Generate a keypair (refuses to overwrite an existing one)
