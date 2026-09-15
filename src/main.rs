@@ -212,10 +212,11 @@ async fn main(spawner: Spawner) {
     // should be at least big enough to hold a few pixels"). A full-frame buffer
     // therefore buys transfer speed only, at a large RAM cost - and that RAM is
     // shared with the executor stack, because flip-link places `.bss` directly
-    // above it. The push-to-talk work added ~26 KiB of static `.bss` (the PCM
-    // ring plus two task pools), shrinking that stack from ~70 KiB to ~45 KiB
-    // and overflowing the deep SSH connect path. A generous 64-pixel-row batch
-    // keeps screen updates fast while leaving the stack ample headroom.
+    // above it. The push-to-talk work's static `.bss` grew enough to shrink
+    // that stack below what the deep SSH connect path needs; this 64-pixel-row
+    // batch is the load-bearing knob that restores the headroom (sizes and the
+    // measured stack region are in AGENTS.md). Keep screen updates fast without
+    // surrendering that headroom.
     const DISPLAY_BUFFER_SIZE: usize = 320 * 3 * 64;
     static DISPLAY_BUFFER: StaticCell<[u8; DISPLAY_BUFFER_SIZE]> = StaticCell::new();
     let di = SpiInterface::new(

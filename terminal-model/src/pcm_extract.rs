@@ -262,8 +262,8 @@ pub fn ac_rms_level(samples: &[i16]) -> u32 {
 }
 
 /// The same robust level for a raw `ptt_raw` chunk, measured over the driven
-/// (even-indexed/left-slot) words' sample field for the configured slot width
-/// - the exact bits [`extract_left_channel_pcm`] would extract - so the level
+/// (even-indexed/left-slot) words' sample field for the configured slot width -
+/// the exact bits [`extract_left_channel_pcm`] would extract - so the level
 /// meter and the streamed payload read the same field in both modes, and a
 /// narrow raw slot cannot meter zero while carrying signal.
 pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
