@@ -18,6 +18,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
+*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a configurable network host (see below) for off-device transcription.
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -291,6 +292,77 @@ shown once it clears.
 
 Holding the power button down instead powers off the device; that's handled
 entirely by the keyboard co-processor and doesn't involve this firmware.
+
+### Push-to-Talk Voice Capture
+
+Hold `F1` (plain, no modifiers - see `src/keyboard.rs` if you want to rebind
+it to a different key) to capture microphone audio and stream it to a
+network host of your choice — for
+example, a companion process on your SSH server that runs speech-to-text and
+injects the resulting text into your session. Configure the destination
+before using it:
+
+```bash
+$ config set ptt_host mymachine.example.com
+$ config set ptt_port 9000
+```
+
+For bringing up a new microphone there are also optional debug settings. They
+take effect on the *next* recording without a rebuild or reflash, and default to
+the documented-correct values:
+
+```bash
+$ config set ptt_bits 32     # I2S channel slot width in bits (default 32)
+$ config set ptt_rate 16000  # sample rate in Hz (default 16000)
+$ config set ptt_edge 1      # invert the BCLK sampling edge (default 0)
+$ config set ptt_raw 1       # stream raw FIFO words instead of PCM (default 0)
+$ config set ptt_gain 256    # x256 DC-removed capture gain, 1-4096 (default 1)
+```
+
+`ptt_gain` is a diagnostic for a very quiet microphone: it subtracts each
+capture chunk's DC offset and then amplifies what is left (saturating, so it
+clips rather than wraps), in both the PCM and `ptt_raw` paths. A gain of `1`
+(the default) does no DC removal and no scaling, so an unconfigured device is
+byte-for-byte unchanged. It cannot conjure a signal that is not there - it only
+makes a faint one easier to see.
+
+The microphone has no hardware gain register (its `SEL` pin only selects the
+left/right slot), so `ptt_gain` is explicitly a **diagnostic**: real gain and
+normalization belong in the receiving/transcription pipeline, where the audio is
+consumed, and the device ships its native sample levels. While recording, the
+overlay also draws a realtime input meter under "recording..." - it shows a
+windowed DC-removed level (a median across the chunk's sub-windows), so a mic
+sitting on its noise floor reads empty and sustained speech fills the bar (it
+turns red if the input is pinned) - making "hold `F1` and speak" the quickest
+"is the mic hearing anything?" check. Note: a separate, real per-chunk capture
+glitch (a few extreme samples once per 25 ms DMA transfer) is still present in
+the streamed audio; the windowed median keeps it from dominating the meter,
+but it is a firmware/I2S-path defect that remains open. The mic's audio path
+is proven to carry real speech (verified against real captures independently
+transcribable by openai-whisper and whisper.cpp) - see `AGENTS.md` for the
+capture analysis and the still-open per-chunk glitch.
+
+`ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
+inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
+refused with the allowed range. `config get` and `config list` report the value
+the next recording will actually use (a stored key that no longer matches is
+rewritten so store, report, and effective value agree; the slot width and rate
+are rewritten together, so a partially failed repair cannot clock the mic
+differently than reported), and `config rm`
+restores the default. If that rewrite cannot land (e.g. the config region is
+full), the console flags the key as `unreconciled` alongside the stale value the
+store still holds, and a `config set` that would make that stale value effective
+again is refused rather than silently changing the reported setting.
+
+A small "recording..." overlay is shown while the button is held.
+Transcription itself is not implemented by this firmware — it only captures
+and streams raw audio; see AGENTS.md for the wire format a receiving process
+needs to speak, and README-DEVICE.md for the mic's I2S pin wiring.
+
+> [!NOTE]
+> This requires a digital I2S microphone wired to the pins documented in
+> README-DEVICE.md. It streams audio unencrypted over a plain TCP
+> connection; only use it on a network you trust.
 
 ### Local Commands
 

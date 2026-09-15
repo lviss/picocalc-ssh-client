@@ -162,11 +162,17 @@ pub async fn config_command(args: &[&str]) {
             print!("{result:?}");
         }
         ["config", "list"] => {
-            let mut config = CONFIG.get().lock().await;
-            match config.get_all().await {
+            let map = {
+                let mut config = CONFIG.get().lock().await;
+                config.get_all().await
+            };
+            match map {
                 Ok(map) => {
                     for (k, v) in &map {
-                        print!("{k}={v}\r\n");
+                        match crate::mic::effective_setting(k.as_str()).await {
+                            Some(effective) => print!("{k}={effective}\r\n"),
+                            None => print!("{k}={v}\r\n"),
+                        }
                     }
                 }
                 Err(err) => {
@@ -187,6 +193,13 @@ pub async fn config_command(args: &[&str]) {
                 }
                 return;
             }
+            // Mic debug keys are optional and have effective defaults (see
+            // `mic::load_settings`), so report the value the next recording
+            // would actually use rather than the raw store slot.
+            if let Some(value) = crate::mic::effective_setting(key).await {
+                print!("{value}\r\n");
+                return;
+            }
             let mut config = CONFIG.get().lock().await;
             let value = config.fetch(key).await;
             print!("{value:?}\r\n");
@@ -203,6 +216,12 @@ pub async fn config_command(args: &[&str]) {
         }
         ["config", "set", key, rest @ ..] => {
             let value: &str = &rest.join(" ");
+            // Refuse a mic debug value that would mis-clock the device before
+            // it ever reaches flash (see `mic::validate_config_setting`).
+            if let Err(message) = crate::mic::validate_config_setting(key, value).await {
+                print!("{message}\r\n");
+                return;
+            }
             if *key == "scroll" {
                 if let Ok(val) = value.parse::<usize>() {
                     // Heap-aware ceiling, not a flat number: keeps the screen's

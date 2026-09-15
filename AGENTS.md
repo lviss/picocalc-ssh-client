@@ -14,10 +14,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bindings and will not compile for a host target — don't try to `cargo test`/`cargo check` the
   root `picocalc-wezterm` package for `x86_64-unknown-linux-gnu`, it fails deep in `embassy-rp`.
 - `terminal-model/` is a separate workspace-member crate (path dependency) holding the
-  hardware-independent terminal buffer/VTE logic (`screen_model.rs`), vector glyph-drawing
-  (`glyphs.rs`), and the SD-card SSH-key backup text codec (`keyfile.rs`), pulled in by
-  `src/screen.rs` and `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
-  `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
+  hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
+  vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
+  (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
+  (`audio_ring.rs`), the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`), the mic
+  runtime-settings resolution and console-validation decision table (`mic_config.rs`) and the
+  runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, and the SD-card
+  SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`. It depends only on
+  `vte`, `embedded-graphics`, `pio`, and `profont` — all host-buildable — so it's the place for
+  real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
   extending this crate over adding tests to the hardware-coupled root crate.
@@ -49,22 +54,45 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `.unwrap_or(0).max(1)` (see `cursor_move_count` in `terminal-model/src/screen_model.rs`) for any
   CSI parameter that has a nonzero default.
 - `ScreenModel::overlay` (`terminal-model/src/screen_model.rs`) is the pattern for any transient
-  on-screen banner (currently just the battery readout on a power-button press, wired in
-  `src/keyboard.rs`'s `keyboard_reader`): it's a paint-time-only flag that never touches
-  `lines`/`scrollback`, composited on top each frame in `src/screen.rs`'s `update_display` /
-  `draw_overlay`. `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real,
-  possibly-changed cell content underneath from scratch rather than needing a save/restore buffer.
-  Auto-dismiss timing (`embassy_time::Instant`) lives on the `Screen` wrapper in `src/screen.rs`
-  (`overlay_expiry`, checked in `Screen::update_display`), not in `ScreenModel`, since
-  `terminal-model` is host-portable and has no clock.
+  on-screen banner (the battery readout on a power-button press, and the push-to-talk
+  "recording..." indicator): it's a paint-time-only flag that never touches `lines`/`scrollback`,
+  composited on top each frame in `src/screen.rs`'s `update_display` / `draw_overlay`.
+  `clear_overlay()` forces `full_repaint = true` so dismissal redraws the real, possibly-changed
+  cell content underneath from scratch rather than needing a save/restore buffer. The
+  overlay/auto-dismiss state machine itself (`overlay`, a persistent-overlay slot to restore,
+  and an absolute `u64` millisecond deadline) lives in `ScreenModel` and is host-tested; it takes
+  `now_ms` from the caller, so `terminal-model` stays clock-free and `src/screen.rs`'s `Screen`
+  wrapper just passes `Instant::now().as_millis()`. Always show overlays through a `Screen`
+  helper: `Screen::show_battery_overlay` calls `ScreenModel::show_timed_overlay` (battery readout,
+  3 s), while `Screen::show_overlay` (used by `src/mic.rs` for the recording indicator) marks a
+  persistent overlay. `ScreenModel::tick_overlay` dismisses only an expired *timed* overlay and
+  restores the persistent one it covered (or clears if there was none), forcing a full repaint
+  so the wider/taller previous box's pixels are erased; replacing an already-shown overlay with
+  different text forces the same repaint (showing one where none was present stays a pure
+  paint-time flag). So a power-button press before or during a recording cannot leave the
+  "recording..." indicator (and the level meter) cleared or partially overdrawn for the rest of
+  the utterance.
 - Despite the caution above about the root package not building for the host target: this repo's
   installed toolchain does carry a prebuilt `thumbv8m.main-none-eabihf` std, so
   `cargo check --features pimoroni2w` (or `pico2w`) on the root package works and fully
   type-checks the firmware crate — useful for validating non-`terminal-model` changes without
   hardware. `cargo build --release --features <chip>` (what `make image` runs) also compiles all
-  the way through codegen; only the final link step needs `flip-link`, which may not be installed
-  in every environment (`cargo install flip-link` needs network/build tools) — that's a linker
-  availability gap, not a code problem, if it's the only failure.
+  the way through codegen and linking with `flip-link` on `PATH` (in this sandbox it's already
+  installed at `/home/ai/.cargo/bin/flip-link`, just not on `PATH` by default — `cargo install
+  flip-link` is a no-op confirming this; add `/home/ai/.cargo/bin` to `PATH` rather than
+  reinstalling). If `flip-link` is genuinely absent and can't be installed (no network/build
+  tools), that's a linker availability gap, not a code problem, if it's the only failure.
+- flip-link places static `.bss` directly above the embassy executor stack, so the two compete
+  for the same RP2350 SRAM: every byte of new static `.bss` comes off the usable stack, and
+  `src/main.rs`'s `DISPLAY_BUFFER_SIZE` (`320 * 3 * 64`, the display SPI interface's batching
+  buffer, deliberately a 61 KiB batch rather than a full 307 KiB framebuffer) is the load-bearing
+  knob that sets it. This is not cosmetic: the PTT work's ~28 KiB of static `.bss` (the PCM ring
+  plus the two embassy task pools) had taken the stack from ~70 KiB on `main`'s 307 KiB-buffer
+  build down to ~45 KiB, which is what overflowed the deep SSH connect/KEX path; the 61 KiB batch
+  restored it to ~282 KiB (the region above `_stack_start` in the linked ELF). Re-measure that
+  region (e.g. read `_stack_start` from the `.elf` after `make image`) before enlarging the
+  display buffer, adding another task pool, or growing any other static `.bss`, and keep the
+  batch at least this generous unless the measurement says otherwise.
 - `terminal-model::screen_model`'s `ScreenModel::max_scrollback` is not a flat literal - it's
   computed by `safe_max_scrollback_for(cols, rows)` against `SCREEN_HEAP_BUDGET_BYTES`
   (`FIRMWARE_HEAP_SIZE_BYTES` minus `NON_SCREEN_HEAP_RESERVE_BYTES`, the heap WiFi/TCP/SSH/SD and
@@ -108,6 +136,196 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   out (`git submodule update --init embassy`) because `src/net.rs` embeds cyw43 firmware blobs
   from it via `include_bytes!`; `pico-sdk`/`picotool` are unrelated C build tooling and don't need
   to be initialized for a Rust-only check/build.
+
+- The `embassy/` git submodule is reference material only, NOT what actually gets compiled: every
+  `embassy-*` line in `Cargo.toml` is a bare `version = "*"` with no `path`/`git` override, so
+  Cargo resolves them from crates.io (check `Cargo.lock` — e.g. `embassy-rp` resolves to a released
+  `0.4.0`, which can be well behind the submodule's pinned commit). The two can have materially
+  different APIs (e.g. `0.4.0` uses the older `embassy_rp::{Peripheral, PeripheralRef, into_ref!}`
+  peripheral-ownership style throughout its `pio` module, while the submodule's HEAD has moved to a
+  newer `Peri<'d, T>` style) — always check the actual installed crate source
+  (`~/.cargo/registry/src/*/embassy-rp-<version>/`, fetch it with `cargo fetch` first if absent)
+  before writing code against any embassy-rp API, rather than trusting the submodule's source.
+  `src/mic.rs` is the up-to-date, actually-building example of this project's real PIO/DMA idiom
+  (`PeripheralRef`, `PeripheralRef::new`, `Pio::new` + `make_pio_pin` + `StateMachine`) to copy
+  from; since the mic's slot width/edge are runtime settings, its program is built at run time by
+  `terminal-model/src/i2s_program.rs` with the `pio` crate's `Assembler` instead of `pio_asm!`
+  (the macro is still the right tool for a fixed program). `src/psram.rs` no longer has any PIO
+  code of its own (see its own entry below) — it only drives PSRAM via raw `embassy_rp::pac`
+  register access now.
+- Push-to-talk voice capture (`src/mic.rs`) captures mic audio on a held button and streams it to a
+  network host; the receiving/transcribing side is a separate, not-yet-built process outside this
+  repo. It claims PIO2 (unclaimed elsewhere — PIO0 is WiFi, PIO1 is now unused; see the PSRAM note
+  below) for a hand-written I2S RX PIO program (embassy-rp ships no I2S RX driver, only the TX-only
+  `pio_programs::i2s`; `mic.rs`'s program is the mirror image of that driver's `pio_asm!` block,
+  `in pins, 1` instead of `out pins, 1`) and expansion-header pins
+  freed by dropping the slow PSRAM path (see below): `GP2`/`GP3`/`GP21` = I2S `BCLK`/`WS`/`SD`.
+  These pins are also wired to the PSRAM chip (see `psram.rs`'s header comment) - that's safe
+  because the QMI/XIP hardware path this firmware now uses to reach PSRAM drives a completely
+  separate, RP2350-internal chip-select pad, never these pins. GP16/17/18/19/22 (the SD card's
+  SPI0 pins) were considered for the mic in an earlier iteration of this feature but the captain's
+  own hardware check moved the mic to the PSRAM/expansion-header group instead, keeping SD card
+  support intact (see `storage.rs`). The mic is an Adafruit SPH0645 breakout (identified from a real
+  capture the captain took with a netcat listener; not INMP441 as this project's earlier
+  investigation reports assumed) - a fixed-ratio I2S digital mic whose internal shift-counter is
+  hardwired to a 32-bit-per-channel slot (64fs total per L+R frame: confirmed against its documented
+  clock table, 1.024 MHz-4.096 MHz BCLK for 16 kHz-64 kHz sample rates, 16 kHz * 64 = 1.024 MHz
+  exactly). The PIO program and its clock are now **runtime settings**, resolved from the config
+  store at the start of every recording and applied on the device (no reflash or reboot):
+  `ptt_bits` (channel slot width, default 32), `ptt_rate` (sample rate Hz, default 16000),
+  `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
+  mono PCM, 1 = stream the FIFO words; the driven slots are DC-removed and gained first when
+  `ptt_gain` > 1), `ptt_gain` (1-4096, default 1 = off; see below). A `ptt_bits`/`ptt_rate` pair
+  whose `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at
+  the console and, if a stored value is somehow invalid, falls back to the default pair with a log.
+  That decision table (`resolve`/`reconcile`/`validate_setting`, host-tested) lives in
+  `terminal-model/src/mic_config.rs`; `src/mic.rs` is only the config-store/console adapter.
+  `reconcile` also rewrites any stored key that no longer matches its effective value, so the
+  store, `config get`/`config list`, and the next recording cannot diverge - otherwise a
+  `ptt_rate`/`ptt_bits` key left stale by `config rm` could be silently re-adopted by a later
+  `config set`. The slot-width and sample-rate keys are returned as a single `ClockPairFix` and
+  written as one atomic pair (rate first, the slot width skipped if the rate write fails, the rate
+  restored if the slot width write fails), so a partial repair can never leave the pair valid but
+  different from what `config get` reported. Concurrently, `config list` overlays the effective
+  values for the `ptt_*` keys. `ResolvedSettings::raw` exposes the pre-fallback pair. `src/mic.rs`
+  re-reads and re-resolves the store after applying its rewrites, so the reported, stored and
+  effective values all describe the state the store is actually left in. If a reconcile rewrite
+  fails, `src/mic.rs` prints the failure and `config get`/`list` report that key as `unreconciled`
+  next to the stale value the store still holds; `validate_setting_with_store` (terminal-model)
+  refuses a clock-key `config set` that would make the stale value effective again (a set that
+  leaves the pair out of window, or that repairs it to the reported value, is allowed), so reported
+  and effective values cannot diverge silently even when the store cannot be rewritten. The program
+  itself is built at run time by `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`)
+  because `pio_asm!` bakes the loop count and edge in at compile time; `capture_task` keeps only the
+  even-indexed/left-slot
+  words, and `extract_left_channel_pcm` reduces each to its slot-width-aware 16-bit sample (see that
+  function's doc for the exact shift, including the left-justified sub-16-bit case).
+  `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,
+  `remove_dc_and_gain_words`/`remove_dc_and_gain_samples` (host-tested in `pcm_extract.rs`)
+  subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating
+  arithmetic, in both paths. The raw-word path is slot-width aware: it sign-extends the configured
+  `bits`-wide field (its sign is at `bits - 1`, not 31) and clamps back into that field, so a
+  narrow `ptt_raw` slot cannot turn a negative sample into a large positive one. DC removal is
+  essential because the SPH0645 sits on a large offset
+  (~-6113 in its 18-bit field on this hardware); multiplying the raw value directly would rail at
+  any useful gain. `ptt_gain=1` is a byte-identical no-op. This knob is explicitly DIAGNOSTIC, not
+  the production gain path: the SPH0645 is a fixed-sensitivity digital mic with no gain register
+  (SEL only selects the L/R slot), so any real gain/normalization belongs on the receiving /
+  transcription side, where the audio is consumed - the device ships its native levels. The
+  overlay also carries a realtime level meter while recording: `ac_rms_level`/
+  `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish a windowed median of per-window
+  AC RMS (8 windows, each window's own DC removed) through `mic::level()`, both reading the
+  configured slot width's sample field (the same bits `extract_left_channel_pcm` puts on the
+  wire), so a narrow raw slot cannot meter zero while carrying signal. `src/screen.rs`'s
+  `draw_overlay` draws it as a bar when `mic::is_recording()` (empty at the noise floor, red when
+  pinned). The windowed median is deliberate: a plain DC-removed AC RMS let the known per-chunk
+  capture artifact below dominate the bar and swing it full/empty at idle. `src/screen.rs`'s
+  `LEVEL_METER_FULL_SCALE` is calibrated against the windowed-median statistic's real measured
+  range on four confirmed-good real captures (independently verified transcribable by both
+  openai-whisper and whisper.cpp) rather than a synthetic tone: the original 512 was sized against
+  `ac_level_ignores_a_spike_confined_to_one_window`'s 100%-duty-cycle `loud` test fixture, which
+  reads far higher than real speech ever does at the same peak amplitude (real speech has silence
+  between words/syllables, so most 25ms windows sit well under a sustained tone's RMS) - that
+  mismatch, not the underlying statistic, is why the meter looked dead on real hardware despite
+  carrying real, transcribable audio. Re-derive the constant (see the doc comment on
+  `LEVEL_METER_FULL_SCALE`) if the windowed-median formula in `pcm_extract.rs` ever changes.
+  The meter is computed on `ptt_upload_task` from the chunks it has already drained from the
+  ring (`mic::meter_level`), NOT in `capture_task`: the PIO RX FIFO is only 4 words deep
+  (`pico-sdk` `hardware/pio.h`; ~125 us of slack at 32 k words/s), so *any* per-chunk work added
+  between DMA pulls can starve the FIFO and silence capture. That was a hardware-confirmed
+  regression - `e9eebf4` (pre-meter) captured real speech, and `f3be4d4` (which adds only the
+  level meter) is silent/crickets - so the meter was moved off the hot path. `capture_task` now
+  only publishes the capture format the upload task's meter decode needs (`PTT_METER_RAW`/
+  `PTT_METER_BITS`) and deposits samples in the ring; the meter consequently reads post-`ptt_gain`
+  samples (identical to the mic's own level at the default gain of 1). Weigh any future per-chunk
+  work in `capture_task` against that 4-word FIFO budget.
+  A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
+  (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
+  counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carries ~91%
+  of the chunk's AC energy. In `/ai/ptt-test-4.raw` the peak-deviation index is ~7 in the first
+  chunk, ~12 for the next few, and then ~59-60 for the rest of the capture: it steps early (a
+  ~48-sample jump from ~12 to ~59-60) and then stays put rather than drifting smoothly. It is
+  present in the captured samples, so it is a firmware/I2S-path defect that corrupts the streamed
+  audio, not just a meter problem.
+  Leading hypothesis to confirm: the per-chunk DMA transfer boundary / RX-FIFO stall between `dma_pull`
+  calls (the SM fills the 8-deep FIFO and stalls while the capture task processes the previous
+  chunk) - root cause NOT confirmed and needs hardware. Do not treat the meter's robustness as an
+  audio fix.
+  The earlier "the mic appears to be converting" correction was itself too generous: the
+  "~-35 dBFS RMS after DC removal" figure it rested on is glitch-dominated (that chunk-wide
+  statistic is ~91% the per-chunk glitch above), and re-analysis of `/ai/ptt-test-4.raw` with the
+  glitch excluded puts the windowed level at zero for essentially every chunk (874/874) - that
+  capture is a flat/silent negative control, not evidence of signal on its own. The decisive test
+  this called for - one fresh capture containing deliberate speech, analysed with the
+  glitch-excluded windowed level - has since been passed: the four real captures used to
+  calibrate `LEVEL_METER_FULL_SCALE` above are independently verified transcribable by both
+  openai-whisper and whisper.cpp, so the mic's audio path is proven to carry real speech for
+  those captures. The per-chunk capture glitch above remains a separate, still-open firmware
+  defect, unaffected by this. An
+  earlier fixed 16-bit slot (a mirror of embassy's
+  `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
+  mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
+  every raw word `0x00000000`), confirming this mic will not run below 1.024 MHz. **Still
+  unverified without hardware**: the mic's documented rising-edge (non-standard) data-change timing
+  versus which BCLK edge this PIO program's `in pins, 1` actually samples on - the RP2040/2350
+  datasheet does not document PIO's internal input/output pipeline timing at all (confirmed via
+  `raspberrypi/pico-feedback#280`), and this program's BCLK period is only 2 PIO cycles,
+  comparable to or shorter than that undocumented pipeline delay. `ptt_edge=1` is the documented
+  experiment for that (it inverts the low/bit-clock bit of every side-set value, shifting sampling
+  by half a BCLK cycle without changing the loop shape). Capture is 16-bit mono in ~25 ms chunks
+  at the default 16 kHz rate (a non-default `ptt_rate` rescales chunk and ring duration, not
+  their sample counts), staged between the capture and upload tasks in a fixed 2048-sample
+  (`i16`) static ring buffer in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the
+  heap, so it does not compete with the `DualHeap` budget and cannot exhaust it. The ring never
+  blocks and never grows; when it is full the oldest samples are dropped, logging a single
+  `ptt: ...` line per recording, so a slow/unreachable `ptt_host` (connect is bounded by a 5s
+  timeout in `mic.rs`) degrades to bounded audio loss rather than a stalled I2S clock or a
+  heap-exhaustion abort, independent of whether a
+  PSRAM heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
+  lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Each sample is tagged with the
+  utterance generation that produced it (`CURRENT_GEN`/`ENDED_GEN` atomic counters in `mic.rs`,
+  with the pure `utterance_ended` predicate in `audio_ring.rs`), so a recording that starts while
+  a previous one's connect is still in flight shares the ring without its audio being sent over
+  the older connection or its own end being consumed as the older one's; the single upload task
+  serves generations in order and every connection closes when its own generation ends. Button binding is
+  plain `Key::F1`. Arming and stopping are independently gated: arming requires `KeyState::Pressed`
+  with `Modifiers::NONE` (so Ctrl+F1 still reaches the existing reboot shortcut), while stopping
+  fires on `KeyState::Released` whenever `mic::is_recording()` (reusing `mic.rs`'s `RECORDING`
+  flag) is set, with no modifier re-check, so a release always ends the recording even if a
+  modifier went down mid-hold. The decision table itself lives in
+  `terminal-model/src/key_dispatch.rs`'s `ptt_action` (host-tested with
+  `cargo test -p terminal-model --target x86_64-unknown-linux-gnu key_dispatch`) and `src/keyboard.rs`
+  is only the I2C/`KeyReport`-to-`ptt_action` adapter, so rebinding means changing the single
+  `Key::F1` check passed to `ptt_action` there and updating that module's tests.
+  `capture_task` also self-stops after `MAX_RECORDING_DURATION` (60s) in case the keyboard
+  link drops the `Released` report entirely. `Key::ButtonLeft2`, tried first, turned out to
+  correspond to no physical control on real hardware - the PicoCalc has one D-pad and no joystick,
+  and `ButtonLeft2` belongs to a `Joy*`/`Button*` group of raw keyboard-protocol codes
+  (`src/keyboard.rs`'s `Key` enum and its `From<u8>` impl) that looks like it comes from a
+  joystick/gamepad-bearing variant of this same keyboard co-processor protocol, not this device -
+  treat that whole code group as suspect for any future key binding on this hardware. Destination
+  is `config set ptt_host`/`config set ptt_port` (plain `sequential_storage` keys, no
+  special-casing needed in `config.rs`). Wire format (needed by anything implementing the
+  receiving side): one TCP connection per utterance, opened on button press and closed on release;
+  each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
+  16-bit little-endian mono PCM at the configured `ptt_rate` (default 16 kHz; the rate is not
+  signaled on the wire, so the receiver must be told it out of band). With `ptt_raw=1` the payload
+  is instead the little-endian `u32` PIO FIFO words, one per channel slot (byte-for-byte
+  unprocessed at the default `ptt_gain=1`; at a higher gain the driven slots are DC-removed and
+  scaled first - see the `ptt_gain` note above); a receiver should concatenate frame payloads
+  before parsing words (frame boundaries are upload-side, not word-aligned). No handshake, no
+  other framing.
+- `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
+  It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
+  DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected
+  size was never fed to the heap allocator — only `init_qmi_psram_heap` (driven by
+  `init_psram_qmi`'s result) does that — so it was dropped as dead weight, freeing PIO1,
+  DMA_CH1/CH2, and those pins (see the mic note above for where `PIN_2`/`PIN_3`/`PIN_21` went).
+  `PIN_20` (`RAM_CS`) is explicitly held deselected in `main.rs` (`Output::new(p.PIN_20,
+  Level::High)`, bound for `main`'s whole lifetime) since nothing drives it as PSRAM chip-select
+  anymore and it must not float. This is safe regardless of the QMI path's own state: QMI/XIP uses
+  a separate, RP2350-internal CS pad (`detect_psram_qmi`'s `XIP_CS_PIN`), never `PIN_20`, so
+  deselecting `PIN_20` cannot interfere with QMI PSRAM access.
 
 ## Maintaining this file
 

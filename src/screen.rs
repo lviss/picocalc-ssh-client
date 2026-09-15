@@ -47,7 +47,6 @@ const OVERLAY_DURATION: Duration = Duration::from_secs(3);
 pub struct Screen {
     model: ScreenModel,
     parser: vte::Parser,
-    overlay_expiry: Option<Instant>,
 }
 
 impl Deref for Screen {
@@ -68,7 +67,6 @@ impl Screen {
         Self {
             model: ScreenModel::default(),
             parser: vte::Parser::new(),
-            overlay_expiry: None,
         }
     }
 
@@ -88,19 +86,23 @@ impl Screen {
 
     /// Show `text` as a transient overlay on top of whatever is currently on
     /// screen; it auto-dismisses after `OVERLAY_DURATION` without corrupting the
-    /// underlying terminal buffer.
+    /// underlying terminal buffer, restoring any overlay it covered.
     pub fn show_battery_overlay(&mut self, text: String) {
+        self.model.show_timed_overlay(
+            text,
+            Instant::now().as_millis(),
+            OVERLAY_DURATION.as_millis(),
+        );
+    }
+
+    /// Show `text` as an overlay that stays until it is explicitly cleared,
+    /// cancelling any auto-dismiss left over from a previous overlay.
+    pub fn show_overlay(&mut self, text: String) {
         self.model.show_overlay(text);
-        self.overlay_expiry = Some(Instant::now() + OVERLAY_DURATION);
     }
 
     pub fn update_display(&mut self, display: &mut PicoCalcDisplay) {
-        if let Some(expiry) = self.overlay_expiry
-            && Instant::now() >= expiry
-        {
-            self.overlay_expiry = None;
-            self.model.clear_overlay();
-        }
+        self.model.tick_overlay(Instant::now().as_millis());
         update_display(&mut self.model, display);
     }
 }
@@ -282,16 +284,42 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     }
 }
 
+/// Height of the push-to-talk level-meter bar, in pixels.
+const LEVEL_METER_HEIGHT: u32 = 8;
+/// AC RMS level (`i16` counts) that fills the meter. Calibrated against the
+/// windowed-median statistic's actual measured range on four confirmed-good
+/// real captures (independently verified transcribable by both openai-whisper
+/// and whisper.cpp): per-recording median levels of 5-10, 90th-percentile
+/// levels of 32-79, and peaks of 118-307. The original value of 512 was
+/// calibrated against a synthetic 100%-duty-cycle test tone (see
+/// `ac_level_ignores_a_spike_confined_to_one_window`'s `loud` fixture in
+/// `pcm_extract.rs`) rather than real speech; real speech has silence between
+/// words and syllables, so a 25ms window's own median-of-8-sub-window RMS
+/// reads far lower than a sustained tone at the same peak amplitude ever
+/// would. That mismatch - not the underlying statistic, which is correctly
+/// glitch-robust - is why the meter stayed visually near-empty on real
+/// hardware despite carrying real, transcribable audio.
+const LEVEL_METER_FULL_SCALE: u32 = 150;
+
 fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut PicoCalcDisplay) {
     const PADDING_X: i32 = 10;
     const PADDING_Y: i32 = 8;
+
+    // While recording, reserve a strip under the text for the level meter. Any
+    // other overlay (e.g. the battery readout) is unchanged.
+    let recording = crate::mic::is_recording();
+    let meter_space = if recording {
+        LEVEL_METER_HEIGHT as i32 + 6
+    } else {
+        0
+    };
 
     let char_count = text.chars().count() as u32;
     let text_width = char_count * (font.character_size.width + font.character_spacing);
     let text_height = font.character_size.height;
 
     let box_w = text_width + (PADDING_X as u32) * 2;
-    let box_h = text_height + (PADDING_Y as u32) * 2;
+    let box_h = text_height + (PADDING_Y as u32) * 2 + meter_space as u32;
 
     let x = (SCREEN_WIDTH as i32 - box_w as i32) / 2;
     let y = (SCREEN_HEIGHT as i32 - box_h as i32) / 2;
@@ -318,6 +346,47 @@ fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut Pico
     )
     .draw(display)
     .ok();
+
+    if recording {
+        draw_level_meter(
+            display,
+            x + PADDING_X,
+            y + PADDING_Y + text_height as i32 + 6,
+            box_w - (PADDING_X as u32) * 2,
+            LEVEL_METER_HEIGHT,
+            crate::mic::level(),
+        );
+    }
+}
+
+/// Draws the realtime push-to-talk input meter: an empty track that fills from
+/// the left with the current AC level, turning red when pinned at full scale so
+/// a loud (or railed) input is obvious. The whole strip is repainted each
+/// overlay pass, so the bar both grows and shrinks rather than smearing.
+fn draw_level_meter(
+    display: &mut PicoCalcDisplay,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    level: u32,
+) {
+    fill_rect(
+        display,
+        Point::new(x, y),
+        Size::new(width, height),
+        Rgb565::BLACK,
+    )
+    .ok();
+    let filled = (width * level.min(LEVEL_METER_FULL_SCALE)) / LEVEL_METER_FULL_SCALE;
+    if filled > 0 {
+        let color = if level >= LEVEL_METER_FULL_SCALE {
+            Rgb565::RED
+        } else {
+            Rgb565::GREEN
+        };
+        fill_rect(display, Point::new(x, y), Size::new(filled, height), color).ok();
+    }
 }
 
 #[embassy_executor::task]
