@@ -179,7 +179,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   not rest on an unconfirmed flash write. The program itself is built at run time by
   `terminal-model/src/i2s_program.rs` (the `pio` crate's `Assembler`) because `pio_asm!` bakes
   the loop count and edge in at compile time; `capture_task` keeps only the even-indexed/left-slot
-  words and `extract_left_channel_pcm` takes the top 16 bits of the configured slot width.
+  words, and `extract_left_channel_pcm` reduces each to its slot-width-aware 16-bit sample (see that
+  function's doc for the exact shift, including the left-justified sub-16-bit case).
   `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,
   `remove_dc_and_gain_words`/`remove_dc_and_gain_samples` (host-tested in `pcm_extract.rs`)
   subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating

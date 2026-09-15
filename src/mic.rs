@@ -430,8 +430,9 @@ async fn capture_task(mut mic: Mic) {
                 // this driver's left-slot pin/wiring contract in AGENTS.md
                 // (swap to odd-indexed words if a captain instead wires the mic
                 // to the right slot). ShiftDirection::Left means MSB-first, and
-                // `extract_left_channel_pcm` takes the top 16 bits of the
-                // configured slot width.
+                // `extract_left_channel_pcm` reduces each word to its
+                // slot-width-aware 16-bit sample (see its doc for the exact
+                // shift).
                 let mut pcm = [0i16; SAMPLES_PER_CHUNK];
                 extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
                 // Publish the AC level for the overlay meter before applying
