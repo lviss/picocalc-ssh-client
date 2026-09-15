@@ -14,8 +14,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bindings and will not compile for a host target — don't try to `cargo test`/`cargo check` the
   root `picocalc-wezterm` package for `x86_64-unknown-linux-gnu`, it fails deep in `embassy-rp`.
 - `terminal-model/` is a separate workspace-member crate (path dependency) holding the
-  hardware-independent terminal buffer/VTE logic (`screen_model.rs`) and vector glyph-drawing
-  (`glyphs.rs`), pulled in by `src/screen.rs`. It depends only on `vte`, `embedded-graphics`, and
+  hardware-independent terminal buffer/VTE logic (`screen_model.rs`), vector glyph-drawing
+  (`glyphs.rs`), and the SD-card SSH-key backup text codec (`keyfile.rs`), pulled in by
+  `src/screen.rs` and `src/sshkey.rs`. It depends only on `vte`, `embedded-graphics`, and
   `profont` — all host-buildable — so it's the place for real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default
   target set in `.cargo/config.toml`). If new logic needs a host test and doesn't fit here, prefer
@@ -88,6 +89,16 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   preserve that fixed pre-reserved capacity or the container-overhead accounting goes stale again.
   Re-run the two tests above (and re-derive the budget) if `HEAP_SIZE` (`src/heap.rs`) or the screen
   geometry (font/`SCREEN_WIDTH`/`SCREEN_HEIGHT`) ever changes.
+- `keygen save [force]` / `keygen load [force]` (`src/sshkey.rs`) export and restore the private key
+  as `ssh_key.hex` in the SD card root, reusing `src/storage.rs`'s `STORAGE`/`VolumeManager` (same
+  SPI0 pins as `ls`) rather than a second filesystem stack; the push-to-talk I2S mic is on
+  `PIN_2`/`PIN_3`/`PIN_21` and is untouched by this. Restoring is deliberately explicit-only: there
+  is NO boot-time auto-restore, because silently adopting a key from whatever card happens to be
+  inserted would hand that card the device's identity without an announced action. Keep it that
+  way; if a boot restore is ever added it must be announced on the console and must only apply when
+  no key is stored at all. The file holds the same 64-char hex the config store keeps, with its
+  parser in `terminal-model/src/keyfile.rs` so the edge cases (trailing newline, wrong length,
+  non-hex) stay host-tested.
 - On a NixOS-style agent sandbox where plain `cargo`/`rustc` aren't on `PATH`, the working
   toolchain lives under `$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu/bin` (set
   `RUSTUP_HOME=/home/ai/.rustup` and prepend that dir to `PATH`); building anything host-targeted

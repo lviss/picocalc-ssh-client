@@ -1,20 +1,31 @@
 use crate::config::{CONFIG, StrValue};
+use crate::storage::STORAGE;
 use ed25519_dalek::SigningKey;
+use embedded_sdmmc::{Mode, VolumeIdx};
 use sunset::{KeyType, SignKey};
+use terminal_model::keyfile;
 
 const SSH_KEY_CONFIG: &str = "ssh_key";
+
+/// Name of the private-key backup file in the root directory of the SD card's
+/// first volume. FAT short names are upper-cased on the card, so this shows up
+/// as `SSH_KEY.HEX` in a card reader (and in `ls`), but lookups here are
+/// case-insensitive.
+const KEY_FILE_NAME: &str = "ssh_key.hex";
 
 /// Loads the ed25519 signing key stored in flash, if one has been generated.
 pub async fn load_signing_key() -> Option<SigningKey> {
     let mut config = CONFIG.get().lock().await;
     let stored = config.fetch(SSH_KEY_CONFIG).await.ok()??;
-    let seed = hex_to_bytes(stored.as_str())?;
+    let seed = keyfile::decode_seed_exact(stored.as_str())?;
     Some(SigningKey::from_bytes(&seed))
 }
 
 async fn store_signing_key(key: &SigningKey) -> Result<(), ()> {
-    let hex = bytes_to_hex(&key.to_bytes());
-    let value: StrValue = hex.as_str().try_into().map_err(|_| ())?;
+    let hex = keyfile::encode_seed(&key.to_bytes());
+    // Always ASCII hex, so this conversion never fails.
+    let hex = core::str::from_utf8(&hex).map_err(|_| ())?;
+    let value: StrValue = hex.try_into().map_err(|_| ())?;
     let mut config = CONFIG.get().lock().await;
     config.store(SSH_KEY_CONFIG, value).await.map_err(|_| ())
 }
@@ -29,8 +40,9 @@ async fn print_public_key(key: &SigningKey) {
 }
 
 /// Handles the local `keygen` shell command: generates and stores a new
-/// on-device Ed25519 keypair (the private key never leaves the device),
-/// or re-displays the public key of an already generated one.
+/// on-device Ed25519 keypair (the private key never leaves the device unless
+/// explicitly exported with `keygen save`), or re-displays the public key of
+/// an already generated one.
 pub async fn keygen_command(args: &[&str]) {
     match args {
         ["keygen"] | ["keygen", "force"] => {
@@ -67,10 +79,198 @@ pub async fn keygen_command(args: &[&str]) {
             Some(key) => print_public_key(&key).await,
             None => print!("No SSH key configured. Run `keygen` to create one.\r\n"),
         },
+        ["keygen", "save"] | ["keygen", "save", "force"] => {
+            save_key_command(args.len() == 3).await;
+        }
+        ["keygen", "load"] | ["keygen", "load", "force"] => {
+            load_key_command(args.len() == 3).await;
+        }
         _ => {
             print!("Usage: keygen [force|show]\r\n");
+            print!(
+                "       keygen save [force]   (write the key to {KEY_FILE_NAME} on the SD card)\r\n"
+            );
+            print!(
+                "       keygen load [force]   (restore the key from {KEY_FILE_NAME} on the SD card)\r\n"
+            );
         }
     }
+}
+
+/// `keygen save [force]`: writes the existing on-device private key to
+/// `ssh_key.hex` in the SD card's root directory, in the same 64-character
+/// hex form the flash config store holds. Refuses to clobber an existing
+/// backup file unless `force` is given, matching `keygen`'s refusal to
+/// silently replace an existing key.
+async fn save_key_command(force: bool) {
+    let Some(key) = load_signing_key().await else {
+        print!("No SSH key configured. Run `keygen` to create one.\r\n");
+        return;
+    };
+    let hex = keyfile::encode_seed(&key.to_bytes());
+
+    let mut storage = STORAGE.get().lock().await;
+    let Some(mgr) = storage.vol_mgr() else {
+        print!("No SD card is present\r\n");
+        return;
+    };
+
+    let mut vol = match mgr.open_volume(VolumeIdx(0)) {
+        Ok(vol) => vol,
+        Err(err) => {
+            print!("Failed to open vol0: {err:?}\r\n");
+            return;
+        }
+    };
+    let mut root = match vol.open_root_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            print!("Failed to open the root directory on vol0: {err:?}\r\n");
+            return;
+        }
+    };
+
+    let mode = if force {
+        Mode::ReadWriteCreateOrTruncate
+    } else {
+        Mode::ReadWriteCreate
+    };
+    let mut file = match root.open_file_in_dir(KEY_FILE_NAME, mode) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::FileAlreadyExists) => {
+            print!(
+                "{KEY_FILE_NAME} already exists on the SD card. Use `keygen save force` \
+                 to overwrite it.\r\n"
+            );
+            return;
+        }
+        Err(err) => {
+            print!("Failed to create {KEY_FILE_NAME} on the SD card: {err:?}\r\n");
+            return;
+        }
+    };
+
+    if let Err(err) = file.write(&hex) {
+        print!("Failed to write {KEY_FILE_NAME}: {err:?}\r\n");
+        print!("The SD card may now hold an incomplete copy; do not rely on it.\r\n");
+        file.close().ok();
+        return;
+    }
+    // `close` flushes the directory entry, so its error is a real write error.
+    if let Err(err) = file.close() {
+        print!("Failed to save {KEY_FILE_NAME}: {err:?}\r\n");
+        print!("The SD card may now hold an incomplete copy; do not rely on it.\r\n");
+        return;
+    }
+
+    print!("Saved the SSH private key to {KEY_FILE_NAME} in the SD card's root directory.\r\n");
+    print!(
+        "That file is the private key in plain text: treat the card as a secret, \
+         and don't leave it lying around.\r\n"
+    );
+}
+
+/// `keygen load [force]`: restores the private key from `ssh_key.hex` in the
+/// SD card's root directory. Refuses to replace an existing on-device key
+/// unless `force` is given, exactly like `keygen` itself.
+async fn load_key_command(force: bool) {
+    if !force && load_signing_key().await.is_some() {
+        print!(
+            "A key already exists. Use `keygen load force` to replace it \
+             (servers you've already authorized will stop accepting it).\r\n"
+        );
+        return;
+    }
+
+    let seed = {
+        let mut storage = STORAGE.get().lock().await;
+        let Some(mgr) = storage.vol_mgr() else {
+            print!("No SD card is present\r\n");
+            return;
+        };
+
+        let mut vol = match mgr.open_volume(VolumeIdx(0)) {
+            Ok(vol) => vol,
+            Err(err) => {
+                print!("Failed to open vol0: {err:?}\r\n");
+                return;
+            }
+        };
+        let mut root = match vol.open_root_dir() {
+            Ok(root) => root,
+            Err(err) => {
+                print!("Failed to open the root directory on vol0: {err:?}\r\n");
+                return;
+            }
+        };
+
+        let mut file = match root.open_file_in_dir(KEY_FILE_NAME, Mode::ReadOnly) {
+            Ok(file) => file,
+            Err(embedded_sdmmc::Error::NotFound) => {
+                print!("No {KEY_FILE_NAME} in the SD card's root directory.\r\n");
+                return;
+            }
+            Err(err) => {
+                print!("Failed to open {KEY_FILE_NAME} on the SD card: {err:?}\r\n");
+                return;
+            }
+        };
+
+        // The file should hold 64 hex characters, optionally with a trailing
+        // newline; anything bigger than this is malformed, not just padded.
+        const MAX_KEY_FILE_BYTES: usize = 128;
+        let mut buf = [0u8; MAX_KEY_FILE_BYTES];
+        let mut len = 0;
+        loop {
+            match file.read(&mut buf[len..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    len += n;
+                    if len == buf.len() {
+                        print!(
+                            "{KEY_FILE_NAME} is malformed: it is larger than {MAX_KEY_FILE_BYTES} \
+                             bytes, not {} hex characters.\r\n",
+                            keyfile::HEX_LEN
+                        );
+                        file.close().ok();
+                        return;
+                    }
+                }
+                Err(err) => {
+                    print!("Failed to read {KEY_FILE_NAME}: {err:?}\r\n");
+                    file.close().ok();
+                    return;
+                }
+            }
+        }
+        file.close().ok();
+
+        let text = match core::str::from_utf8(&buf[..len]) {
+            Ok(text) => text,
+            Err(_) => {
+                print!("{KEY_FILE_NAME} is malformed: it is not ASCII text.\r\n");
+                return;
+            }
+        };
+        match keyfile::decode_seed_file(text) {
+            Ok(seed) => seed,
+            Err(err) => {
+                print!("{KEY_FILE_NAME} is malformed: {err}.\r\n");
+                return;
+            }
+        }
+    };
+
+    // The stored key is only replaced once the file has been read and fully
+    // validated, so a bad file can never leave a half-applied key behind.
+    let key = SigningKey::from_bytes(&seed);
+    if store_signing_key(&key).await.is_err() {
+        print!("failed to store key\r\n");
+        return;
+    }
+
+    print!("Loaded the SSH private key from {KEY_FILE_NAME} on the SD card.\r\n\r\n");
+    print_public_key(&key).await;
 }
 
 /// SSH wire-format public key blob: string("ssh-ed25519") + string(pubkey).
@@ -111,36 +311,4 @@ fn base64_encode(input: &[u8]) -> heapless::String<96> {
         .ok();
     }
     out
-}
-
-const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-fn bytes_to_hex(bytes: &[u8; 32]) -> heapless::String<64> {
-    let mut out = heapless::String::new();
-    for b in bytes {
-        out.push(HEX_CHARS[(b >> 4) as usize] as char).ok();
-        out.push(HEX_CHARS[(b & 0x0f) as usize] as char).ok();
-    }
-    out
-}
-
-fn hex_to_bytes(s: &str) -> Option<[u8; 32]> {
-    let bytes = s.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.chunks(2).enumerate() {
-        out[i] = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
-    }
-    Some(out)
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
