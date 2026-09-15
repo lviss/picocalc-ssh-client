@@ -17,6 +17,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Scrolling**: Scroll through the command history, with a heap-budget-derived scrollback limit.
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
+*   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -175,6 +176,67 @@ $ keygen force
 Once a key is generated, `ssh` tries it automatically before falling back to
 `ssh_pw` or an interactive password prompt.
 
+#### Backing up and restoring the private key on the SD card
+
+Erasing flash (for example `flash_nuke.uf2` before switching the PicoCalc to
+another firmware) also wipes the config sectors that hold the private key,
+which would otherwise mean generating a new key and re-authorising it on
+every server. With an SD card inserted, the key can be written to the card
+and restored later:
+
+```bash
+# Write the current private key to the card (creates ssh_key.hex;
+# refuses if a backup already exists)
+$ keygen save
+
+# Overwrite an existing backup on the card
+$ keygen save force
+
+# Restore a key from the card (refuses if the device already has a key)
+$ keygen load
+
+# Replace the device's current key with the one on the card
+$ keygen load force
+```
+
+*   **File and location**: `ssh_key.hex` in the root directory of the card's
+    first (FAT) partition. FAT short names are stored upper-cased, so the file
+    appears as `SSH_KEY.HEX` in a PC card reader (and in `ls`).
+*   **Format**: exactly the 64-character hex string the config store already
+    holds under `ssh_key` — plain text, nothing else in the file, so it can be
+    inspected or copied with any editor. A trailing newline is tolerated when
+    reading.
+*   **Safety**: `keygen save` needs a key to exist (run `keygen` first) and
+    will not overwrite an existing backup without `force`; `keygen load` will
+    not replace an existing on-device key without `force`, exactly like
+    `keygen` itself. Every failure — no card, missing or malformed file, a
+    failed write — prints a reason instead of doing nothing.
+
+> [!CAUTION]
+> `keygen save` writes the **private key in plain text** to removable media.
+> The card then has to be treated as a secret in its own right: anyone who can
+> read it can impersonate the device on every server that authorises the
+> matching public key. Keep the card somewhere safe and delete `ssh_key.hex`
+> when you no longer need the backup. The export is always explicit — the
+> firmware never copies the key to the card on its own, and it never loads a
+> key from the card automatically at boot either.
+
+#### Recovering after a flash erase
+
+1.  Flash the firmware as usual (BOOTSEL, copy the `.uf2`, reboot).
+2.  Insert the SD card that holds `SSH_KEY.HEX`.
+3.  Run `keygen load`. It prints the public key it just restored.
+4.  Run `keygen show` and check the `ssh-ed25519 AAAA...` line matches the one
+    already in your servers' `~/.ssh/authorized_keys`; your existing
+    authorisations keep working, with no need to re-authorise anything.
+
+The erase clears *every* stored setting, not just the key: WiFi credentials,
+`ssh_user`/`ssh_pw`, saved `ssh` aliases, `scroll`, and — in builds that have
+it — the push-to-talk `ptt_*` settings all have to be re-entered with
+`config set`. Only the SSH key has a save/restore path today; the same
+file-on-the-card approach could carry the rest of the config, but that isn't
+implemented here.
+
 #### Retrieving the public key
 
 The public key line is long (an Ed25519 `ssh-ed25519 AAAA...` line is around
@@ -237,6 +299,8 @@ entirely by the keyboard co-processor and doesn't involve this firmware.
 *   `free`: Show memory usage.
 *   `bootsel`: Reboot into bootloader mode.
 *   `keygen [force|show]`: Generate (or re-display) an SSH keypair for public-key authentication.
+*   `keygen save [force]`: Write the private key to `ssh_key.hex` on the SD card (see [Backing up and restoring the private key](#backing-up-and-restoring-the-private-key-on-the-sd-card)).
+*   `keygen load [force]`: Restore the private key from `ssh_key.hex` on the SD card.
 
 ## Credits
 

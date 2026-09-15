@@ -127,6 +127,8 @@ pub async fn help_command(_args: &[&str]) {
             "free",
             "help",
             "keygen [force|show]",
+            "keygen save [force]",
+            "keygen load [force]",
             "ls [path]",
             "reboot",
             "ssh [user@]hostname[:port] [command]",
