@@ -484,8 +484,7 @@ mod tests {
         // An out-of-window pair (8-bit @ 32 kHz) plus a malformed edge: both
         // stored keys are not what the next recording uses, so each must be
         // reported for rewriting.
-        let (resolved, fixes, clock_pair) =
-            reconcile(Some("8"), Some("32000"), Some("maybe"));
+        let (resolved, fixes, clock_pair) = reconcile(Some("8"), Some("32000"), Some("maybe"));
         assert!(resolved.fell_back);
         assert_eq!(resolved.settings.bits, DEFAULT_BITS);
         assert_eq!(resolved.settings.rate, DEFAULT_RATE_HZ);

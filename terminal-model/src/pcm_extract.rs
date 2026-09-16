@@ -81,8 +81,7 @@ pub fn extract_left_channel_pcm(raw: &[u32], pcm: &mut [i16], bits_per_channel_s
 /// The 16-bit PCM sample a single captured slot word carries, using the same
 /// shift the production extraction applies: the slot's most significant 16
 /// bits for widths >= 16, or the captured bits left-justified for narrower
-/// slots. Shared by [`extract_left_channel_pcm`] and [`ac_rms_level_words`] so
-/// the level meter always measures the same bit field the payload carries.
+/// slots.
 pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
     let bits = bits_per_channel_slot.clamp(1, 32);
     if bits >= 16 {
@@ -317,5 +316,4 @@ mod tests {
             ac_rms_level(&loud)
         );
     }
-
 }

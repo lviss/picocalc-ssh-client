@@ -338,7 +338,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `python3 tools/test_picocalc_ptt.py`; nothing else in the repo is Python) and is **embedded in
   the firmware** (`include_bytes!`, `src/net.rs`'s `PTT_HELPER_SCRIPT`), so the server needs only
   `python3` and whisper: at session start the device streams the script down the audio channel
-  (`AudioCommand::Embedded`, ~21 KB in 1 KB writes) and the exec'd command
+  (`AudioCommand::Embedded`, streamed in `PTT_SCRIPT_CHUNK_BYTES` writes) and the exec'd command
   (`terminal_model::ptt_frame::helper_exec_command`, host-tested) copies exactly that many bytes
   into `$TMPDIR/picocalc-ptt.<pid>` with `dd bs=1` and execs python on it, which leaves the
   channel on python's stdin for the frames that follow - `dd`'s byte-at-a-time reads are what keep

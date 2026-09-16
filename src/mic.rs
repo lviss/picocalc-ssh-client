@@ -82,8 +82,8 @@ const SAMPLES_PER_CHUNK: usize = DEFAULT_RATE_HZ as usize / 40;
 /// fixed audio queue with this, so the two cannot drift apart.
 pub const WIRE_FRAME_BYTES: usize = ptt_frame::frame_bytes(SAMPLES_PER_CHUNK);
 /// Capacity of the shared capture/upload ring, in `i16` samples: 2048 samples
-/// at 16 kHz is 128 ms of audio, enough to absorb ordinary connection-setup
-/// and scheduling jitter without being a meaningful memory cost. This buffer
+/// at 16 kHz is 128 ms of audio, enough to absorb ordinary scheduling jitter
+/// without being a meaningful memory cost. This buffer
 /// is a plain `static` compiled into `.bss`, so - unlike the heap-allocated
 /// per-chunk `Box`es it replaces - it does not draw on the 64 KiB `DualHeap`
 /// the WiFi/TCP/SSH stack and screen scrollback share, and therefore cannot
@@ -300,11 +300,10 @@ pub async fn effective_setting(key: &str) -> Option<String> {
 /// `static` (never heap-allocated, never resized), guarded by an
 /// `embassy_sync` mutex rather than held lock-free per `heap.rs`'s CAS
 /// caveat. Because `AudioRing::write` never blocks, `capture_task` can deposit
-/// samples cooperatively regardless of whether the upload task has connected
-/// yet, so there is no connect-vs-capture race to manage. Each sample carries
-/// the utterance generation that produced it, so overlapping utterances can
-/// share the buffer without one's audio (or end) leaking into the other's
-/// connection.
+/// samples cooperatively regardless of what the upload task is doing, so there
+/// is no upload-vs-capture race to manage. Each sample carries the utterance
+/// generation that produced it, so overlapping utterances can share the buffer
+/// without one's audio (or end) leaking into the other's upload.
 static PCM_RING: Mutex<CriticalSectionRawMutex, AudioRing<RING_SAMPLES>> =
     Mutex::new(AudioRing::new());
 
@@ -372,8 +371,8 @@ static DATA_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static STREAM_ENDED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Separate from `START_SIGNAL` (each `Signal` has exactly one waiter:
 /// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` on this one) so
-/// the upload task can begin DNS/TCP connect as soon as a recording starts,
-/// while `capture_task` fills the static ring.
+/// the upload task can start serving an utterance as soon as a recording
+/// starts, while `capture_task` fills the static ring.
 static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Begins push-to-talk capture; a no-op if already recording. Called from
@@ -394,8 +393,8 @@ pub async fn start_recording() {
         }
         // A new generation identifies this utterance for the rest of its
         // life. The ring is deliberately *not* cleared here: a previous
-        // utterance's undrained audio must stay available to the connection
-        // that owns it, and the generation tags keep the two separate.
+        // utterance's undrained audio must stay available to its own upload,
+        // and the generation tags keep the two separate.
         let generation = CURRENT_GEN.fetch_add(1, Ordering::AcqRel) + 1;
         RECORDING.store(generation, Ordering::Release);
         SCREEN
@@ -656,7 +655,8 @@ async fn capture_task(mut mic: Mic) {
                 // Even index on purpose: the DMA starts this recording at ring
                 // index 0 with a left-slot word, so even positions stay the
                 // driven (left) slot and the extraction's pairing holds.
-                read_index = (write_index + DMA_RING_WORDS - DMA_RING_MARGIN) % DMA_RING_WORDS & !1;
+                read_index =
+                    ((write_index + DMA_RING_WORDS - DMA_RING_MARGIN) % DMA_RING_WORDS) & !1;
                 filled = 0;
             }
             last_poll = Instant::now();
@@ -754,9 +754,9 @@ async fn emit_pending_notices() {
 /// generation are left in the ring for their own upload, and the end
 /// condition is [`utterance_ended`] on the generation counters - never a
 /// shared signal - so a later recording can neither have its audio sent here
-/// nor be mistaken for this one's end. With no socket (connect failed or
-/// timed out) the samples are discarded instead, so the ring is still drained
-/// and the recording always terminates.
+/// nor be mistaken for this one's end. When the channel is unavailable the
+/// samples are discarded instead, so the ring is still drained and the
+/// recording always terminates.
 ///
 /// The destination is the SSH session's audio channel when it is up (see
 /// [`crate::net::ssh_audio_available`]); that is the transport that reaches a
@@ -771,7 +771,7 @@ async fn serve_utterance(generation: u32) {
         emit_pending_notices().await;
         // Drain everything this generation has buffered so far. The static
         // ring absorbs (and, when full, drops the oldest of) whatever capture
-        // produces meanwhile, so a failed, slow, or congested connection only
+        // produces meanwhile, so a failed, slow, or congested session only
         // ever costs buffered audio - it never blocks `capture_task`.
         loop {
             let n = {
@@ -830,7 +830,7 @@ async fn ptt_upload_task() {
     loop {
         // Serve every utterance exactly once, in order. Generations are
         // contiguous, so once `CURRENT_GEN` has reached one it exists and must
-        // be served - even if it was superseded before its connect resolved.
+        // be served - even if it was superseded before its upload began.
         // Whether the session's audio channel is up is decided per utterance
         // in `serve_utterance`.
         while next_generation > CURRENT_GEN.load(Ordering::Acquire) {

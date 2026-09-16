@@ -11,12 +11,12 @@
 //!
 //! Every sample is tagged with the *generation* (utterance) that produced
 //! it. Utterances are serialized on the capture side, but a second recording
-//! can begin while the first one's connection is still being established, so
-//! their samples share this buffer. The generation tags let the upload task
-//! drain exactly the audio belonging to the connection it currently holds
-//! and never send a later utterance's audio (or consume its end) on an
-//! earlier utterance's socket. [`utterance_ended`] is the matching pure
-//! predicate for deciding when a generation has finished.
+//! can begin while the first one is still being uploaded, so their samples
+//! share this buffer. The generation tags let the upload task drain exactly
+//! the audio belonging to the utterance it is serving and never send a later
+//! utterance's audio (or consume its end) as an earlier utterance's.
+//! [`utterance_ended`] is the matching pure predicate for deciding when a
+//! generation has finished.
 //!
 //! Keeping this here (free of embassy/`crate` dependencies) lets host tests
 //! exercise the exact code the firmware runs, per AGENTS.md's
@@ -104,7 +104,11 @@ impl<const N: usize> AudioRing<N> {
         self.write_iter(generation, samples.iter().copied())
     }
 
-    fn write_iter(&mut self, generation: u32, samples: impl IntoIterator<Item = i16>) -> WriteResult {
+    fn write_iter(
+        &mut self,
+        generation: u32,
+        samples: impl IntoIterator<Item = i16>,
+    ) -> WriteResult {
         if generation < self.newest_generation {
             return WriteResult {
                 dropped: 0,
@@ -393,7 +397,7 @@ mod tests {
 
     /// End-to-end model of the shared-ring lifecycle the firmware runs: a
     /// stalled first utterance (A) is superseded by a second (B) that starts
-    /// and finishes before A's connection resolves. A's uploader must stop at
+    /// and finishes before A's upload gets to it. A's uploader must stop at
     /// its own end without touching B's audio, and B's uploader must then get
     /// B's untouched audio and its own end.
     #[test]
@@ -402,11 +406,11 @@ mod tests {
         const B: u32 = 2;
         let mut ring = AudioRing::<32>::new();
 
-        // A captures, and ends while its upload is still connecting.
+        // A captures, and ends while its upload is still in progress.
         ring.write(A, &[10, 11, 12]);
 
-        // B starts and finishes before A's connect resolves, so at this point
-        // A has ended and B is both armed and finished.
+        // B starts and finishes before A's upload gets to it, so at this
+        // point A has ended and B is both armed and finished.
         ring.write(B, &[20, 21, 22]);
         let newest_armed = B;
         let newest_ended = B;
@@ -419,7 +423,7 @@ mod tests {
         assert!(utterance_ended(newest_armed, newest_ended, A));
 
         // B's uploader gets B's audio, untouched by A's upload, and its own
-        // end signal - so its connection eventually closes too.
+        // end signal - so its utterance is finished too.
         let mut b_out = [0i16; 8];
         let b_len = ring.read(B, &mut b_out);
         assert_eq!(&b_out[..b_len], [20, 21, 22]);

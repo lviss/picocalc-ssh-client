@@ -332,10 +332,9 @@ pub async fn ssh_audio_send(samples: &[i16]) -> bool {
 }
 
 /// Marks the end of one push-to-talk utterance on the session's audio channel:
-/// a zero-length frame, the in-band equivalent of the TCP transport closing its
-/// connection for that utterance (see `terminal_model::ptt_frame`). Returns
-/// `false` if the marker could not be queued, leaving the utterance unterminated
-/// for the server-side helper.
+/// a zero-length frame (see `terminal_model::ptt_frame` for why the marker is
+/// in band). Returns `false` if the marker could not be queued, leaving the
+/// utterance unterminated for the server-side helper.
 pub async fn ssh_audio_end_of_utterance() -> bool {
     queue_audio_frame(&[]).await
 }
