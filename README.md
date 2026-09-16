@@ -439,6 +439,31 @@ little-endian PCM at `ptt_rate` (16 kHz), which the wire does not signal, so
 the receiver has to be told the rate out of band; see AGENTS.md for the
 authoritative contract.
 
+#### Microphone wiring
+
+Push-to-talk drives a digital I2S microphone from three expansion-header pins,
+and the firmware expects the mic's data and both clock lines on exactly these:
+
+| microphone pin | PicoCalc pin | direction |
+| --- | --- | --- |
+| `BCLK` (bit clock) | `GP2` | driven by the firmware |
+| `WS` / `LRCLK` (word select) | `GP3` | driven by the firmware |
+| `DOUT` / `SD` (serial data) | `GP21` | driven by the microphone |
+| `SEL` (channel select) | left-channel setting | wire it so the mic drives the *left* slot, which is the one the firmware extracts |
+| `3V` / `GND` | `3V3` / `GND` | power and ground |
+
+`GP2`, `GP3` and `GP21` are also wired to the PicoCalc's PSRAM chip (its
+`RAM_TX`/`RAM_RX`/`RAM_SCK` lines); that is safe here because this firmware
+never uses that PSRAM - see `README-DEVICE.md` and `src/psram.rs`. If your mic
+is strapped to the right channel instead, the capture keeps the wrong I2S slot
+and records silence; `terminal_model::pcm_extract::extract_left_channel_pcm`
+documents the one-line change for that case.
+
+The firmware was brought up against an Adafruit SPH0645 breakout. That mic has
+a fixed 32-bit slot per channel, which is why the defaults (`ptt_bits=32`,
+`ptt_rate=16000`) clock it at 1.024 MHz - the bottom of its documented clock
+range. The settings below exist for bringing up a different microphone.
+
 #### Microphone bring-up and diagnostics
 
 For bringing up a new microphone there are also optional debug settings. They
@@ -495,10 +520,11 @@ needs to speak, README-DEVICE.md for the mic's I2S pin wiring, and
 `tools/picocalc-ptt` for the transcribing end of the SSH transport.
 
 > [!NOTE]
-> This requires a digital I2S microphone wired to the pins documented in
-> README-DEVICE.md. The SSH transport is encrypted, being part of the SSH
-> session; the `ptt_host`/`ptt_port` fallback streams audio unencrypted over a
-> plain TCP connection, so only use that on a network you trust.
+> This requires a digital I2S microphone wired to the pins in the
+> [Microphone wiring](#microphone-wiring) section above. The SSH transport is
+> encrypted, being part of the SSH session; the `ptt_host`/`ptt_port` fallback
+> streams audio unencrypted over a plain TCP connection, so only use that on a
+> network you trust.
 
 ### Local Commands
 
