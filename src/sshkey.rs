@@ -13,6 +13,16 @@ const SSH_KEY_CONFIG: &str = "ssh_key";
 /// case-insensitive.
 const KEY_FILE_NAME: &str = "ssh_key.hex";
 
+/// Name of the public-key file in the root directory of the SD card's first
+/// volume, written in the exact `authorized_keys` line form printed by
+/// `print_public_key`. FAT short names are upper-cased on the card, so this
+/// shows up as `SSH_KEY.PUB` in a card reader (and in `ls`), but lookups here
+/// are case-insensitive. Unlike `KEY_FILE_NAME`, this file is not a secret and
+/// is unconditionally (re)written on every `keygen`/`keygen force`/`keygen
+/// show`, with no overwrite protection, so it can never go stale relative to
+/// the key actually in use.
+const PUBLIC_KEY_FILE_NAME: &str = "ssh_key.pub";
+
 /// Loads the ed25519 signing key stored in flash, if one has been generated.
 pub async fn load_signing_key() -> Option<SigningKey> {
     let mut config = CONFIG.get().lock().await;
@@ -37,6 +47,71 @@ async fn print_public_key(key: &SigningKey) {
     // (USB-CDC or the debug UART) instead of hand-transcribed off the LCD.
     log::info!("ssh-ed25519 {encoded} picocalc-ssh-client");
     print!("ssh-ed25519 {encoded} picocalc-ssh-client\r\n");
+    write_public_key_to_sd(&encoded).await;
+}
+
+/// Best-effort mirror of the public key to `ssh_key.pub` in the SD card's
+/// root directory, so pulling the card and reading the file is enough to get
+/// the key without transcribing it off the LCD or serial console. Unlike
+/// `save_key_command`, this always overwrites: the public key isn't a
+/// secret, and a stale mismatched copy on the card would be actively
+/// unhelpful. Never fails the caller — no SD card, or any write error, just
+/// prints one clear message and returns.
+async fn write_public_key_to_sd(encoded: &heapless::String<96>) {
+    let mut storage = STORAGE.get().lock().await;
+    let Some(mgr) = storage.vol_mgr() else {
+        print!(
+            "No SD card is present; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n"
+        );
+        return;
+    };
+
+    let mut vol = match mgr.open_volume(VolumeIdx(0)) {
+        Ok(vol) => vol,
+        Err(err) => {
+            print!("Failed to open vol0: {err:?}; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n");
+            return;
+        }
+    };
+    let mut root = match vol.open_root_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            print!(
+                "Failed to open the root directory on vol0: {err:?}; not mirroring the public \
+                 key to {PUBLIC_KEY_FILE_NAME}.\r\n"
+            );
+            return;
+        }
+    };
+
+    let mut file =
+        match root.open_file_in_dir(PUBLIC_KEY_FILE_NAME, Mode::ReadWriteCreateOrTruncate) {
+            Ok(file) => file,
+            Err(err) => {
+                print!("Failed to write {PUBLIC_KEY_FILE_NAME} to the SD card: {err:?}\r\n");
+                return;
+            }
+        };
+
+    let write_err = file
+        .write(b"ssh-ed25519 ")
+        .and_then(|_| file.write(encoded.as_bytes()))
+        .and_then(|_| file.write(b" picocalc-ssh-client\n"))
+        .err();
+    if let Some(err) = write_err {
+        print!("Failed to write {PUBLIC_KEY_FILE_NAME} to the SD card: {err:?}\r\n");
+        file.close().ok();
+        return;
+    }
+    // `close` flushes the directory entry, so its error is a real write error.
+    if let Err(err) = file.close() {
+        print!("Failed to write {PUBLIC_KEY_FILE_NAME} to the SD card: {err:?}\r\n");
+        return;
+    }
+
+    print!(
+        "Mirrored the public key to {PUBLIC_KEY_FILE_NAME} in the SD card's root directory.\r\n"
+    );
 }
 
 /// Handles the local `keygen` shell command: generates and stores a new
@@ -92,6 +167,10 @@ pub async fn keygen_command(args: &[&str]) {
             );
             print!(
                 "       keygen load [force]   (restore the key from {KEY_FILE_NAME} on the SD card)\r\n"
+            );
+            print!(
+                "       (the public key is also mirrored to {PUBLIC_KEY_FILE_NAME} on the SD \
+                 card whenever it's generated or shown)\r\n"
             );
         }
     }

@@ -224,6 +224,38 @@ $ keygen load force
 > firmware never copies the key to the card on its own, and it never loads a
 > key from the card automatically at boot either.
 
+#### Public key on the SD card
+
+Unlike the private key, the public key doesn't need an explicit export step.
+Whenever it's generated or shown (`keygen`, `keygen force`, or `keygen show`),
+it's also mirrored to `ssh_key.pub` in the root directory of the card's first
+(FAT) partition — the same `ssh-ed25519 <base64> picocalc-ssh-client` line
+printed to the LCD and serial console, ready to paste into a server's
+`~/.ssh/authorized_keys`. FAT short names are stored upper-cased, so the file
+appears as `SSH_KEY.PUB` in a PC card reader (and in `ls`). This write always
+overwrites whatever was there — the public key isn't a secret, so there's no
+`force`/overwrite-protection to worry about, and a stale mismatched copy on
+the card would only be confusing. It's also best-effort: if no card is
+present or the write fails, the console prints one line saying so and the
+`keygen`/`keygen show` command still succeeds — the LCD/serial output is
+never blocked on it.
+
+**How to test:**
+
+1.  With an SD card inserted, run `keygen force` (or `keygen show` if a key
+    already exists) on the device console.
+2.  Confirm the console prints both the `ssh-ed25519 AAAA... picocalc-ssh-client`
+    line and a `Mirrored the public key to ssh_key.pub ...` confirmation line.
+3.  Pull the card and read it on another machine — `cat ssh_key.pub` (or open
+    `SSH_KEY.PUB` in any text editor) — and check the line matches exactly
+    what the console printed.
+4.  Re-insert the card, run `keygen show` again, and confirm the file's
+    contents are unchanged (same key, rewritten in place).
+5.  Remove the card and run `keygen show`; confirm the public key still
+    prints normally and the console instead prints a
+    `No SD card is present; not mirroring the public key ...` line, with the
+    command otherwise succeeding.
+
 #### Recovering after a flash erase
 
 1.  Flash the firmware as usual (BOOTSEL, copy the `.uf2`, reboot).
@@ -243,8 +275,11 @@ implemented here.
 #### Retrieving the public key
 
 The public key line is long (an Ed25519 `ssh-ed25519 AAAA...` line is around
-100 characters), too long to reliably copy by hand off the LCD. Instead,
-retrieve it over the device's USB serial log port:
+100 characters), too long to reliably copy by hand off the LCD. With an SD
+card inserted, the easiest way is to just read it off the card — see
+[Public key on the SD card](#public-key-on-the-sd-card) above; no cable
+needed. Without a card, retrieve it over the device's USB serial log port
+instead:
 
 1. Connect a USB cable to the PicoCalc (the same port used to flash it, once
    it's booted normally rather than in BOOTSEL mode).
@@ -372,7 +407,7 @@ needs to speak, and README-DEVICE.md for the mic's I2S pin wiring.
 *   `bl kbd <percent>`: Set keyboard backlight brightness (requires updated keyboard firmware).
 *   `free`: Show memory usage.
 *   `bootsel`: Reboot into bootloader mode.
-*   `keygen [force|show]`: Generate (or re-display) an SSH keypair for public-key authentication.
+*   `keygen [force|show]`: Generate (or re-display) an SSH keypair for public-key authentication. Also mirrors the public key to `ssh_key.pub` on the SD card if one is present (see [Public key on the SD card](#public-key-on-the-sd-card)).
 *   `keygen save [force]`: Write the private key to `ssh_key.hex` on the SD card (see [Backing up and restoring the private key](#backing-up-and-restoring-the-private-key-on-the-sd-card)).
 *   `keygen load [force]`: Restore the private key from `ssh_key.hex` on the SD card.
 
