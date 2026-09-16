@@ -397,7 +397,7 @@ impl Drop for AudioReadyGuard {
 
 /// The command `config set ptt_ssh_cmd` selects the session's audio helper
 /// with, or `None` when it is set to an empty value, which disables the SSH
-/// audio channel and leaves recordings on the raw TCP sink. Reported by
+/// audio channel (recordings then never start). Reported by
 /// `config get` as well, so the console shows what a new session would run
 /// rather than the raw store slot.
 pub async fn effective_ssh_audio_command() -> Option<AudioCommand> {
@@ -486,7 +486,7 @@ impl AudioCommand {
 /// the session's `select`, so completing would end the session. When the audio
 /// channel dies (the helper exited, or the server closed it), the branch keeps
 /// draining `AUDIO_QUEUE` forever instead, which leaves the session's audio
-/// unavailable so later recordings use the raw TCP sink.
+/// unavailable so later recordings never start.
 async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&AudioCommand>) {
     if let Some(command) = command {
         PTY_READY.wait().await;
@@ -504,7 +504,8 @@ async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&AudioComm
 
 /// Opens the session's audio channel and waits for the ticker to have sent the
 /// helper's `exec` request on it. Returns `None`, after reporting why, when
-/// the channel cannot carry audio - the session then keeps its raw TCP sink.
+/// the channel cannot carry audio - the session then has none, so later
+/// recordings never start.
 async fn open_audio_channel<'g, 'a>(
     ssh_client: &'g SSHClient<'a>,
     command: &AudioCommand,
@@ -549,8 +550,8 @@ async fn open_audio_channel<'g, 'a>(
 /// stdout drained, and forwards its stderr to the console, until the channel
 /// closes.
 async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) {
-    // From here recordings queue frames instead of opening a TCP connection;
-    // the guard makes that untrue again the moment this pump stops.
+    // From here recordings queue frames for this channel; the guard makes
+    // that untrue again the moment this pump stops.
     AUDIO_READY.store(true, Ordering::Release);
     let _ready = AudioReadyGuard;
 
@@ -672,7 +673,7 @@ async fn ssh_session_task(
 
                     // Resolved once per session: `config set ptt_ssh_cmd`
                     // changes what the *next* session runs, and `None` (an empty
-                    // value) leaves recordings on the raw TCP sink.
+                    // value) disables the audio channel.
                     let audio_command = effective_ssh_audio_command().await;
                     match &audio_command {
                         Some(command) => {

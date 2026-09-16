@@ -632,6 +632,7 @@ async fn capture_task(mut mic: Mic) {
         let mut read_index = 0usize;
         let mut filled = 0usize;
         let mut last_poll = Instant::now();
+        let mut overrun_noticed = false;
         let mut ticker = Ticker::every(DMA_POLL_INTERVAL);
         // The DMA writes two words per sample (one per channel slot), which is
         // what tells a *late* poll (see the overrun check below) apart from a
@@ -648,7 +649,10 @@ async fn capture_task(mut mic: Mic) {
             // the DMA wrapped, so resynchronise at the write head, drop the
             // audio that was overwritten, and report it once for this recording.
             if (Instant::now() - last_poll).as_millis() as usize * words_per_ms > DMA_RING_WORDS {
-                DMA_OVERRUN_NOTICE_GEN.store(generation, Ordering::Release);
+                if !overrun_noticed {
+                    DMA_OVERRUN_NOTICE_GEN.store(generation, Ordering::Release);
+                    overrun_noticed = true;
+                }
                 // Even index on purpose: the DMA starts this recording at ring
                 // index 0 with a left-slot word, so even positions stay the
                 // driven (left) slot and the extraction's pairing holds.
@@ -745,8 +749,8 @@ async fn emit_pending_notices() {
 }
 
 /// Sends one utterance's audio down the session's audio channel: drain every
-/// sample tagged `generation` until that
-/// generation ends, then close the connection. Samples belonging to any other
+/// sample tagged `generation` until that generation ends, then mark its end
+/// on the channel. Samples belonging to any other
 /// generation are left in the ring for their own upload, and the end
 /// condition is [`utterance_ended`] on the generation counters - never a
 /// shared signal - so a later recording can neither have its audio sent here
@@ -754,12 +758,11 @@ async fn emit_pending_notices() {
 /// timed out) the samples are discarded instead, so the ring is still drained
 /// and the recording always terminates.
 ///
-/// The destination is chosen once per utterance: the SSH session's audio
-/// channel when it is up (see [`crate::net::ssh_audio_available`]), because
-/// that is the transport that can reach a helper running on the machine the
-/// user is typing into, and otherwise the raw TCP sink
-/// session's audio channel. If that channel fails mid-recording the rest of
-/// the utterance is drained, so the recording still terminates.
+/// The destination is the SSH session's audio channel when it is up (see
+/// [`crate::net::ssh_audio_available`]); that is the transport that reaches a
+/// helper running on the machine the user is typing into. If that channel
+/// fails mid-recording the rest of the utterance is drained, so the recording
+/// still terminates.
 async fn serve_utterance(generation: u32) {
     let mut ssh = crate::net::ssh_audio_available();
 
@@ -828,8 +831,8 @@ async fn ptt_upload_task() {
         // Serve every utterance exactly once, in order. Generations are
         // contiguous, so once `CURRENT_GEN` has reached one it exists and must
         // be served - even if it was superseded before its connect resolved.
-        // Which sink that is (the SSH session's audio channel or a TCP
-        // connection) is decided per utterance in `serve_utterance`.
+        // Whether the session's audio channel is up is decided per utterance
+        // in `serve_utterance`.
         while next_generation > CURRENT_GEN.load(Ordering::Acquire) {
             UPLOAD_START_SIGNAL.wait().await;
         }

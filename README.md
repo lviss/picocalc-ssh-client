@@ -18,7 +18,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
-*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a server-side helper over the SSH session (which transcribes it with Whisper and types it into your tmux pane), or to a configurable TCP host (see below).
+*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a server-side helper over the SSH session (which transcribes it with Whisper and types it into your tmux pane).
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements

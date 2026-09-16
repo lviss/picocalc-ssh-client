@@ -668,6 +668,22 @@ class ConfigPrecedence(unittest.TestCase):
                 del os.environ["PICOCALC_PTT_WHISPER"]
                 del os.environ["PICOCALC_PTT_TMUX_SOCKET"]
 
+    def test_enter_and_no_enter_flags_both_override_the_config_file(self):
+        # BooleanOptionalAction is Python 3.9+, so the helper declares both
+        # spellings itself to keep working on the 3.8 it documents.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "ptt.conf"
+            config.write_text("whisper = whisper-fake\nenter = yes\n")
+            args = ptt.build_parser().parse_args(["--config", str(config), "--no-enter"])
+            with contextlib.redirect_stderr(io.StringIO()):
+                resolved = ptt.resolve_config(args)
+            self.assertFalse(resolved.enter)
+
+            args = ptt.build_parser().parse_args(["--config", str(config), "--enter"])
+            with contextlib.redirect_stderr(io.StringIO()):
+                resolved = ptt.resolve_config(args)
+            self.assertTrue(resolved.enter)
+
 
 if __name__ == "__main__":
     sys.exit(unittest.main(verbosity=2))

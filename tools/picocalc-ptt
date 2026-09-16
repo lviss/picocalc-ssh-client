@@ -568,9 +568,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--enter",
-        action=argparse.BooleanOptionalAction,
+        dest="enter",
+        action="store_true",
         default=None,
         help="also press Enter after typing the transcript",
+    )
+    parser.add_argument(
+        "--no-enter",
+        dest="enter",
+        action="store_false",
+        help="do not press Enter after typing the transcript",
     )
     parser.add_argument(
         "--rate",

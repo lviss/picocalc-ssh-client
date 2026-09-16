@@ -184,9 +184,9 @@ mod tests {
         assert_eq!(LEN_PREFIX_BYTES + byte_len, n);
     }
 
-    /// The TCP sink writes the byte count separately from batched sample
-    /// payloads, so that path needs the two halves to agree with the
-    /// whole-frame encoder byte for byte.
+    /// A sender that writes the byte count and then the payload in batches
+    /// must produce the same bytes as the whole-frame encoder, so the two
+    /// halves can never drift.
     #[test]
     fn split_prefix_and_batched_payload_match_the_whole_frame_encoder() {
         let samples: [i16; 5] = [7, -8, 9, -10, 11];
