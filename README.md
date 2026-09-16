@@ -275,8 +275,11 @@ implemented here.
 #### Retrieving the public key
 
 The public key line is long (an Ed25519 `ssh-ed25519 AAAA...` line is around
-100 characters), too long to reliably copy by hand off the LCD. Instead,
-retrieve it over the device's USB serial log port:
+100 characters), too long to reliably copy by hand off the LCD. With an SD
+card inserted, the easiest way is to just read it off the card — see
+[Public key on the SD card](#public-key-on-the-sd-card) above; no cable
+needed. Without a card, retrieve it over the device's USB serial log port
+instead:
 
 1. Connect a USB cable to the PicoCalc (the same port used to flash it, once
    it's booted normally rather than in BOOTSEL mode).

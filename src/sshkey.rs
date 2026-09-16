@@ -60,7 +60,9 @@ async fn print_public_key(key: &SigningKey) {
 async fn write_public_key_to_sd(encoded: &heapless::String<96>) {
     let mut storage = STORAGE.get().lock().await;
     let Some(mgr) = storage.vol_mgr() else {
-        print!("No SD card is present; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n");
+        print!(
+            "No SD card is present; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n"
+        );
         return;
     };
 
@@ -82,16 +84,14 @@ async fn write_public_key_to_sd(encoded: &heapless::String<96>) {
         }
     };
 
-    let mut file = match root.open_file_in_dir(
-        PUBLIC_KEY_FILE_NAME,
-        Mode::ReadWriteCreateOrTruncate,
-    ) {
-        Ok(file) => file,
-        Err(err) => {
-            print!("Failed to write {PUBLIC_KEY_FILE_NAME} to the SD card: {err:?}\r\n");
-            return;
-        }
-    };
+    let mut file =
+        match root.open_file_in_dir(PUBLIC_KEY_FILE_NAME, Mode::ReadWriteCreateOrTruncate) {
+            Ok(file) => file,
+            Err(err) => {
+                print!("Failed to write {PUBLIC_KEY_FILE_NAME} to the SD card: {err:?}\r\n");
+                return;
+            }
+        };
 
     let write_err = file
         .write(b"ssh-ed25519 ")
@@ -109,7 +109,9 @@ async fn write_public_key_to_sd(encoded: &heapless::String<96>) {
         return;
     }
 
-    print!("Mirrored the public key to {PUBLIC_KEY_FILE_NAME} in the SD card's root directory.\r\n");
+    print!(
+        "Mirrored the public key to {PUBLIC_KEY_FILE_NAME} in the SD card's root directory.\r\n"
+    );
 }
 
 /// Handles the local `keygen` shell command: generates and stores a new

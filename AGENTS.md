@@ -126,7 +126,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   way; if a boot restore is ever added it must be announced on the console and must only apply when
   no key is stored at all. The file holds the same 64-char hex the config store keeps, with its
   parser in `terminal-model/src/keyfile.rs` so the edge cases (trailing newline, wrong length,
-  non-hex) stay host-tested.
+  non-hex) stay host-tested. Separately, `print_public_key` (called from every `keygen`/`keygen
+  force`/`keygen show`) best-effort-mirrors the *public* key to `ssh_key.pub` in the same SD root
+  via the same `STORAGE` manager — always overwritten, no `force` gate, since it isn't a secret;
+  see README's "Public key on the SD card" for the user-facing behavior and test steps.
 - On a NixOS-style agent sandbox where plain `cargo`/`rustc` aren't on `PATH`, the working
   toolchain lives under `$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu/bin` (set
   `RUSTUP_HOME=/home/ai/.rustup` and prepend that dir to `PATH`); building anything host-targeted
