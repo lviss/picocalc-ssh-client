@@ -17,7 +17,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   hardware-independent logic the firmware pulls in: terminal buffer/VTE (`screen_model.rs`) and
   vector glyph-drawing (`glyphs.rs`) from `src/screen.rs`, push-to-talk key dispatch
   (`key_dispatch.rs`) from `src/keyboard.rs`, the capture/upload sample ring
-  (`audio_ring.rs`), the I2S bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`), the mic
+  (`audio_ring.rs`), the free-running capture DMA ring's wrap arithmetic (`dma_ring.rs`), the I2S
+  bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`), the mic
   runtime-settings resolution and console-validation decision table (`mic_config.rs`) and the
   runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, and the SD-card
   SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`. It depends only on
@@ -99,7 +100,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   KiB of headroom, which is the whole of its `.bss` footprint. The two chips do differ by a
   little: re-measured after this work, the source gives `_stack_start`=0x20045a88 (~278.6 KiB) on
   `pico2w` and 0x200459f8 (~278.5 KiB) on `pimoroni2w`, so always name the chip with the reading
-  (the 0x20045a88 figure above was originally recorded as pimoroni2w's).
+  (the 0x20045a88 figure above was originally recorded as pimoroni2w's). The free-running capture
+  DMA's ring (`src/mic.rs`'s `DMA_RING`, 2048 words = 8 KiB, `#[repr(align(8192))]` so the DMA's
+  write-address wrap lands on it) costs another ~14.5 KiB of that region - 8 KiB of buffer plus of
+  the order of 8 KiB of alignment padding - taking `_stack_start` to 0x20042000 (~264 KiB) on both
+  chips. That is still generous (the crashes this note exists for happened at ~45 KiB), but it is
+  the number to re-measure before growing the display buffer or any other static from here on.
 - `make image` embeds the image version (reported by `picotool info -a`, and used in the `.uf2`
   filename) from `build.rs`'s `PICOCALC_CI_TAG`, which `build.rs` computes by running `git show -s`
   itself when it runs. `build.rs` asks cargo to `rerun-if-changed=memory.x` only, so an incremental
@@ -247,27 +253,37 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   carrying real, transcribable audio. Re-derive the constant (see the doc comment on
   `LEVEL_METER_FULL_SCALE`) if the windowed-median formula in `pcm_extract.rs` ever changes.
   The meter is computed on `ptt_upload_task` from the chunks it has already drained from the
-  ring (`mic::meter_level`), NOT in `capture_task`: the PIO RX FIFO is only 4 words deep
-  (`pico-sdk` `hardware/pio.h`; ~125 us of slack at 32 k words/s), so *any* per-chunk work added
-  between DMA pulls can starve the FIFO and silence capture. That was a hardware-confirmed
-  regression - `e9eebf4` (pre-meter) captured real speech, and `f3be4d4` (which adds only the
-  level meter) is silent/crickets - so the meter was moved off the hot path. `capture_task` now
-  only publishes the capture format the upload task's meter decode needs (`PTT_METER_RAW`/
-  `PTT_METER_BITS`) and deposits samples in the ring; the meter consequently reads post-`ptt_gain`
-  samples (identical to the mic's own level at the default gain of 1). Weigh any future per-chunk
-  work in `capture_task` against that 4-word FIFO budget.
-  A REAL, STILL-OPEN ARTIFACT (found while investigating the meter): every 400-sample chunk
-  (one 25 ms DMA transfer) contains ~6 zero samples plus a 1-2 sample glitch (up to ~+/-12600
-  counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carries ~91%
-  of the chunk's AC energy. In `/ai/ptt-test-4.raw` the peak-deviation index is ~7 in the first
-  chunk, ~12 for the next few, and then ~59-60 for the rest of the capture: it steps early (a
-  ~48-sample jump from ~12 to ~59-60) and then stays put rather than drifting smoothly. It is
-  present in the captured samples, so it is a firmware/I2S-path defect that corrupts the streamed
-  audio, not just a meter problem.
-  Leading hypothesis to confirm: the per-chunk DMA transfer boundary / RX-FIFO stall between `dma_pull`
-  calls (the SM fills the 8-deep FIFO and stalls while the capture task processes the previous
-  chunk) - root cause NOT confirmed and needs hardware. Do not treat the meter's robustness as an
-  audio fix.
+  ring (`mic::meter_level`), NOT in `capture_task`. That split was originally forced by the PIO RX
+  FIFO's depth (4 words, `pico-sdk` `hardware/pio.h`): with the old one-shot capture DMA, *any*
+  per-chunk work between transfers could starve the FIFO and silence capture, which was a
+  hardware-confirmed regression - `e9eebf4` (pre-meter) captured real speech, and `f3be4d4` (which
+  adds only the level meter) is silent/crickets - so the meter was moved off the hot path.
+  `capture_task` now only publishes the capture format the upload task's meter decode needs
+  (`PTT_METER_RAW`/`PTT_METER_BITS`) and deposits samples in the ring; the meter consequently reads
+  post-`ptt_gain` samples (identical to the mic's own level at the default gain of 1).
+  THE FIFO STALL IS NOW A SOLVED DEFECT, not a budget to respect: the capture DMA copies the RX
+  FIFO into `DMA_RING` in the RP2350's endless transfer mode with the write address wrapped on the
+  ring, so it drains the FIFO in hardware and the state machine never stalls between transfers; a
+  task only has to poll that ring every 5 ms (64 ms of slack) instead of re-arming a transfer
+  within ~250 us. The per-chunk plateau-plus-glitch artifact recorded below was this same stall -
+  the FIFO filling while the next transfer was armed, stopping the bit clock - and the same stall
+  was what silenced capture for the whole utterance when an SSH session kept the CPU busy: the
+  hardware log showed the microphone's data line reading zero for ~90% of an in-session recording
+  (~99% non-zero locally) with the transfers arriving ~15 ms late. `capture_task` now owns no
+  per-chunk timing requirement at all; the remaining bound is that a poll must arrive inside the
+  ring's 64 ms, after which the DMA laps the reader and the audio overwritten is dropped with a
+  `ptt: capture ring overran, dropping some audio` line (see `DMA_OVERRUN_NOTICE_GEN`).
+  Hardware confirmation of that build on the captain's device is the gate this fix ships behind.
+  A FORMERLY OPEN ARTIFACT, NOW EXPLAINED (found while investigating the meter): every 400-sample
+  chunk (one 25 ms DMA transfer) contained ~6 zero samples plus a 1-2 sample glitch (up to
+  ~+/-12600 counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carried
+  ~91% of the chunk's AC energy. That is the RX FIFO stalling between one-shot DMA transfers - the
+  state machine stops on `in` while the FIFO is full, so the microphone's bit clock hiccups - and
+  the free-running ring DMA described above removes the stall rather than working around it. (The
+  old log of the same defect, for reference: in `/ai/ptt-test-4.raw` the peak-deviation index was
+  ~7 in the first chunk, ~12 for the next few, then ~59-60 for the rest of the capture - it steps
+  once and stays put rather than drifting smoothly.) The artifact was present in the captured
+  samples, so it corrupted streamed audio too, not just the meter.
   The earlier "the mic appears to be converting" correction was itself too generous: the
   "~-35 dBFS RMS after DC removal" figure it rested on is glitch-dominated (that chunk-wide
   statistic is ~91% the per-chunk glitch above), and re-analysis of `/ai/ptt-test-4.raw` with the
@@ -277,8 +293,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   glitch-excluded windowed level - has since been passed: the four real captures used to
   calibrate `LEVEL_METER_FULL_SCALE` above are independently verified transcribable by both
   openai-whisper and whisper.cpp, so the mic's audio path is proven to carry real speech for
-  those captures. The per-chunk capture glitch above remains a separate, still-open firmware
-  defect, unaffected by this. An
+  those captures. An
   earlier fixed 16-bit slot (a mirror of embassy's
   `PioI2sOut` DAC example's own bit depth, which targets ordinary 16-bit-slot I2S DACs, not this
   mic) clocked 512 kHz - exactly half - and produced a dead line on real hardware (`ppt-test3.raw`:
@@ -293,7 +308,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   at the default 16 kHz rate (a non-default `ptt_rate` rescales chunk and ring duration, not
   their sample counts), staged between the capture and upload tasks in a fixed 2048-sample
   (`i16`) static ring buffer in `.bss` (`terminal_model::audio_ring::AudioRing`), not on the
-  heap, so it does not compete with the `DualHeap` budget and cannot exhaust it. The ring never
+  heap, so it does not compete with the `DualHeap` budget and cannot exhaust it; upstream of that,
+  the DMA writes into `src/mic.rs`'s own `DMA_RING` and the capture task copies out of it, so
+  neither buffer's consumer can hold up the I2S clock. The ring never
   blocks and never grows; when it is full the oldest samples are dropped, logging a single
   `ptt: ...` line per recording, so a slow/unreachable `ptt_host` (connect is bounded by a 5s
   timeout in `mic.rs`) degrades to bounded audio loss rather than a stalled I2S clock or a

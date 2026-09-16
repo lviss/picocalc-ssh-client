@@ -13,6 +13,18 @@
 //! the firmware heap. This holds regardless of whether a PSRAM heap tier is
 //! present or working.
 //!
+//! The DMA side is decoupled from CPU timing the same way: the channel copies
+//! the PIO RX FIFO into its own circular buffer ([`DMA_RING`]) in the RP2350's
+//! endless transfer mode with the write address wrapped on the ring, and
+//! [`capture_task`] only drains that buffer every `DMA_POLL_INTERVAL`. Nothing
+//! about the microphone's bit clock depends on how quickly the CPU gets back to
+//! it - with a one-shot transfer per chunk, the eight-word FIFO filled while
+//! the next transfer was armed, the state machine stalled on `in`, and the
+//! clock stopped for as long as the CPU was late (which is what silenced
+//! captures under an SSH session's load, and what the old per-chunk
+//! plateau-and-glitch artifact was). Being late now only costs whatever audio
+//! the ring had to overwrite.
+//!
 //! The I2S slot width, sample rate, bit-clock edge polarity, raw-passthrough
 //! mode and diagnostic capture gain are runtime settings read from the
 //! persisted config store (`ptt_bits`/`ptt_rate`/`ptt_edge`/`ptt_raw`/
@@ -36,6 +48,7 @@ use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
@@ -44,6 +57,8 @@ use embassy_net::dns::{DnsQueryType, DnsSocket};
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::PeripheralRef;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel as _;
+use embassy_rp::pac::dma::vals::{DataSize, TransCountMode, TreqSel};
 use embassy_rp::peripherals::{DMA_CH4, PIN_2, PIN_3, PIN_21, PIO2};
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, ShiftConfig, ShiftDirection,
@@ -51,7 +66,7 @@ use embassy_rp::pio::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, with_timeout};
 use embedded_io_async::Write as _;
 use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
@@ -65,7 +80,7 @@ use terminal_model::pcm_extract::{
     ac_rms_level, ac_rms_level_word_pairs, bit_clock_hz, extract_left_channel_pcm,
     remove_dc_and_gain_samples, remove_dc_and_gain_words,
 };
-use terminal_model::ptt_frame;
+use terminal_model::{dma_ring, ptt_frame};
 
 extern crate alloc;
 
@@ -98,6 +113,26 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// running, "recording..." overlay stuck) to a minute, far longer than any
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
+
+/// Words in the capture DMA's circular buffer: the DMA writes the PIO RX FIFO
+/// into it in hardware (endless transfer mode, write address wrapped on the
+/// ring) so the FIFO is drained with no CPU in the loop. Must be a power of two
+/// (the DMA wraps the address on a `1 << DMA_RING_BITS` byte boundary) and even
+/// (one L+R frame is two words, so an odd size would flip the left/right parity
+/// across a wrap). 2048 words is 1024 frames, i.e. 64 ms of mono audio at
+/// 32-bit slots - the slack the consumer gets before the DMA laps it.
+const DMA_RING_WORDS: usize = 2048;
+/// `log2` of the ring's size in bytes, which is what the DMA's RING_SIZE field
+/// wants (`DMA_RING_WORDS * 4 == 1 << DMA_RING_BITS`).
+const DMA_RING_BITS: u8 = 13;
+/// Words left unread behind the DMA's write head, so a read can never race the
+/// word being written right now. Even, which is what keeps a drained run whole
+/// L+R frames.
+const DMA_RING_MARGIN: usize = 2;
+/// How often the consumer drains the DMA ring while a recording runs: often
+/// enough to keep the ring nearly empty (it holds 64 ms), cheap enough to cost
+/// nothing next to the audio it moves.
+const DMA_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// A stored `ptt_*` key the final store state still does not resolve to its
 /// effective value, with the value the store holds.
@@ -317,6 +352,12 @@ static OVERFLOW_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 /// Generation that hit `MAX_RECORDING_DURATION` and has not yet been reported,
 /// set for the same reason as `OVERFLOW_NOTICE_GEN`.
 static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
+/// Generation whose capture first outran the DMA ring (the consumer was late by
+/// more than the whole ring, so the DMA overwrote unread audio) and has not yet
+/// been reported, or 0. Recorded rather than printed for the same reason as
+/// `OVERFLOW_NOTICE_GEN`: printing here would take the screen lock on the
+/// capture path.
+static DMA_OVERRUN_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 
 /// Latest drained chunk's AC RMS level (in `i16` counts), for the on-screen
 /// level meter. Updated by `ptt_upload_task` from the samples it has just
@@ -433,17 +474,87 @@ struct Mic {
     loaded: Option<LoadedProgram<'static, PIO2>>,
 }
 
+/// The capture DMA's circular buffer, written by the DMA in hardware and read
+/// (volatile) by `capture_task`. Power-of-two sized and naturally aligned, so
+/// the DMA's write-address wrap covers exactly the buffer once per lap.
+#[repr(align(8192))]
+struct DmaRingStorage(UnsafeCell<[u32; DMA_RING_WORDS]>);
+
+// SAFETY: the only writer is the DMA channel, which runs only between
+// `start_capture_dma` and `stop_capture_dma` inside one recording; the CPU reads
+// the buffer through volatile loads and never keeps a reference across an
+// await.
+unsafe impl Sync for DmaRingStorage {}
+
+static DMA_RING: DmaRingStorage = DmaRingStorage(UnsafeCell::new([0; DMA_RING_WORDS]));
+
+/// Address of the DMA ring's first word.
+fn dma_ring_base() -> *mut u32 {
+    DMA_RING.0.get() as *mut u32
+}
+
+/// The DMA's live write position, in words into [`DMA_RING`].
+fn dma_write_index(channel: usize) -> usize {
+    let address = embassy_rp::pac::DMA.ch(channel).write_addr().read() as usize;
+    address.wrapping_sub(dma_ring_base() as usize) / 4 % DMA_RING_WORDS
+}
+
 impl Mic {
     fn set_enabled(&mut self, enabled: bool) {
         self.pio.sm0.set_enable(enabled);
     }
 
-    async fn capture(&mut self, buf: &mut [u32]) {
-        self.pio
-            .sm0
-            .rx()
-            .dma_pull(self.dma_ch.reborrow(), buf, false)
-            .await;
+    /// Starts the free-running capture DMA: this channel copies PIO SM0's RX
+    /// FIFO into [`DMA_RING`] until it is aborted, wrapping the write address on
+    /// the ring (endless transfer mode). With a one-shot transfer per chunk
+    /// instead, the eight-word FIFO fills while the next transfer is armed, the
+    /// state machine stalls on `in`, and the microphone's bit clock stops for as
+    /// long as the CPU was late - which is what silences a capture (and what the
+    /// old per-chunk plateau/glitch artifact was). Here the FIFO is drained in
+    /// hardware and the CPU only has to keep up with the buffer, not with the
+    /// clock.
+    ///
+    /// Returns the DMA channel number, which the consumer needs to read the
+    /// live write position back.
+    fn start_capture_dma(&mut self) -> usize {
+        let channel = self.dma_ch.number() as usize;
+        let ch = embassy_rp::pac::DMA.ch(channel);
+        ch.read_addr()
+            .write_value(embassy_rp::pac::PIO2.rxf(0).as_ptr() as u32);
+        ch.write_addr().write_value(dma_ring_base() as u32);
+        ch.trans_count().write(|w| {
+            w.set_count(DMA_RING_WORDS as u32);
+            // Endless: the count never decrements, so the channel runs until it
+            // is aborted, raising no interrupts and triggering no other channel.
+            w.set_mode(TransCountMode::ENDLESS);
+        });
+        ch.ctrl_trig().write(|w| {
+            w.set_treq_sel(TreqSel::PIO2_RX0);
+            w.set_data_size(DataSize::SIZE_WORD);
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            // Wrap the write address inside the ring rather than the read one.
+            w.set_ring_sel(true);
+            w.set_ring_size(DMA_RING_BITS);
+            // Chaining to itself is how the field disables chaining.
+            w.set_chain_to(channel as u8);
+            w.set_en(true);
+        });
+        channel
+    }
+
+    /// Aborts the free-running capture DMA, leaving the state machine and its
+    /// pins to `apply`/`set_enabled`.
+    fn stop_capture_dma(&mut self) {
+        let channel = self.dma_ch.number() as usize;
+        let ch = embassy_rp::pac::DMA.ch(channel);
+        embassy_rp::pac::DMA
+            .chan_abort()
+            .write(|w| w.set_chan_abort(1 << channel));
+        while ch.ctrl_trig().read().busy() {}
+        // A full write (not `modify`) so the read-only status bits cannot be
+        // written back, and without `en` so nothing is retriggered.
+        ch.ctrl_trig().write(|w| w.set_en(false));
     }
 
     /// (Re)configures the PIO program and clock for `settings`, freeing the
@@ -531,6 +642,9 @@ pub fn init_mic(
 
 #[embassy_executor::task]
 async fn capture_task(mut mic: Mic) {
+    // One wire chunk's worth of raw RX-FIFO words: one word per channel slot,
+    // two slots per L+R frame (see `SAMPLES_PER_CHUNK`).
+    let mut chunk = [0u32; SAMPLES_PER_CHUNK * 2];
     loop {
         START_SIGNAL.wait().await;
         let generation = CURRENT_GEN.load(Ordering::Acquire);
@@ -540,59 +654,106 @@ async fn capture_task(mut mic: Mic) {
         let settings = load_settings().await;
         // Record the format the upload task's level meter must decode for this
         // utterance. Two relaxed stores, no computation: the meter itself runs
-        // on the upload task so nothing heavy sits between DMA pulls.
+        // on the upload task, off this path.
         PTT_METER_RAW.store(settings.raw, Ordering::Relaxed);
         PTT_METER_BITS.store(settings.bits, Ordering::Relaxed);
         mic.apply(settings);
         mic.set_enabled(true);
+        let channel = mic.start_capture_dma();
+
         let started = Instant::now();
+        let mut read_index = 0usize;
+        let mut filled = 0usize;
+        let mut last_poll = Instant::now();
+        let mut ticker = Ticker::every(DMA_POLL_INTERVAL);
+        // The DMA writes two words per sample (one per channel slot), which is
+        // what tells a *late* poll (see the overrun check below) apart from a
+        // quick one: the ring holds `DMA_RING_WORDS / words_per_ms` milliseconds
+        // of audio.
+        let words_per_ms = ((settings.rate as usize) * 2 / 1000).max(1);
         // Ends when the button is released, when a newer recording supersedes
         // this one, or on the recording-duration cap below.
         while RECORDING.load(Ordering::Acquire) == generation
             && CURRENT_GEN.load(Ordering::Acquire) == generation
         {
+            let write_index = dma_write_index(channel);
+            // A poll that arrives more than a full ring late cannot tell how far
+            // the DMA wrapped, so resynchronise at the write head, drop the
+            // audio that was overwritten, and report it once for this recording.
+            if (Instant::now() - last_poll).as_millis() as usize * words_per_ms > DMA_RING_WORDS {
+                DMA_OVERRUN_NOTICE_GEN.store(generation, Ordering::Release);
+                // Even index on purpose: the DMA starts this recording at ring
+                // index 0 with a left-slot word, so even positions stay the
+                // driven (left) slot and the extraction's pairing holds.
+                read_index = (write_index + DMA_RING_WORDS - DMA_RING_MARGIN) % DMA_RING_WORDS & !1;
+                filled = 0;
+            }
+            last_poll = Instant::now();
+
             // One FIFO word is one channel slot (see `MicSettings::bits`), not
-            // a combined L+R pair: the PIO program pushes left, then right,
-            // alternating, so a chunk's worth of *mono* samples needs twice as
-            // many raw words.
-            let mut raw = [0u32; SAMPLES_PER_CHUNK * 2];
-            mic.capture(&mut raw).await;
-            if CURRENT_GEN.load(Ordering::Acquire) != generation {
-                continue;
+            // a combined L+R pair, and one wire chunk is
+            // `SAMPLES_PER_CHUNK` *frames*: two words each. Take whole frames
+            // only, so the left/right parity of the run never shifts, and leave
+            // the margin behind the write head untouched.
+            let available = dma_ring::available_words(write_index, read_index, DMA_RING_WORDS);
+            let take = available
+                .saturating_sub(DMA_RING_MARGIN)
+                .min(SAMPLES_PER_CHUNK * 2 - filled)
+                & !1;
+            if take > 0 {
+                let mut copied = 0usize;
+                for (start, len) in dma_ring::segments(read_index, take, DMA_RING_WORDS) {
+                    for offset in 0..len {
+                        // SAFETY: `start + offset` is inside the ring (see
+                        // `dma_ring::segments`'s bounds test) and the DMA owns
+                        // only the region at and beyond the write head.
+                        chunk[filled + copied + offset] = unsafe {
+                            core::ptr::read_volatile(dma_ring_base().add(start + offset))
+                        };
+                    }
+                    copied += len;
+                }
+                read_index = (read_index + take) % DMA_RING_WORDS;
+                filled += take;
             }
 
-            // Never blocks and never allocates: if the network side is
-            // behind, the ring drops its oldest samples instead of stalling
-            // the DMA pull that keeps the I2S clocks running.
-            let result = if settings.raw {
-                // `ptt_raw`: bypass extraction and hand the ring the raw FIFO
-                // words as little-endian i16 halves, so re-serializing them
-                // reproduces the exact unprocessed I2S word stream. The gain
-                // knob removes the driven slot's DC offset before amplifying,
-                // so it reveals signal rather than railing on the offset.
-                remove_dc_and_gain_words(&mut raw, settings.bits, settings.gain);
-                PCM_RING.lock().await.write_u32_words(generation, &raw)
-            } else {
-                // Keep only the even-indexed (left-slot) words and drop the
-                // odd-indexed (right-slot) ones the mic never drives, matching
-                // this driver's left-slot pin/wiring contract in AGENTS.md
-                // (swap to odd-indexed words if a captain instead wires the mic
-                // to the right slot). ShiftDirection::Left means MSB-first, and
-                // `extract_left_channel_pcm` reduces each word to its
-                // slot-width-aware 16-bit sample (see its doc for the exact
-                // shift).
-                let mut pcm = [0i16; SAMPLES_PER_CHUNK];
-                extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
-                // `ptt_gain`: the captain's capture-time gain experiment,
-                // applied after DC removal so a useful gain reveals the AC
-                // signal instead of immediately railing on the offset.
-                remove_dc_and_gain_samples(&mut pcm, settings.gain);
-                PCM_RING.lock().await.write(generation, &pcm)
-            };
-            if result.first_drop {
-                OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
+            if filled == chunk.len() {
+                // Never blocks and never allocates: if the network side is
+                // behind, the audio ring drops its oldest samples instead of
+                // stalling this task, which is what keeps the DMA (and with it
+                // the I2S clocks) running.
+                let result = if settings.raw {
+                    // `ptt_raw`: bypass extraction and hand the ring the raw
+                    // FIFO words as little-endian i16 halves, so re-serializing
+                    // them reproduces the exact unprocessed I2S word stream. The
+                    // gain knob removes the driven slot's DC offset before
+                    // amplifying, so it reveals signal rather than railing on
+                    // the offset.
+                    remove_dc_and_gain_words(&mut chunk, settings.bits, settings.gain);
+                    PCM_RING.lock().await.write_u32_words(generation, &chunk)
+                } else {
+                    // Keep only the even-indexed (left-slot) words and drop the
+                    // odd-indexed (right-slot) ones the mic never drives,
+                    // matching this driver's left-slot pin/wiring contract in
+                    // AGENTS.md (swap to odd-indexed words if a captain instead
+                    // wires the mic to the right slot). ShiftDirection::Left
+                    // means MSB-first, and `extract_left_channel_pcm` reduces
+                    // each word to its slot-width-aware 16-bit sample (see its
+                    // doc for the exact shift).
+                    let mut pcm = [0i16; SAMPLES_PER_CHUNK];
+                    extract_left_channel_pcm(&chunk, &mut pcm, settings.bits);
+                    // `ptt_gain`: the captain's capture-time gain experiment,
+                    // applied after DC removal so a useful gain reveals the AC
+                    // signal instead of immediately railing on the offset.
+                    remove_dc_and_gain_samples(&mut pcm, settings.gain);
+                    PCM_RING.lock().await.write(generation, &pcm)
+                };
+                if result.first_drop {
+                    OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
+                }
+                DATA_READY.signal(());
+                filled = 0;
             }
-            DATA_READY.signal(());
 
             if started.elapsed() >= MAX_RECORDING_DURATION {
                 CAP_NOTICE_GEN.store(generation, Ordering::Release);
@@ -600,8 +761,10 @@ async fn capture_task(mut mic: Mic) {
                     RECORDING.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 break;
             }
+            ticker.next().await;
         }
         mic.set_enabled(false);
+        mic.stop_capture_dma();
         PTT_LEVEL.store(0, Ordering::Release);
         ENDED_GEN.fetch_max(generation, Ordering::AcqRel);
         STREAM_ENDED.signal(());
@@ -639,6 +802,9 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
 async fn emit_pending_notices() {
     if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
         print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+    }
+    if DMA_OVERRUN_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
+        print!("ptt: capture ring overran, dropping some audio\r\n");
     }
     let capped_generation = CAP_NOTICE_GEN.swap(0, Ordering::AcqRel);
     if capped_generation != 0 {
