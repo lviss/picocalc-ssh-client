@@ -273,7 +273,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   per-chunk timing requirement at all; the remaining bound is that a poll must arrive inside the
   ring's 64 ms, after which the DMA laps the reader and the audio overwritten is dropped with a
   `ptt: capture ring overran, dropping some audio` line (see `DMA_OVERRUN_NOTICE_GEN`).
-  Hardware confirmation of that build on the captain's device is the gate this fix ships behind.
+  Confirmed on the captain's hardware: with the ring DMA an SSH-session recording moves the level
+  meter and whisper transcribes it correctly into the tmux session, where the same build with the
+  one-shot transfer was silent.
   A FORMERLY OPEN ARTIFACT, NOW EXPLAINED (found while investigating the meter): every 400-sample
   chunk (one 25 ms DMA transfer) contained ~6 zero samples plus a 1-2 sample glitch (up to
   ~+/-12600 counts) at a stepping offset, with >50% of the chunk a flat plateau; the glitch carried
