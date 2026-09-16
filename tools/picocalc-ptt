@@ -57,8 +57,13 @@ and ``whisper --output_dir %dir`` write. Both the standard output and the
 standard error of the whisper command are captured, so a progress bar can
 never flood the SSH channel back to the device.
 
-Requirements: Python 3.8+, a whisper command, and tmux. Nothing else: only the
-standard library is used, so there is nothing to install with pip.
+Requirements: Python 3.8+, whisper and tmux on the server, and nothing else -
+only the standard library is used, so there is nothing to install with pip. A
+default setup needs no configuration at all: with no ``whisper`` configured the
+helper runs ``whisper-cli`` with the first model it finds (see
+``MODEL_CANDIDATES``, or point ``$PICOCALC_PTT_MODEL`` at yours), or falls back
+to ``openai-whisper``, which downloads the ``base`` model itself. The config
+file below is purely for overrides.
 """
 
 from __future__ import annotations
@@ -86,6 +91,58 @@ DEFAULT_TIMEOUT = 120.0
 #: anything beyond this is a protocol error, and refusing it keeps a broken or
 #: hostile stream from growing this process without bound.
 MAX_UTTERANCE_SECONDS = 90.0
+#: Model paths a `whisper-cli` (whisper.cpp) setup conventionally uses. With no
+#: `whisper` configured, the helper takes the first of these that exists, so a
+#: default install needs no configuration.
+MODEL_CANDIDATES = (
+    "~/models/ggml-base.en.bin",
+    "~/models/ggml-base.bin",
+    "~/.cache/whisper/ggml-base.en.bin",
+    "~/.cache/whisper/ggml-base.bin",
+    "~/.local/share/whisper/ggml-base.en.bin",
+    "/usr/share/whisper/ggml-base.en.bin",
+    "/usr/local/share/whisper/ggml-base.en.bin",
+)
+#: Glob tried after the exact candidates, so a differently-named download in
+#: the usual models directory still works.
+MODEL_GLOBS = ("~/models/ggml-*.bin",)
+#: Environment variable naming the model explicitly, overriding discovery.
+MODEL_ENV = "PICOCALC_PTT_MODEL"
+
+
+def find_model() -> str | None:
+    """The whisper.cpp model to use when none is configured: the explicit
+    ``$PICOCALC_PTT_MODEL``, else the first conventional path that exists, else
+    the first ``ggml-*.bin`` in the usual models directory."""
+    explicit = os.environ.get(MODEL_ENV)
+    if explicit:
+        return explicit
+    for candidate in MODEL_CANDIDATES:
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return str(path)
+    for pattern in MODEL_GLOBS:
+        expanded = Path(os.path.expanduser(pattern))
+        found = sorted(expanded.parent.glob(expanded.name))
+        if found:
+            return str(found[0])
+    return None
+
+
+def default_whisper_command() -> str | None:
+    """The whisper command to run when the user configured none, or ``None``
+    when this server has no whisper the helper knows how to drive.
+
+    `whisper-cli` (whisper.cpp) needs a model path, so it is only used when one
+    is found; `openai-whisper`'s ``--model base`` downloads its own model on
+    first use, so it needs nothing.
+    """
+    model = find_model()
+    if model and shutil.which("whisper-cli"):
+        return f"whisper-cli -m {shlex.quote(model)} -f %wav -nt -np"
+    if shutil.which("whisper"):
+        return "whisper %wav --model base --output_format txt --output_dir %dir"
+    return None
 
 DEFAULTS = {
     "whisper": None,
@@ -125,9 +182,16 @@ class Config:
         if self.rate <= 0:
             raise ValueError("rate must be positive")
         if self.whisper is None:
+            # Nothing configured: drive whatever whisper this server has, so a
+            # default setup (whisper-cli + a model, or openai-whisper) needs no
+            # configuration at all.
+            self.whisper = default_whisper_command()
+        if self.whisper is None:
             raise ValueError(
-                "no whisper command configured: set `whisper = ...` in "
-                f"~/.config/{PROGRAM}.conf, $PICOCALC_PTT_WHISPER, or --whisper"
+                "no whisper command found: install whisper-cli with a model "
+                f"(set ${MODEL_ENV} or put one in ~/models), or openai-whisper; "
+                f"or set `whisper = ...` in ~/.config/{PROGRAM}.conf "
+                "($PICOCALC_PTT_WHISPER, or --whisper)"
             )
 
     def log(self, message: str) -> None:
@@ -486,7 +550,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--whisper",
         metavar="COMMAND",
         help="shell command that transcribes %%wav (see the epilog); "
-        "defaults to $PICOCALC_PTT_WHISPER or the config file",
+        "defaults to $PICOCALC_PTT_WHISPER, the config file, or - with none of "
+        "those - whisper-cli with a discovered model (or openai-whisper)",
     )
     parser.add_argument(
         "--tmux-target",

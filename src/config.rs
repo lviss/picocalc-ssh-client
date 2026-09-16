@@ -204,7 +204,7 @@ pub async fn config_command(args: &[&str]) {
             // stored value disables the transport; report that resolved state.
             if *key == crate::net::PTT_SSH_CMD_KEY {
                 match crate::net::effective_ssh_audio_command().await {
-                    Some(command) => print!("{command}\r\n"),
+                    Some(command) => print!("{}\r\n", command.describe()),
                     None => print!("(disabled)\r\n"),
                 }
                 return;

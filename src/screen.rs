@@ -43,6 +43,8 @@ pub static SCREEN: LazyLock<AsyncMutex<CriticalSectionRawMutex, Screen>> =
 
 /// How long the battery overlay stays on screen before it auto-dismisses.
 const OVERLAY_DURATION: Duration = Duration::from_secs(3);
+/// How long a transient notice (e.g. "no SSH session") stays on screen.
+const NOTICE_DURATION: Duration = Duration::from_secs(2);
 
 pub struct Screen {
     model: ScreenModel,
@@ -92,6 +94,17 @@ impl Screen {
             text,
             Instant::now().as_millis(),
             OVERLAY_DURATION.as_millis(),
+        );
+    }
+
+    /// Show `text` as a transient notice that clears itself after
+    /// `NOTICE_DURATION`, for a button press that had nothing to do (e.g.
+    /// push-to-talk with no SSH session up).
+    pub fn show_notice(&mut self, text: String) {
+        self.model.show_timed_overlay(
+            text,
+            Instant::now().as_millis(),
+            NOTICE_DURATION.as_millis(),
         );
     }
 

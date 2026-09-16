@@ -196,9 +196,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   exactly). The PIO program and its clock are now **runtime settings**, resolved from the config
   store at the start of every recording and applied on the device (no reflash or reboot):
   `ptt_bits` (channel slot width, default 32), `ptt_rate` (sample rate Hz, default 16000),
-  `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment), `ptt_raw` (0 = extracted
-  mono PCM, 1 = stream the FIFO words; the driven slots are DC-removed and gained first when
-  `ptt_gain` > 1), `ptt_gain` (1-4096, default 1 = off; see below). A `ptt_bits`/`ptt_rate` pair
+  `ptt_edge` (0 = default BCLK edge, 1 = the inverted-edge experiment; the one remaining knob a
+  regular user would never touch). A `ptt_bits`/`ptt_rate` pair
   whose `rate * bits * 2` falls outside the mic's documented 1.024-4.096 MHz window is refused at
   the console and, if a stored value is somehow invalid, falls back to the default pair with a log.
   That decision table (`resolve`/`reconcile`/`validate_setting`, host-tested) lives in
@@ -223,23 +222,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   even-indexed/left-slot
   words, and `extract_left_channel_pcm` reduces each to its slot-width-aware 16-bit sample (see that
   function's doc for the exact shift, including the left-justified sub-16-bit case).
-  `ptt_gain` is a diagnostic for the captain's "this mic reads very quietly" question: when >1,
-  `remove_dc_and_gain_words`/`remove_dc_and_gain_samples` (host-tested in `pcm_extract.rs`)
-  subtract each capture chunk's DC mean *first* and then amplify the deviation with saturating
-  arithmetic, in both paths. The raw-word path is slot-width aware: it sign-extends the configured
-  `bits`-wide field (its sign is at `bits - 1`, not 31) and clamps back into that field, so a
-  narrow `ptt_raw` slot cannot turn a negative sample into a large positive one. DC removal is
-  essential because the SPH0645 sits on a large offset
-  (~-6113 in its 18-bit field on this hardware); multiplying the raw value directly would rail at
-  any useful gain. `ptt_gain=1` is a byte-identical no-op. This knob is explicitly DIAGNOSTIC, not
-  the production gain path: the SPH0645 is a fixed-sensitivity digital mic with no gain register
-  (SEL only selects the L/R slot), so any real gain/normalization belongs on the receiving /
-  transcription side, where the audio is consumed - the device ships its native levels. The
-  overlay also carries a realtime level meter while recording: `ac_rms_level`/
-  `ac_rms_level_words` (host-tested in `pcm_extract.rs`) publish a windowed median of per-window
-  AC RMS (8 windows, each window's own DC removed) through `mic::level()`, both reading the
-  configured slot width's sample field (the same bits `extract_left_channel_pcm` puts on the
-  wire), so a narrow raw slot cannot meter zero while carrying signal. `src/screen.rs`'s
+  overlay also carries a realtime level meter while recording: `ac_rms_level`
+  (host-tested in `pcm_extract.rs`) publishes a windowed median of per-window AC RMS (8 windows,
+  each window's own DC removed) through `mic::level()`, reading the same bits
+  `extract_left_channel_pcm` puts on the wire. `src/screen.rs`'s
   `draw_overlay` draws it as a bar when `mic::is_recording()` (empty at the noise floor, red when
   pinned). The windowed median is deliberate: a plain DC-removed AC RMS let the known per-chunk
   capture artifact below dominate the bar and swing it full/empty at idle. `src/screen.rs`'s
@@ -258,9 +244,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   per-chunk work between transfers could starve the FIFO and silence capture, which was a
   hardware-confirmed regression - `e9eebf4` (pre-meter) captured real speech, and `f3be4d4` (which
   adds only the level meter) is silent/crickets - so the meter was moved off the hot path.
-  `capture_task` now only publishes the capture format the upload task's meter decode needs
-  (`PTT_METER_RAW`/`PTT_METER_BITS`) and deposits samples in the ring; the meter consequently reads
-  post-`ptt_gain` samples (identical to the mic's own level at the default gain of 1).
+  `capture_task` now only deposits samples in the ring; the meter is computed from them by the
+  upload task, off the capture path.
   THE FIFO STALL IS NOW A SOLVED DEFECT, not a budget to respect: the capture DMA copies the RX
   FIFO into `DMA_RING` in the RP2350's endless transfer mode with the write address wrapped on the
   ring, so it drains the FIFO in hardware and the state machine never stalls between transfers; a
@@ -314,16 +299,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   the DMA writes into `src/mic.rs`'s own `DMA_RING` and the capture task copies out of it, so
   neither buffer's consumer can hold up the I2S clock. The ring never
   blocks and never grows; when it is full the oldest samples are dropped, logging a single
-  `ptt: ...` line per recording, so a slow/unreachable `ptt_host` (connect is bounded by a 5s
-  timeout in `mic.rs`) degrades to bounded audio loss rather than a stalled I2S clock or a
-  heap-exhaustion abort, independent of whether a
-  PSRAM heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
+  `ptt: ...` line per recording, so a congested or stalled SSH session degrades to bounded audio
+  loss rather than a stalled I2S clock or a heap-exhaustion abort, independent of whether a PSRAM
+  heap tier is present. The ring is guarded by an `embassy_sync` mutex, deliberately not a
   lock-free structure, per `heap.rs`'s CAS-vs-PSRAM `FIXME`. Each sample is tagged with the
   utterance generation that produced it (`CURRENT_GEN`/`ENDED_GEN` atomic counters in `mic.rs`,
   with the pure `utterance_ended` predicate in `audio_ring.rs`), so a recording that starts while
-  a previous one's connect is still in flight shares the ring without its audio being sent over
-  the older connection or its own end being consumed as the older one's; the single upload task
-  serves generations in order and every connection closes when its own generation ends. Button binding is
+  a previous one is still being uploaded shares the ring without its audio being sent as the older
+  utterance's or its own end being consumed by it; the single upload task serves generations in
+  order. Button binding is
   plain `Key::F1`. Arming and stopping are independently gated: arming requires `KeyState::Pressed`
   with `Modifiers::NONE` (so Ctrl+F1 still reaches the existing reboot shortcut), while stopping
   fires on `KeyState::Released` whenever `mic::is_recording()` (reusing `mic.rs`'s `RECORDING`
@@ -339,31 +323,27 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   and `ButtonLeft2` belongs to a `Joy*`/`Button*` group of raw keyboard-protocol codes
   (`src/keyboard.rs`'s `Key` enum and its `From<u8>` impl) that looks like it comes from a
   joystick/gamepad-bearing variant of this same keyboard co-processor protocol, not this device -
-  treat that whole code group as suspect for any future key binding on this hardware. Destination
-  is `config set ptt_host`/`config set ptt_port` (plain `sequential_storage` keys, no
-  special-casing needed in `config.rs`), *or* the SSH session's audio channel when one is up - see
-  the push-to-talk-over-SSH entry below for that transport and how the two are chosen.
-  Wire format for the TCP sink (needed by anything implementing the receiving side): one TCP
-  connection per utterance, opened on button press and closed on release;
-  each frame is a 4-byte little-endian `u32` byte count followed by that many bytes of raw signed
-  16-bit little-endian mono PCM at the configured `ptt_rate` (default 16 kHz; the rate is not
-  signaled on the wire, so the receiver must be told it out of band). With `ptt_raw=1` the payload
-  is instead the little-endian `u32` PIO FIFO words, one per channel slot (byte-for-byte
-  unprocessed at the default `ptt_gain=1`; at a higher gain the driven slots are DC-removed and
-  scaled first - see the `ptt_gain` note above); a receiver should concatenate frame payloads
-  before parsing words (frame boundaries are upload-side, not word-aligned). No handshake, no
-  other framing. Both sinks frame identically through `terminal_model/src/ptt_frame.rs` (host-
-  tested); they differ only in what ends an utterance - the TCP sink closes its connection, the
-  SSH channel stays open and gets a zero-length frame instead.
-- Push-to-talk can also ride the *existing* SSH session (`src/net.rs`'s `ssh_audio_branch`,
-  `ssh_audio_send`, `pump_audio`), which is the preferred transport whenever a session is up:
-  `mic.rs`'s `serve_utterance` asks `net::ssh_audio_available()` once per utterance and only falls
-  back to the `ptt_host`/`ptt_port` TCP sink when it is false. The audio goes over a **second SSH
+  treat that whole code group as suspect for any future key binding on this hardware. That is the
+  whole destination story now: the SSH session's audio channel and nothing else. `mic.rs`'s
+  `start_recording` asks `net::ssh_audio_available()` when the button is pressed and, when it is
+  false (no session, or `ptt_ssh_cmd` set empty), shows `no ssh session: not recording` through
+  `Screen::show_notice` and starts no capture, no PIO clock and no ring traffic. There used to be
+  a raw-TCP sink (`ptt_host`/`ptt_port`, one connection per utterance) from the capture-only
+  stage; it was removed on the captain's call as a stepping stone nobody would use.
+- Push-to-talk rides the *existing* SSH session (`src/net.rs`'s `ssh_audio_branch`,
+  `ssh_audio_send`, `pump_audio`). The audio goes over a **second SSH
   channel of the same connection** - no new connection, no listening port anywhere, no extra
-  credential - which `exec`s the server-side helper (`config set ptt_ssh_cmd`, default
-  `picocalc-ptt`; an empty value disables the transport). The helper lives in this repo at
+  credential - which `exec`s the server-side helper. The helper lives in this repo at
   `tools/picocalc-ptt` (Python 3 stdlib only, tests in `tools/test_picocalc_ptt.py`, run with
-  `python3 tools/test_picocalc_ptt.py`; nothing else in the repo is Python). Its protocol is
+  `python3 tools/test_picocalc_ptt.py`; nothing else in the repo is Python) and is **embedded in
+  the firmware** (`include_bytes!`, `src/net.rs`'s `PTT_HELPER_SCRIPT`), so the server needs only
+  `python3` and whisper: at session start the device streams the script down the audio channel
+  (`AudioCommand::Embedded`, ~21 KB in 1 KB writes) and the exec'd command
+  (`terminal_model::ptt_frame::helper_exec_command`, host-tested) copies exactly that many bytes
+  into `$TMPDIR/picocalc-ptt.<pid>` with `dd bs=1` and execs python on it, which leaves the
+  channel on python's stdin for the frames that follow - `dd`'s byte-at-a-time reads are what keep
+  the script/audio boundary exact. A user-supplied `config set ptt_ssh_cmd <command>` still runs
+  instead (nothing is streamed then), and an empty value disables the transport. Its protocol is
   documented in that file's docstring and in `terminal_model/src/ptt_frame.rs`; one helper process
   runs per SSH session and transcribes each utterance on the device's zero-length end marker,
   typing the text into tmux (`tmux send-keys -l`). The tmux hand-off is the one part of the chain
@@ -380,10 +360,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `tmux display-message -p '#{socket_path}'` hint whenever a tmux call fails. `tools/test_picocalc_ptt.py`
   covers all three paths, and its `FakeCommands` scrubs the tmux environment so the machine running
   the tests cannot influence them. The device-side half of setting this up has its own sharp edges
-  worth telling anyone who documents it: `config get ptt_ssh_cmd` is the authoritative readout
-  (`src/config.rs` special-cases it to print the effective command, or `(disabled)` for an empty
-  stored value), while `config list` only dumps the stored 32-entry map and never resolves this key,
-  so it does not appear there at all at its default; the command is read **once per SSH session**
+  (`config get ptt_ssh_cmd` is the authoritative readout
+  (`src/config.rs` special-cases it to print the effective command, `(built-in helper)` when
+  nothing is configured, or `(disabled)` for an empty stored value), while `config list` only dumps
+  the stored 32-entry map and never resolves this key, so it does not appear there at all at its
+  default; the command is read **once per SSH session**
   (`effective_ssh_audio_command` at session start), so a change needs a reconnect; `src/process.rs`
   splits the console line on single spaces with no quote handling, so the value is set unquoted
   (`config set ptt_ssh_cmd TMUX_TMPDIR=/run/user/1003 picocalc-ptt`) and quote characters would be
@@ -397,8 +378,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   no channel number, so with two session channels an exit event cannot be attributed - the ticker
   therefore only ends the session on it when `ssh_audio_available()` is false, and otherwise relies
   on the interactive channel's own EOF (`ssh_channel_task`), which is what makes a missing or
-  crashing helper print a message and fall back to TCP instead of tearing the user's terminal
-  down. `ssh_audio_branch` is an arm of the session's `select` and must never return while the
+  crashing helper print a message and leave the rest of that utterance unsent instead of tearing
+  the user's terminal down. `ssh_audio_branch` is an arm of the session's `select` and must never return while the
   session lives: when the audio channel dies it drains `AUDIO_QUEUE` forever instead. (3)
   `PTY_READY`, `AUDIO_EXEC_SENT`, and `AUDIO_QUEUE` are module-level statics shared across every
   `ssh_session_task` invocation, and `embassy_sync::Signal` keeps a signaled value queued until
@@ -410,7 +391,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   audio can never be written before the process exists) and is cleared by `AudioReadyGuard` when
   the branch stops pumping; a frame that cannot be queued within `AUDIO_SEND_TIMEOUT` (1 s) makes
   `ssh_audio_send` return false, and the recording's drain loop then drops the rest of that
-  utterance while still metering it, exactly as a broken TCP connection does.
+  utterance while still metering it.
 - `src/psram.rs` only drives PSRAM over the RP2350's QMI/XIP hardware path (`init_psram_qmi`) now.
   It used to also have a PIO-driven "slow path" (its own `PsRam` struct, claiming PIO1, DMA_CH1,
   DMA_CH2, and `PIN_2`/`PIN_3`/`PIN_20`/`PIN_21`) as a fallback/self-test, but that path's detected

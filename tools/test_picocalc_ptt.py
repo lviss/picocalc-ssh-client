@@ -498,9 +498,104 @@ class EndToEnd(unittest.TestCase):
     def test_no_whisper_command_is_a_usage_error(self):
         with FakeCommands(self) as fake:
             fake.add("tmux", "true\n")
-            rc, stderr = run_main(["--config", str(fake.dir / "missing.conf")], b"", fake)
+            # No whisper configured and none discoverable on this PATH.
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(fake.bin)
+            try:
+                rc, stderr = run_main(["--config", str(fake.dir / "missing.conf")], b"", fake)
+            finally:
+                os.environ["PATH"] = old_path
             self.assertEqual(rc, 2)
-            self.assertIn("no whisper command configured", stderr)
+            self.assertIn("no whisper command found", stderr)
+            # The message has to say what to install, not just that something
+            # is missing.
+            self.assertIn("whisper-cli", stderr)
+            self.assertIn("openai-whisper", stderr)
+
+    def test_default_whisper_discovers_whisper_cli_and_a_model(self):
+        # A default server setup - whisper-cli installed, a model in the usual
+        # place, no config file anywhere - must work with no configuration.
+        with FakeCommands(self) as fake:
+            home = fake.dir / "home"
+            (home / "models").mkdir(parents=True)
+            model = home / "models" / "ggml-base.en.bin"
+            model.write_bytes(b"model")
+            fake.add("whisper-cli", f'echo "$@" >> {fake.log}\necho "hello"\n')
+            fake.add("tmux", f'echo "$@" >> {fake.log}\n')
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(fake.bin)
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(home)
+            try:
+                rc, _ = run_main(
+                    ["--config", str(fake.dir / "missing.conf")],
+                    frame(samples([1])) + END,
+                    fake,
+                )
+            finally:
+                os.environ["PATH"] = old_path
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
+            self.assertEqual(rc, 0)
+            calls = fake.calls()
+            # The fake whisper-cli logs its arguments, i.e. the command after
+            # the program name.
+            self.assertTrue(any(f"-m {model} -f " in call for call in calls), calls)
+            self.assertTrue(any(call.startswith("send-keys -l -- hello") for call in calls), calls)
+
+    def test_picocalc_ptt_model_overrides_discovery(self):
+        # $PICOCALC_PTT_MODEL names the model explicitly, so a server whose
+        # model lives outside the conventional paths still needs no config file.
+        with FakeCommands(self) as fake:
+            model = fake.dir / "custom-model.bin"
+            model.write_bytes(b"model")
+            fake.add("whisper-cli", f'echo "$@" >> {fake.log}\necho "hi"\n')
+            fake.add("tmux", f'echo "$@" >> {fake.log}\n')
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(fake.bin)
+            try:
+                rc, _ = run_main(
+                    ["--config", str(fake.dir / "missing.conf")],
+                    frame(samples([1])) + END,
+                    fake,
+                    env={"PICOCALC_PTT_MODEL": str(model)},
+                )
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(rc, 0)
+            calls = fake.calls()
+            self.assertTrue(any(f"-m {model} -f " in call for call in calls), calls)
+
+    def test_default_whisper_falls_back_to_openai_whisper(self):
+        # No whisper-cli, no model, but openai-whisper on PATH: its `--model
+        # base` fetches its own model, so that is the default command.
+        with FakeCommands(self) as fake:
+            fake.add("whisper", f'echo "$@" >> {fake.log}\necho "hi"\n')
+            fake.add("tmux", f'echo "$@" >> {fake.log}\n')
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(fake.bin)
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(fake.dir / "empty-home")
+            try:
+                (fake.dir / "empty-home").mkdir(exist_ok=True)
+                rc, _ = run_main(
+                    ["--config", str(fake.dir / "missing.conf")],
+                    frame(samples([1])) + END,
+                    fake,
+                )
+            finally:
+                os.environ["PATH"] = old_path
+                if old_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = old_home
+            self.assertEqual(rc, 0)
+            calls = fake.calls()
+            self.assertTrue(
+                any("--model base" in call and "--output_dir" in call for call in calls), calls
+            )
 
     def test_aix_style_target_is_passed_through(self):
         with FakeCommands(self) as fake:

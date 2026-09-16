@@ -172,13 +172,6 @@ pub async fn setup_wifi(
     STACK.get().lock().await.replace(stack);
 }
 
-/// Returns the network stack, if WiFi has finished bringing it up.
-/// Used by other subsystems (e.g. `crate::mic`'s push-to-talk uploader)
-/// that need a second, independent socket alongside the SSH one.
-pub async fn stack() -> Option<Stack<'static>> {
-    STACK.get().lock().await.as_ref().copied()
-}
-
 const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
 async fn send_key_bytes(channel: &mut ChanInOut<'_, '_>, bytes: &[u8]) {
@@ -269,10 +262,15 @@ async fn ssh_channel_task(mut channel: ChanInOut<'_, '_>, key_rx: Arc<Channel<CS
 /// Config key holding the command the SSH server runs to receive push-to-talk
 /// audio, i.e. `config set ptt_ssh_cmd "..."`.
 pub const PTT_SSH_CMD_KEY: &str = "ptt_ssh_cmd";
-/// What the server runs when `ptt_ssh_cmd` is unset: the helper this repo
-/// ships in `tools/picocalc-ptt`, which has to be installed on the server's
-/// non-interactive `PATH` (see README.md).
-const PTT_SSH_CMD_DEFAULT: &str = "picocalc-ptt";
+/// The server-side helper this firmware carries with it: `tools/picocalc-ptt`
+/// as bytes in flash, streamed down the audio channel on every session so a
+/// server needs only `python3` and whisper - nothing pre-installed, no copy
+/// step (see [`AudioCommand`]).
+const PTT_HELPER_SCRIPT: &[u8] = include_bytes!("../tools/picocalc-ptt");
+/// How much of the helper script to hand the channel per write. Small enough
+/// to stay out of the session's way while it is being delivered, large enough
+/// that a session start costs a few hundred writes rather than thousands.
+const PTT_SCRIPT_CHUNK_BYTES: usize = 1024;
 /// How long a frame may wait for room in `AUDIO_QUEUE` before the upload task
 /// gives up on the SSH sink for the rest of that recording. The queue holds
 /// three frames (~75 ms of audio at the default rate) and the channel drains
@@ -310,15 +308,15 @@ static PTY_READY: Signal<CS, ()> = Signal::new();
 /// never reach the server before the helper is running.
 static AUDIO_EXEC_SENT: Signal<CS, bool> = Signal::new();
 
-/// Whether push-to-talk recordings should go over the SSH session. `crate::mic`
-/// asks this once per recording: when it holds, the recording's wire frames go
-/// to the session's server-side helper, and when it does not, they fall back to
-/// the raw TCP sink (`ptt_host`/`ptt_port`).
+/// Whether push-to-talk can send audio right now, i.e. whether the session's
+/// audio channel is open and the server has been asked to run the helper.
+/// `crate::mic` asks this when the button is pressed: without it there is
+/// nowhere for a recording to go, so the device says so instead of recording.
 ///
-/// An active SSH session is preferred over the raw TCP sink because it is
-/// already authenticated and encrypted, needs no listener anywhere new, and is
-/// the only transport that can hand the audio to a process on the machine the
-/// user is typing into (see README.md's push-to-talk section).
+/// The session is the only transport: it is already authenticated and
+/// encrypted, needs no listener anywhere new, and is the only way to hand the
+/// audio to a process on the machine the user is typing into (see README.md's
+/// push-to-talk section).
 pub fn ssh_audio_available() -> bool {
     AUDIO_READY.load(Ordering::Acquire)
 }
@@ -402,7 +400,7 @@ impl Drop for AudioReadyGuard {
 /// audio channel and leaves recordings on the raw TCP sink. Reported by
 /// `config get` as well, so the console shows what a new session would run
 /// rather than the raw store slot.
-pub async fn effective_ssh_audio_command() -> Option<alloc::string::String> {
+pub async fn effective_ssh_audio_command() -> Option<AudioCommand> {
     let stored = CONFIG
         .get()
         .lock()
@@ -411,14 +409,65 @@ pub async fn effective_ssh_audio_command() -> Option<alloc::string::String> {
         .await
         .ok()
         .flatten();
-    let command = stored
-        .as_ref()
-        .map(|value| value.as_str().trim().to_string())
-        .unwrap_or_else(|| PTT_SSH_CMD_DEFAULT.to_string());
-    if command.is_empty() {
-        None
-    } else {
-        Some(command)
+    match stored.as_ref().map(|value| value.as_str().trim()) {
+        // An empty stored value disables the transport.
+        Some("") => None,
+        // An explicit command is run as-is; the user has installed whatever it
+        // needs on the server.
+        Some(command) => Some(AudioCommand::Configured(command.to_string())),
+        // Nothing configured: run the helper this firmware carries.
+        None => Some(AudioCommand::Embedded),
+    }
+}
+
+/// The command that receives the embedded helper script: create a private file
+/// under `$TMPDIR` (or `/tmp`), copy exactly `script_bytes` bytes off the
+/// channel into it with `dd bs=1` - one byte per read, so the audio frames that
+/// follow stay on the channel for python to read - and exec the helper. The
+/// installed name carries the shell's pid so two sessions cannot collide.
+/// The exact string is host-tested in `terminal_model::ptt_frame`.
+fn embedded_helper_command(script_bytes: usize) -> alloc::string::String {
+    terminal_model::ptt_frame::helper_exec_command(script_bytes)
+}
+
+/// What the session's audio channel runs, resolved once per session.
+///
+/// The default is the helper script embedded in the firmware: the device
+/// streams it down the channel right after the `exec`, the command writes it to
+/// a private file and runs it with `python3`, and the audio frames follow on
+/// the same channel. That means the server needs no copy of `picocalc-ptt` on
+/// its `PATH` - only `python3` and whisper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioCommand {
+    /// The embedded helper, delivered over the channel.
+    Embedded,
+    /// A `ptt_ssh_cmd` the user set, run as-is.
+    Configured(alloc::string::String),
+}
+
+impl AudioCommand {
+    /// Whether the helper script is streamed down the channel after the `exec`
+    /// request (and therefore whether the command expects it).
+    pub fn sends_script(&self) -> bool {
+        matches!(self, Self::Embedded)
+    }
+
+    /// The command string the server's shell runs.
+    fn exec_string(&self) -> alloc::string::String {
+        match self {
+            Self::Configured(command) => command.clone(),
+            Self::Embedded => crate::net::embedded_helper_command(PTT_HELPER_SCRIPT.len()),
+        }
+    }
+
+    /// What `config get ptt_ssh_cmd` and the log report for this destination.
+    pub fn describe(&self) -> alloc::string::String {
+        match self {
+            Self::Configured(command) => command.clone(),
+            // The generated command is long and uninteresting; the console says
+            // where the helper comes from instead.
+            Self::Embedded => alloc::string::String::from("(built-in helper)"),
+        }
     }
 }
 
@@ -438,7 +487,7 @@ pub async fn effective_ssh_audio_command() -> Option<alloc::string::String> {
 /// channel dies (the helper exited, or the server closed it), the branch keeps
 /// draining `AUDIO_QUEUE` forever instead, which leaves the session's audio
 /// unavailable so later recordings use the raw TCP sink.
-async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&str>) {
+async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&AudioCommand>) {
     if let Some(command) = command {
         PTY_READY.wait().await;
         if let Some((channel, stderr)) = open_audio_channel(ssh_client, command).await {
@@ -458,7 +507,7 @@ async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&str>) {
 /// the channel cannot carry audio - the session then keeps its raw TCP sink.
 async fn open_audio_channel<'g, 'a>(
     ssh_client: &'g SSHClient<'a>,
-    command: &str,
+    command: &AudioCommand,
 ) -> Option<(ChanInOut<'g, 'a>, ChanIn<'g, 'a>)> {
     let (channel, stderr) = match ssh_client.open_session_nopty().await {
         Ok(channel) => channel,
@@ -467,13 +516,31 @@ async fn open_audio_channel<'g, 'a>(
             return None;
         }
     };
-    log::info!("ptt: ssh audio channel opened for `{command}`");
+    let described = command.describe();
+    log::info!("ptt: ssh audio channel opened for `{described}`");
     // The `exec` request is sent by the ticker, when it sees this channel's
     // session-open event; waiting for its result keeps audio from being
     // written before the helper is running, which would only be discarded.
     if !AUDIO_EXEC_SENT.wait().await {
-        print!("ptt: could not start the ssh audio helper `{command}`\r\n");
+        print!("ptt: could not start the ssh audio helper `{described}`\r\n");
         return None;
+    }
+    if command.sends_script() {
+        // Deliver the embedded helper before any audio: the server-side command
+        // is blocked in `dd` waiting for exactly these bytes, and the frames
+        // that follow it are the audio it then reads.
+        let mut channel = channel;
+        let mut sent = 0usize;
+        while sent < PTT_HELPER_SCRIPT.len() {
+            let end = (sent + PTT_SCRIPT_CHUNK_BYTES).min(PTT_HELPER_SCRIPT.len());
+            if let Err(err) = channel.write_all(&PTT_HELPER_SCRIPT[sent..end]).await {
+                print!("ptt: could not send the ssh audio helper ({err:?})\r\n");
+                return None;
+            }
+            sent = end;
+        }
+        log::info!("ptt: sent the embedded helper ({} bytes)", sent);
+        return Some((channel, stderr));
     }
     Some((channel, stderr))
 }
@@ -608,7 +675,9 @@ async fn ssh_session_task(
                     // value) leaves recordings on the raw TCP sink.
                     let audio_command = effective_ssh_audio_command().await;
                     match &audio_command {
-                        Some(command) => log::info!("ptt: ssh audio helper is `{command}`"),
+                        Some(command) => {
+                            log::info!("ptt: ssh audio helper is `{}`", command.describe())
+                        }
                         None => log::info!("ptt: ssh audio disabled ({PTT_SSH_CMD_KEY} is empty)"),
                     }
                     reset_audio_session_state();
@@ -714,7 +783,8 @@ async fn ssh_session_task(
                                             // the branch whether that worked.
                                             let sent = match &audio_command {
                                                 Some(cmd) => {
-                                                    s.cmd(&SessionCommand::Exec(cmd)).is_ok()
+                                                    let exec = cmd.exec_string();
+                                                    s.cmd(&SessionCommand::Exec(&exec)).is_ok()
                                                 }
                                                 None => false,
                                             };
@@ -815,7 +885,7 @@ async fn ssh_session_task(
                             ssh_ticker,
                             select(
                                 spawn_session_future,
-                                ssh_audio_branch(&ssh_client, audio_command.as_deref()),
+                                ssh_audio_branch(&ssh_client, audio_command.as_ref()),
                             ),
                         ),
                     )
