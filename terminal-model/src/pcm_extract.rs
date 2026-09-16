@@ -92,12 +92,6 @@ pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
     }
 }
 
-/// Level-meter value for a chunk of extracted mono samples: a windowed median
-/// of per-window AC RMS (see [`windowed_ac_level`]). Integer-only and linear,
-/// so a mic on its noise floor reads near zero while speech drives it up; the
-/// raw value is the number of `i16` counts, which the overlay maps to a bar.
-/// The firmware computes it on the upload task from the samples it has already
-/// drained from the audio ring, never on the DMA capture path.
 fn integer_sqrt(value: u64) -> u64 {
     if value == 0 {
         return 0;
