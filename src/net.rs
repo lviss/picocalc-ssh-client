@@ -369,6 +369,22 @@ async fn queue_audio_frame(samples: &[i16]) -> bool {
     }
 }
 
+/// Clears any `PTY_READY`/`AUDIO_EXEC_SENT`/`AUDIO_QUEUE` state left over from a
+/// previous `ssh_session_task` invocation. Those are module-level statics
+/// shared between this task and `ssh_audio_branch`/`pump_audio`, and a
+/// `Signal` keeps a signaled value until it is consumed - so without this, a
+/// session whose `ptt_ssh_cmd` was empty (whose audio branch never waits on
+/// `PTY_READY`) can leave a stale `PTY_READY` signal for the *next* session's
+/// audio branch to consume immediately, before that session's own interactive
+/// channel opens, misattributing which channel is the terminal and which is
+/// the audio helper. Must run once per session, before the audio branch/select
+/// starts.
+fn reset_audio_session_state() {
+    PTY_READY.reset();
+    AUDIO_EXEC_SENT.reset();
+    while AUDIO_QUEUE.try_receive().is_ok() {}
+}
+
 /// Clears the session's audio availability when its audio branch stops
 /// pumping - the helper exited, the server closed the channel, or the whole
 /// session is being torn down - so nothing can queue frames for a channel
@@ -595,6 +611,7 @@ async fn ssh_session_task(
                         Some(command) => log::info!("ptt: ssh audio helper is `{command}`"),
                         None => log::info!("ptt: ssh audio disabled ({PTT_SSH_CMD_KEY} is empty)"),
                     }
+                    reset_audio_session_state();
 
                     let runner = ssh_client.run(&mut read, &mut write);
                     let mut progress = ProgressHolder::new();
