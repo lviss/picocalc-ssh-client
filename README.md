@@ -454,7 +454,9 @@ and the firmware expects the mic's data and both clock lines on exactly these:
 
 `GP2`, `GP3` and `GP21` are also wired to the PicoCalc's PSRAM chip (its
 `RAM_TX`/`RAM_RX`/`RAM_SCK` lines); that is safe here because this firmware
-never uses that PSRAM - see `README-DEVICE.md` and `src/psram.rs`. If your mic
+only reaches PSRAM over the RP2350's internal QMI/XIP hardware path, which
+uses a separate, RP2350-internal chip-select pad rather than these pins - see
+`README-DEVICE.md` and `src/psram.rs`. If your mic
 is strapped to the right channel instead, the capture keeps the wrong I2S slot
 and records silence; `terminal_model::pcm_extract::extract_left_channel_pcm`
 documents the one-line change for that case.
