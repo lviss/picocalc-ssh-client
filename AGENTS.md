@@ -389,7 +389,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (`config set ptt_ssh_cmd TMUX_TMPDIR=/run/user/1003 picocalc-ptt`) and quote characters would be
   stored literally and break the remote shell; and stored values are `FixedString<128>`
   (`src/config.rs`).
-  Two sunset (the SSH stack) sharp edges shaped that design and must stay in mind for any future
+  Three sunset (the SSH stack) sharp edges shaped that design and must stay in mind for any future
   channel work: (1) `Channels::open` only reuses a slot that is `None`, and nothing frees a
   client-side channel slot after `channel_done`, so with `MAX_CHANNELS = 4` a client can open only
   a few channels per connection - hence *one* audio channel per session, not one per utterance,
@@ -399,7 +399,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   on the interactive channel's own EOF (`ssh_channel_task`), which is what makes a missing or
   crashing helper print a message and fall back to TCP instead of tearing the user's terminal
   down. `ssh_audio_branch` is an arm of the session's `select` and must never return while the
-  session lives: when the audio channel dies it drains `AUDIO_QUEUE` forever instead.
+  session lives: when the audio channel dies it drains `AUDIO_QUEUE` forever instead. (3)
+  `PTY_READY`, `AUDIO_EXEC_SENT`, and `AUDIO_QUEUE` are module-level statics shared across every
+  `ssh_session_task` invocation, and `embassy_sync::Signal` keeps a signaled value queued until
+  consumed - so `ssh_session_task` calls `reset_audio_session_state()` (`src/net.rs`) once per
+  session, before the audio branch/select starts, to clear any of the three left over from the
+  previous session; any future per-session channel state added here needs the same reset.
   The handoff is a fixed `Channel<CS, AudioFrame, 3>` of encoded frames (never heap):
   `ssh_audio_available()` is set only after the ticker has sent the helper's `exec` request (so
   audio can never be written before the process exists) and is cleared by `AudioReadyGuard` when

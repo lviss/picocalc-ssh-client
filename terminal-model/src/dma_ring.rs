@@ -83,7 +83,8 @@ mod tests {
         for capacity in [2usize, 4, 8, 16] {
             for read_index in 0..capacity {
                 for count in 0..=capacity {
-                    let [(a_start, a_len), (b_start, b_len)] = segments(read_index, count, capacity);
+                    let [(a_start, a_len), (b_start, b_len)] =
+                        segments(read_index, count, capacity);
                     assert_eq!(a_len + b_len, count, "count {count} at {read_index}");
                     assert!(a_start + a_len <= capacity, "first segment in bounds");
                     assert!(b_start + b_len <= capacity, "second segment in bounds");
