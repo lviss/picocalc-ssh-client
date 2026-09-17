@@ -325,8 +325,8 @@ pub fn ssh_session_active() -> bool {
 
 /// Report a push-to-talk diagnostic. While an SSH session is up the screen *is*
 /// that session's terminal: writing this text into it would corrupt or scroll
-/// the remote output - including the transcript the helper is typing into tmux
-/// - so the message goes to the log instead. With no session the local console
+/// the remote output, including the transcript the helper is typing into tmux,
+/// so the message goes to the log instead. With no session the local console
 /// is the only place the user can see it, so it is printed there.
 pub async fn ptt_note(message: &str) {
     if ssh_session_active() {

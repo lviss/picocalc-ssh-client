@@ -422,7 +422,9 @@ most 128 bytes: quote characters would be stored literally and then reach the
 remote shell as literal quotes.
 
 Setting `ptt_ssh_cmd` to empty turns push-to-talk off: the device opens no
-channel, and pressing `F1` shows `no ssh session: not recording`.
+channel, and pressing `F1` during a session shows `ptt unavailable: the
+session's audio channel is not running` (with no session at all, it shows
+`no ssh session: not recording` as always).
 
 If the helper cannot be started or it exits - a server without `python3` or
 whisper, a crashed helper - **only push-to-talk is affected: the SSH session

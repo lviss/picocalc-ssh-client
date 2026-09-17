@@ -243,14 +243,17 @@ async fn read_and_reconcile() -> StoreOutcome {
             Some((_, err)) => {
                 crate::net::ptt_note(&alloc::format!(
                     "failed to reconcile {} ({}) - store still holds {}; console reports flag it",
-                    failed.key, err, failed.stored
+                    failed.key,
+                    err,
+                    failed.stored
                 ))
                 .await
             }
             None => {
                 crate::net::ptt_note(&alloc::format!(
                     "{} store is unreconciled (still holds {}); console reports flag it",
-                    failed.key, failed.stored
+                    failed.key,
+                    failed.stored
                 ))
                 .await
             }
