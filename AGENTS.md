@@ -331,16 +331,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `Screen::show_notice`, and starts no capture, no PIO clock and no ring traffic. A push-to-talk
   failure must never cost the user their terminal: the helper exits on its own when the server has
   no `python3` or whisper, and `CliEvent::SessionExit` carries no channel number, so the ticker
-  attributes an exit event with `AUDIO_CHANNEL_LIVE` (`src/net.rs`, set by `ssh_audio_branch` once
-  it is committed to using the session's audio channel, cleared by `AudioChannelLiveGuard` on every
-  path where that branch stops using it - a failed exec, an undeliverable embedded script, or
-  `pump_audio` returning): while the audio channel is live an exit event may be its own exit-status
-  message (arriving ahead of its EOF), so the session carries on with push-to-talk unavailable,
-  which `config get`-style console and `ssh_session_active()` report distinctly from "no session at
-  all"; `pump_audio`'s own channel read independently detects and reports that channel's closure
-  via `ptt_note`. Once the audio channel is not live, nothing but the terminal channel can be left,
-  so this is its exit and the ticker ends the session there (the terminal channel's own EOF ends it
-  too, by completing `spawn_session_future`). For the same reason push-to-talk diagnostics never
+  decides by the *terminal* channel's lifetime (`TERMINAL_OPEN`): while the terminal is open an exit
+  event may be the audio channel's own exit-status message (which arrives ahead of that channel's
+  EOF), so the session carries on with push-to-talk unavailable - `pump_audio`'s own channel read
+  independently reports that closure via `ptt_note`, and `ssh_session_active()` lets `mic.rs` say
+  "ptt unavailable" rather than "no ssh session" - and once the terminal channel is closed nothing
+  else can be left, so the ticker ends the session there (the terminal's own EOF ends it too, by
+  completing `spawn_session_future`). Deciding by the *audio* branch's liveness instead is a trap:
+  its guard clears as soon as `pump_audio` returns, which can happen before the ticker consumes the
+  event, and then the ticker reads a dead helper as a dead terminal and drops the session - the
+  exact bug reproduced with a host harness (`sunset-embassy` against a real sshd whose helper
+  command fails) and fixed by using the terminal's state. For the same reason push-to-talk diagnostics never
   `print!` into a live session's screen - that screen *is* the terminal, so a diagnostic line
   would corrupt the remote output and any transcript being typed into tmux. They go through
   `net::ptt_note` (host-visible): `log::warn!` while a session is up, the device's `print!`
@@ -395,12 +396,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   a few channels per connection - hence *one* audio channel per session, not one per utterance,
   which is also why the end-of-utterance marker exists at all; (2) `CliEvent::SessionExit` carries
   no channel number, so with two session channels an exit event cannot be attributed - the ticker
-  therefore only ends the session on it when `AUDIO_CHANNEL_LIVE` is false, and otherwise relies on
-  `pump_audio`'s own channel read to report a missing or crashing helper (via `ptt_note`) and leave
-  the rest of that utterance unsent instead of tearing the user's terminal down. `ssh_audio_branch`
+  therefore only ends the session on it when `TERMINAL_OPEN` is false (the interactive channel is
+  already gone), and otherwise relies on `pump_audio`'s own channel read to report a missing or
+  crashing helper (via `ptt_note`) and leave the rest of that utterance unsent instead of tearing
+  the user's terminal down. `ssh_audio_branch`
   is an arm of the session's `select` and must never return while the
   session lives: when the audio channel dies it drains `AUDIO_QUEUE` forever instead. (3)
-  `PTY_READY`, `AUDIO_EXEC_SENT`, `TERMINAL_OPEN`, `AUDIO_CHANNEL_LIVE`, and `AUDIO_QUEUE` are
+  `PTY_READY`, `AUDIO_EXEC_SENT`, `TERMINAL_OPEN`, and `AUDIO_QUEUE` are
   module-level statics shared across every `ssh_session_task` invocation, and `embassy_sync::Signal`
   keeps a signaled value queued until consumed - so `ssh_session_task` calls
   `reset_audio_session_state()` (`src/net.rs`) once per session, before the audio branch/select
