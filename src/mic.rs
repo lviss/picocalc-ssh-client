@@ -379,16 +379,21 @@ static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// `keyboard.rs` on `(KeyState::Pressed, Key::F1)` (with no modifiers held).
 pub async fn start_recording() {
     if RECORDING.load(Ordering::Acquire) == 0 {
-        // Push-to-talk only exists on the SSH session's audio channel: with no
-        // session up there is nowhere for the audio to go, so say so instead of
+        // Push-to-talk only exists on the SSH session's audio channel, so
+        // without it there is nowhere for the audio to go: say why instead of
         // recording into the void (and without spinning up the microphone, the
-        // PIO clock or a ring full of samples nobody will read).
+        // PIO clock or a ring full of samples nobody will read). The notice is
+        // an overlay - painted over the terminal for a couple of seconds,
+        // never written into its buffer - so it cannot corrupt the session's
+        // output, and the same reason goes to the log for the record.
         if !crate::net::ssh_audio_available() {
-            SCREEN
-                .get()
-                .lock()
-                .await
-                .show_notice(String::from("no ssh session: not recording"));
+            let message = if crate::net::ssh_session_active() {
+                "ptt unavailable: the session\'s audio channel is not running"
+            } else {
+                "no ssh session: not recording"
+            };
+            crate::net::ptt_note(message).await;
+            SCREEN.get().lock().await.show_notice(String::from(message));
             return;
         }
         // A new generation identifies this utterance for the rest of its
@@ -733,14 +738,14 @@ async fn capture_task(mut mic: Mic) {
 /// stalling the I2S clocks.
 async fn emit_pending_notices() {
     if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
-        print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+        crate::net::ptt_note("upload can't keep up, dropping oldest audio").await;
     }
     if DMA_OVERRUN_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
-        print!("ptt: capture ring overran, dropping some audio\r\n");
+        crate::net::ptt_note("capture ring overran, dropping some audio").await;
     }
     let capped_generation = CAP_NOTICE_GEN.swap(0, Ordering::AcqRel);
     if capped_generation != 0 {
-        print!("ptt: recording exceeded 60s cap, stopping\r\n");
+        crate::net::ptt_note("recording exceeded 60s cap, stopping").await;
         let mut screen = SCREEN.get().lock().await;
         if CURRENT_GEN.load(Ordering::Acquire) == capped_generation {
             screen.clear_overlay();
@@ -793,7 +798,7 @@ async fn serve_utterance(generation: u32) {
                 // or its helper went away), which also covers the channel
                 // becoming unavailable between chunks.
                 if !crate::net::ssh_audio_send(&buf[..n]).await {
-                    print!("ptt: ssh audio channel unavailable, dropping rest\r\n");
+                    crate::net::ptt_note("ssh audio channel unavailable, dropping rest").await;
                     ssh = false;
                 }
             }
@@ -818,7 +823,7 @@ async fn serve_utterance(generation: u32) {
         // utterance has to be marked in band (a zero-length frame) rather than
         // by closing anything.
         if !crate::net::ssh_audio_end_of_utterance().await {
-            print!("ptt: ssh audio channel unavailable, dropping utterance end\r\n");
+            crate::net::ptt_note("ssh audio channel unavailable, dropping utterance end").await;
         }
     }
 }

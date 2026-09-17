@@ -326,8 +326,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   treat that whole code group as suspect for any future key binding on this hardware. That is the
   whole destination story now: the SSH session's audio channel and nothing else. `mic.rs`'s
   `start_recording` asks `net::ssh_audio_available()` when the button is pressed and, when it is
-  false (no session, or `ptt_ssh_cmd` set empty), shows `no ssh session: not recording` through
-  `Screen::show_notice` and starts no capture, no PIO clock and no ring traffic. There used to be
+  false, shows `no ssh session: not recording` - or `ptt unavailable: the session's audio channel
+  is not running` when `net::ssh_session_active()` says a session *is* up - through
+  `Screen::show_notice`, and starts no capture, no PIO clock and no ring traffic. A push-to-talk
+  failure must never cost the user their terminal: the helper exits on its own when the server has
+  no `python3` or whisper, and `CliEvent::SessionExit` carries no channel number, so the ticker
+  attributes an exit event with `TERMINAL_OPEN` (`src/net.rs`, set once the interactive channel's
+  `pty`/`shell` request is sent, cleared on that channel's EOF or when the session ends): while the
+  terminal is open an exit can only be the audio branch's, and the session carries on with
+  push-to-talk unavailable, which `config get`-style console and `ssh_session_active()` report
+  distinctly from "no session at all". For the same reason push-to-talk diagnostics never
+  `print!` into a live session's screen - that screen *is* the terminal, so a diagnostic line
+  would corrupt the remote output and any transcript being typed into tmux. They go through
+  `net::ptt_note` (host-visible): `log::warn!` while a session is up, the device's `print!`
+  console otherwise; the only thing drawn on the screen during a session is the transient
+  `Screen::show_notice` overlay, which is paint-time-only and never touches the terminal buffer
+  (see the overlay note above). There used to be
   a raw-TCP sink (`ptt_host`/`ptt_port`, one connection per utterance) from the capture-only
   stage; it was removed on the captain's call as a stepping stone nobody would use.
 - Push-to-talk rides the *existing* SSH session (`src/net.rs`'s `ssh_audio_branch`,

@@ -303,10 +303,38 @@ static AUDIO_READY: AtomicBool = AtomicBool::new(false);
 /// `pty`/`shell` request sent, which is what makes "the next session-open event
 /// is the audio channel's" true (see `ssh_audio_branch`).
 static PTY_READY: Signal<CS, ()> = Signal::new();
+/// Whether the session's interactive terminal channel is still open. Set when
+/// its `pty`/`shell` request has been sent, cleared when `ssh_channel_task`
+/// returns (its EOF) or the session ends. `CliEvent::SessionExit` carries no
+/// channel number, so this is what attributes an exit event: while the terminal
+/// is open, an exit can only be the audio channel's (`ssh_audio_branch`), and a
+/// failed push-to-talk helper must never take the user's terminal down.
+static TERMINAL_OPEN: AtomicBool = AtomicBool::new(false);
 /// Signalled by the ticker with the result of the audio channel's `exec`
 /// request. The audio branch starts pumping only after that, so audio data can
 /// never reach the server before the helper is running.
 static AUDIO_EXEC_SENT: Signal<CS, bool> = Signal::new();
+
+/// Whether an SSH session is up at all, regardless of whether its audio
+/// channel works. `crate::mic` uses this to tell "there is no session to send
+/// audio over" apart from "the session is fine but push-to-talk is not
+/// available", which are different things to say to the user.
+pub fn ssh_session_active() -> bool {
+    TERMINAL_OPEN.load(Ordering::Acquire)
+}
+
+/// Report a push-to-talk diagnostic. While an SSH session is up the screen *is*
+/// that session's terminal: writing this text into it would corrupt or scroll
+/// the remote output - including the transcript the helper is typing into tmux
+/// - so the message goes to the log instead. With no session the local console
+/// is the only place the user can see it, so it is printed there.
+pub async fn ptt_note(message: &str) {
+    if ssh_session_active() {
+        log::warn!("ptt: {message}");
+    } else {
+        print!("ptt: {message}\r\n");
+    }
+}
 
 /// Whether push-to-talk can send audio right now, i.e. whether the session's
 /// audio channel is open and the server has been asked to run the helper.
@@ -366,8 +394,8 @@ async fn queue_audio_frame(samples: &[i16]) -> bool {
     }
 }
 
-/// Clears any `PTY_READY`/`AUDIO_EXEC_SENT`/`AUDIO_QUEUE` state left over from a
-/// previous `ssh_session_task` invocation. Those are module-level statics
+/// Clears any `PTY_READY`/`AUDIO_EXEC_SENT`/`TERMINAL_OPEN`/`AUDIO_QUEUE` state
+/// left over from a previous `ssh_session_task` invocation. Those are module-level statics
 /// shared between this task and `ssh_audio_branch`/`pump_audio`, and a
 /// `Signal` keeps a signaled value until it is consumed - so without this, a
 /// session whose `ptt_ssh_cmd` was empty (whose audio branch never waits on
@@ -379,6 +407,7 @@ async fn queue_audio_frame(samples: &[i16]) -> bool {
 fn reset_audio_session_state() {
     PTY_READY.reset();
     AUDIO_EXEC_SENT.reset();
+    TERMINAL_OPEN.store(false, Ordering::Release);
     while AUDIO_QUEUE.try_receive().is_ok() {}
 }
 
@@ -512,7 +541,10 @@ async fn open_audio_channel<'g, 'a>(
     let (channel, stderr) = match ssh_client.open_session_nopty().await {
         Ok(channel) => channel,
         Err(err) => {
-            print!("ptt: could not open the ssh audio channel: {err:?}\r\n");
+            ptt_note(&alloc::format!(
+                "could not open the ssh audio channel: {err:?}"
+            ))
+            .await;
             return None;
         }
     };
@@ -522,7 +554,10 @@ async fn open_audio_channel<'g, 'a>(
     // session-open event; waiting for its result keeps audio from being
     // written before the helper is running, which would only be discarded.
     if !AUDIO_EXEC_SENT.wait().await {
-        print!("ptt: could not start the ssh audio helper `{described}`\r\n");
+        ptt_note(&alloc::format!(
+            "could not start the ssh audio helper `{described}`"
+        ))
+        .await;
         return None;
     }
     if command.sends_script() {
@@ -534,7 +569,10 @@ async fn open_audio_channel<'g, 'a>(
         while sent < PTT_HELPER_SCRIPT.len() {
             let end = (sent + PTT_SCRIPT_CHUNK_BYTES).min(PTT_HELPER_SCRIPT.len());
             if let Err(err) = channel.write_all(&PTT_HELPER_SCRIPT[sent..end]).await {
-                print!("ptt: could not send the ssh audio helper ({err:?})\r\n");
+                ptt_note(&alloc::format!(
+                    "could not send the ssh audio helper ({err:?})"
+                ))
+                .await;
                 return None;
             }
             sent = end;
@@ -578,7 +616,10 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
         {
             Either3::First(frame) => {
                 if let Err(err) = channel.write_all(&frame.bytes[..frame.len as usize]).await {
-                    print!("ptt: ssh audio helper stopped reading ({err:?})\r\n");
+                    ptt_note(&alloc::format!(
+                        "ssh audio helper stopped reading ({err:?})"
+                    ))
+                    .await;
                     return;
                 }
             }
@@ -588,7 +629,7 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
                 // `picocalc-ptt` makes the shell report a failure and exit
                 // immediately).
                 Ok(0) | Err(_) => {
-                    print!("ptt: ssh audio helper exited\r\n");
+                    ptt_note("ssh audio helper exited").await;
                     return;
                 }
                 Ok(_) => {}
@@ -599,7 +640,7 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
                 Ok(0) | Err(_) => stderr_done = true,
                 Ok(n) => {
                     let text = alloc::string::String::from_utf8_lossy(&err_buf[..n]);
-                    print!("ptt: {}\r\n", text.trim_end());
+                    ptt_note(text.trim_end()).await;
                 }
             },
         }
@@ -666,6 +707,11 @@ async fn ssh_session_task(
                         if wait_for_auth.receive().await {
                             let channel = ssh_client.open_session_pty().await?;
                             ssh_channel_task(channel, key_channel).await;
+                            // The terminal channel reached EOF (or failed), so
+                            // the session is over as far as this arm is
+                            // concerned: stop attributing later exit events to
+                            // the audio channel.
+                            TERMINAL_OPEN.store(false, Ordering::Release);
                         }
                         Ok::<(), sunset::Error>(())
                     };
@@ -820,7 +866,7 @@ async fn ssh_session_task(
 
                                         log::info!("requesting pty {pty:?}");
                                         if let Err(err) = s.pty(pty) {
-                                            print!("requesting pty failed {err:?}\r\n");
+                                            log::error!("requesting pty failed {err:?}");
                                             return Err(err);
                                         }
                                         log::info!("setting command");
@@ -828,7 +874,7 @@ async fn ssh_session_task(
                                             Some(cmd) => {
                                                 if let Err(err) = s.cmd(&SessionCommand::Exec(cmd))
                                                 {
-                                                    print!("command failed: {err:?}\r\n");
+                                                    log::error!("command failed: {err:?}");
                                                     return Err(err);
                                                 }
                                             }
@@ -844,23 +890,35 @@ async fn ssh_session_task(
                                         // audio branch may open the session's
                                         // second channel: the next open event
                                         // can only be its own.
+                                        TERMINAL_OPEN.store(true, Ordering::Release);
                                         PTY_READY.signal(());
                                     }
                                     CliEvent::SessionExit(status) => {
-                                        print!("[ssh session exit with {status:?}]\r\n");
                                         // sunset does not say which channel an
                                         // exit event belongs to, and the audio
-                                        // channel's helper exits on its own
-                                        // when it is missing or crashes. While
-                                        // that channel is live, only the
-                                        // interactive channel's own EOF may
-                                        // end the session, or a failed helper
-                                        // would take the user's terminal down
-                                        // with it; without it, this event can
-                                        // only be the interactive channel's, so
-                                        // the session ends here as it always
-                                        // has.
-                                        if !ssh_audio_available() {
+                                        // channel's helper exits on its own -
+                                        // a server without `python3` or
+                                        // whisper, a crashed helper, a
+                                        // killed process. The interactive
+                                        // channel's own lifetime is what
+                                        // attributes the event: while the
+                                        // terminal is still open, an exit can
+                                        // only be the audio channel's, and
+                                        // push-to-talk becomes unavailable
+                                        // while the session carries on.
+                                        // Otherwise this is the terminal
+                                        // exiting, and the session ends as it
+                                        // always has. (The terminal's own EOF
+                                        // ends the session too, by completing
+                                        // `spawn_session_future`.)
+                                        if TERMINAL_OPEN.load(Ordering::Acquire) {
+                                            ptt_note(&alloc::format!(
+                                                "ssh audio channel exited with {status:?}; \
+                                                 push-to-talk unavailable for this session"
+                                            ))
+                                            .await;
+                                        } else {
+                                            log::info!("ssh session exit with {status:?}");
                                             break;
                                         }
                                     }
@@ -870,7 +928,7 @@ async fn ssh_session_task(
                                     }
                                 },
                                 Err(err) => {
-                                    print!("ssh progress error: {err:?}\r\n");
+                                    log::error!("ssh progress error: {err:?}");
                                     return Err(err);
                                 }
                             }
@@ -890,6 +948,7 @@ async fn ssh_session_task(
                         ),
                     )
                     .await;
+                    TERMINAL_OPEN.store(false, Ordering::Release);
                     log::info!("ssh result is {res:?}");
                     assign_proc(prior_proc).await;
                 }

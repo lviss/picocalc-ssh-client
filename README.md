@@ -421,14 +421,22 @@ so a custom command is set **unquoted**, word by word, and the value may be at
 most 128 bytes: quote characters would be stored literally and then reach the
 remote shell as literal quotes.
 
-Setting `ptt_ssh_cmd` to empty turns push-to-talk off: the device still opens
-no channel, and pressing `F1` shows `no ssh session: not recording`.
+Setting `ptt_ssh_cmd` to empty turns push-to-talk off: the device opens no
+channel, and pressing `F1` shows `no ssh session: not recording`.
 
-If the helper cannot be started or it exits, the device reports why on screen
-(the helper's own `stderr` is forwarded there), and the rest of that utterance
-is dropped rather than silently queued. Run `tools/picocalc-ptt --help` for the
-helper's options and `python3 tools/test_picocalc_ptt.py` for its tests, which
-need neither whisper nor tmux.
+If the helper cannot be started or it exits - a server without `python3` or
+whisper, a crashed helper - **only push-to-talk is affected: the SSH session
+itself keeps working normally**, and pressing `F1` shows `ptt unavailable: the
+session's audio channel is not running` for a couple of seconds. The rest of
+that utterance is dropped rather than silently queued.
+
+Push-to-talk's diagnostics go to the device's **log** (the USB serial console)
+rather than its screen while a session is up: the screen *is* the session's
+terminal, so writing diagnostic lines into it would corrupt or scroll whatever
+the server is printing, including the transcript being typed into tmux. With no
+session up they are printed on the device as usual. Run `tools/picocalc-ptt
+--help` for the helper's options and `python3 tools/test_picocalc_ptt.py` for
+its tests, which need neither whisper nor tmux.
 
 #### Microphone wiring
 
