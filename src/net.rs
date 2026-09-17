@@ -305,11 +305,34 @@ static AUDIO_READY: AtomicBool = AtomicBool::new(false);
 static PTY_READY: Signal<CS, ()> = Signal::new();
 /// Whether the session's interactive terminal channel is still open. Set when
 /// its `pty`/`shell` request has been sent, cleared when `ssh_channel_task`
-/// returns (its EOF) or the session ends. `CliEvent::SessionExit` carries no
-/// channel number, so this is what attributes an exit event: while the terminal
-/// is open, an exit can only be the audio channel's (`ssh_audio_branch`), and a
-/// failed push-to-talk helper must never take the user's terminal down.
+/// returns (its EOF) or the session ends. Used by `ssh_session_active()` to
+/// tell "no session" apart from "session is up but push-to-talk may not be".
 static TERMINAL_OPEN: AtomicBool = AtomicBool::new(false);
+/// Whether the session's audio channel currently exists, independent of
+/// whether its helper is running. Set by `ssh_audio_branch` as soon as it is
+/// committed to using its channel, cleared by `AudioChannelLiveGuard`'s
+/// `Drop` when that use ends - the exec request failed, the embedded script
+/// could not be delivered, or the pump loop's channel closed - so it is set
+/// for exactly the window during which a `CliEvent::SessionExit` could be
+/// that channel's own exit-status message. `CliEvent::SessionExit` carries no
+/// channel number, so this is what the ticker checks instead of guessing from
+/// the terminal's state: while the audio channel is live, an exit event may
+/// be its own (a helper that could not start, e.g. missing `python3`), and a
+/// failed push-to-talk helper must never take the user's terminal down; once
+/// it is not live, nothing but the terminal channel can be left.
+static AUDIO_CHANNEL_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Clears `AUDIO_CHANNEL_LIVE` when the audio branch stops using its channel,
+/// on every exit path (an early return in `open_audio_channel`, or
+/// `pump_audio` returning), so the flag can never stay set after the channel
+/// is actually gone.
+struct AudioChannelLiveGuard;
+
+impl Drop for AudioChannelLiveGuard {
+    fn drop(&mut self) {
+        AUDIO_CHANNEL_LIVE.store(false, Ordering::Release);
+    }
+}
 /// Signalled by the ticker with the result of the audio channel's `exec`
 /// request. The audio branch starts pumping only after that, so audio data can
 /// never reach the server before the helper is running.
@@ -394,20 +417,21 @@ async fn queue_audio_frame(samples: &[i16]) -> bool {
     }
 }
 
-/// Clears any `PTY_READY`/`AUDIO_EXEC_SENT`/`TERMINAL_OPEN`/`AUDIO_QUEUE` state
-/// left over from a previous `ssh_session_task` invocation. Those are module-level statics
-/// shared between this task and `ssh_audio_branch`/`pump_audio`, and a
-/// `Signal` keeps a signaled value until it is consumed - so without this, a
-/// session whose `ptt_ssh_cmd` was empty (whose audio branch never waits on
-/// `PTY_READY`) can leave a stale `PTY_READY` signal for the *next* session's
-/// audio branch to consume immediately, before that session's own interactive
-/// channel opens, misattributing which channel is the terminal and which is
-/// the audio helper. Must run once per session, before the audio branch/select
-/// starts.
+/// Clears any `PTY_READY`/`AUDIO_EXEC_SENT`/`TERMINAL_OPEN`/`AUDIO_CHANNEL_LIVE`/
+/// `AUDIO_QUEUE` state left over from a previous `ssh_session_task`
+/// invocation. Those are module-level statics shared between this task and
+/// `ssh_audio_branch`/`pump_audio`, and a `Signal` keeps a signaled value
+/// until it is consumed - so without this, a session whose `ptt_ssh_cmd` was
+/// empty (whose audio branch never waits on `PTY_READY`) can leave a stale
+/// `PTY_READY` signal for the *next* session's audio branch to consume
+/// immediately, before that session's own interactive channel opens,
+/// misattributing which channel is the terminal and which is the audio
+/// helper. Must run once per session, before the audio branch/select starts.
 fn reset_audio_session_state() {
     PTY_READY.reset();
     AUDIO_EXEC_SENT.reset();
     TERMINAL_OPEN.store(false, Ordering::Release);
+    AUDIO_CHANNEL_LIVE.store(false, Ordering::Release);
     while AUDIO_QUEUE.try_receive().is_ok() {}
 }
 
@@ -518,6 +542,11 @@ impl AudioCommand {
 async fn ssh_audio_branch(ssh_client: &SSHClient<'_>, command: Option<&AudioCommand>) {
     if let Some(command) = command {
         PTY_READY.wait().await;
+        // From here an exit event could be this channel's own exit-status
+        // message; the guard makes that untrue again the moment this branch
+        // stops using the channel, on every return path below.
+        AUDIO_CHANNEL_LIVE.store(true, Ordering::Release);
+        let _live = AudioChannelLiveGuard;
         if let Some((channel, stderr)) = open_audio_channel(ssh_client, command).await {
             pump_audio(channel, stderr).await;
         }
@@ -894,28 +923,28 @@ async fn ssh_session_task(
                                     }
                                     CliEvent::SessionExit(status) => {
                                         // sunset does not say which channel an
-                                        // exit event belongs to, and the audio
-                                        // channel's helper exits on its own -
-                                        // a server without `python3` or
-                                        // whisper, a crashed helper, a
-                                        // killed process. The interactive
-                                        // channel's own lifetime is what
-                                        // attributes the event: while the
-                                        // terminal is still open, an exit can
-                                        // only be the audio channel's, and
-                                        // push-to-talk becomes unavailable
-                                        // while the session carries on.
-                                        // Otherwise this is the terminal
-                                        // exiting, and the session ends as it
-                                        // always has. (The terminal's own EOF
-                                        // ends the session too, by completing
+                                        // exit event belongs to. While the
+                                        // audio channel is live this may be
+                                        // its own exit-status message,
+                                        // arriving ahead of its EOF - a
+                                        // server without `python3` or
+                                        // whisper, a crashed helper, a killed
+                                        // process - so the session must carry
+                                        // on; `pump_audio`'s own channel read
+                                        // independently detects and reports
+                                        // that channel's closure. Once the
+                                        // audio channel is not live, nothing
+                                        // but the terminal channel can be
+                                        // left, so this is its exit and the
+                                        // session ends as it always has. (The
+                                        // terminal's own EOF ends the session
+                                        // too, by completing
                                         // `spawn_session_future`.)
-                                        if TERMINAL_OPEN.load(Ordering::Acquire) {
-                                            ptt_note(&alloc::format!(
-                                                "ssh audio channel exited with {status:?}; \
-                                                 push-to-talk unavailable for this session"
-                                            ))
-                                            .await;
+                                        if AUDIO_CHANNEL_LIVE.load(Ordering::Acquire) {
+                                            log::info!(
+                                                "ssh session exit event with {status:?} \
+                                                 while the audio channel is live"
+                                            );
                                         } else {
                                             log::info!("ssh session exit with {status:?}");
                                             break;
