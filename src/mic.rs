@@ -240,14 +240,20 @@ async fn read_and_reconcile() -> StoreOutcome {
     drop(config);
     for failed in &unreconciled {
         match write_errors.iter().find(|(key, _)| *key == failed.key) {
-            Some((_, err)) => print!(
-                "ptt: failed to reconcile {} ({}) - store still holds {}; console reports flag it\r\n",
-                failed.key, err, failed.stored
-            ),
-            None => print!(
-                "ptt: {} store is unreconciled (still holds {}); console reports flag it\r\n",
-                failed.key, failed.stored
-            ),
+            Some((_, err)) => {
+                crate::net::ptt_note(&alloc::format!(
+                    "failed to reconcile {} ({}) - store still holds {}; console reports flag it",
+                    failed.key, err, failed.stored
+                ))
+                .await
+            }
+            None => {
+                crate::net::ptt_note(&alloc::format!(
+                    "{} store is unreconciled (still holds {}); console reports flag it",
+                    failed.key, failed.stored
+                ))
+                .await
+            }
         }
     }
     StoreOutcome {
@@ -266,7 +272,7 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
 pub async fn load_settings() -> MicSettings {
     let resolved = resolve_settings().await;
     if resolved.fell_back {
-        print!("ptt: stored mic clock settings out of range, using defaults\r\n");
+        crate::net::ptt_note("stored mic clock settings out of range, using defaults").await;
     }
     resolved.settings
 }
