@@ -13,10 +13,10 @@
 //! exercise the exact arithmetic the firmware runs, per AGENTS.md's
 //! "host-testable logic lives in terminal-model" guidance.
 //!
-//! Slot width, sample rate, BCLK edge polarity and the diagnostic capture gain
-//! are runtime-configurable on the device (see `mic.rs`) so the microphone can
-//! be probed without a reflash. The default remains the documented-correct
-//! 32-bit slot at 16 kHz, i.e. a 1.024 MHz BCLK.
+//! Slot width, sample rate and BCLK edge polarity are runtime-configurable on
+//! the device (see `mic.rs`) so the microphone can be probed without a reflash.
+//! The default remains the documented-correct 32-bit slot at 16 kHz, i.e. a
+//! 1.024 MHz BCLK.
 
 /// Bit-clock (BCLK) frequency, in Hz, this mic requires for a given sample
 /// rate: `sample_rate_hz * bits_per_channel_slot * channels`. For the
@@ -81,8 +81,7 @@ pub fn extract_left_channel_pcm(raw: &[u32], pcm: &mut [i16], bits_per_channel_s
 /// The 16-bit PCM sample a single captured slot word carries, using the same
 /// shift the production extraction applies: the slot's most significant 16
 /// bits for widths >= 16, or the captured bits left-justified for narrower
-/// slots. Shared by [`extract_left_channel_pcm`] and [`ac_rms_level_words`] so
-/// the level meter always measures the same bit field the payload carries.
+/// slots.
 pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
     let bits = bits_per_channel_slot.clamp(1, 32);
     if bits >= 16 {
@@ -92,102 +91,6 @@ pub fn slot_sample(word: u32, bits_per_channel_slot: u32) -> i16 {
     }
 }
 
-/// Sign-extends the low `bits_per_channel_slot` bits of a captured slot word
-/// (the PIO leaves the slot's `bits`-wide two's-complement sample there, with
-/// its sign at bit `bits - 1`) to a signed value, so a narrow slot is
-/// interpreted at its true field width rather than as a full 32-bit word.
-fn slot_field_signed(word: u32, bits_per_channel_slot: u32) -> i32 {
-    if bits_per_channel_slot >= 32 {
-        word as i32
-    } else {
-        let shift = 32 - bits_per_channel_slot;
-        ((word << shift) as i32) >> shift
-    }
-}
-
-/// Signed range of a `bits_per_channel_slot`-wide two's-complement slot field.
-fn slot_field_range(bits_per_channel_slot: u32) -> (i64, i64) {
-    if bits_per_channel_slot >= 32 {
-        (i32::MIN as i64, i32::MAX as i64)
-    } else {
-        let half = 1i64 << (bits_per_channel_slot - 1);
-        (-half, half - 1)
-    }
-}
-
-/// Writes `value` back into `word`'s low `bits_per_channel_slot`-wide slot
-/// field, preserving any bits outside that field.
-fn write_slot_field(word: &mut u32, bits_per_channel_slot: u32, value: i32) {
-    if bits_per_channel_slot >= 32 {
-        *word = value as u32;
-    } else {
-        let mask = (1u32 << bits_per_channel_slot) - 1;
-        *word = (*word & !mask) | ((value as u32) & mask);
-    }
-}
-
-/// Removes the DC component from the driven (even-indexed/left-slot) raw I2S
-/// FIFO words, then applies a capture-time digital gain in place.
-///
-/// `ptt_gain` is a diagnostic knob for the "this mic reads very quietly"
-/// experiment. Subtracting the per-chunk mean *first* is essential: the
-/// SPH0645 sits on a large DC offset (~-6113 in its 18-bit field on the
-/// captain's hardware), so multiplying the raw value by any useful gain would
-/// rail immediately and reveal nothing. Each driven word's
-/// `bits_per_channel_slot`-wide field is sign-extended (its sign bit is at
-/// `bits_per_channel_slot - 1`, not 31, for a narrow slot), amplified with
-/// saturating arithmetic clamped to that field's range, and written back into
-/// that same field, so the scaled raw payload is the scaled version of the
-/// sample the PCM path would extract. The undriven (odd-indexed/right-slot)
-/// words are left untouched. A gain of `1` (the default) returns immediately,
-/// leaving every word byte-for-byte identical to the un-gained capture.
-pub fn remove_dc_and_gain_words(raw: &mut [u32], bits_per_channel_slot: u32, gain: u32) {
-    if gain <= 1 {
-        return;
-    }
-    let bits = bits_per_channel_slot.clamp(1, 32);
-    let gain = gain.min(i32::MAX as u32) as i64;
-    let mut sum: i64 = 0;
-    let mut count: i64 = 0;
-    for word in raw.iter().step_by(2) {
-        sum += slot_field_signed(*word, bits) as i64;
-        count += 1;
-    }
-    if count == 0 {
-        return;
-    }
-    let mean = sum / count;
-    let (min, max) = slot_field_range(bits);
-    for word in raw.iter_mut().step_by(2) {
-        let ac = slot_field_signed(*word, bits) as i64 - mean;
-        let scaled = ac.saturating_mul(gain).clamp(min, max) as i32;
-        write_slot_field(word, bits, scaled);
-    }
-}
-
-/// The sample-domain counterpart of [`remove_dc_and_gain_words`] for the
-/// production PCM path: subtracts the chunk mean from the extracted mono
-/// samples, then scales the remainder with saturating `i16` arithmetic. A gain
-/// of `1` is a no-op, so the configured-out device is unchanged. This removes
-/// the DC offset before amplifying, which is what makes any useful gain reveal
-/// the AC signal instead of railing on the offset.
-pub fn remove_dc_and_gain_samples(pcm: &mut [i16], gain: u32) {
-    if gain <= 1 || pcm.is_empty() {
-        return;
-    }
-    let gain = gain.min(i32::MAX as u32) as i32;
-    let sum: i64 = pcm.iter().map(|&s| s as i64).sum();
-    let mean = (sum / pcm.len() as i64) as i32;
-    for sample in pcm.iter_mut() {
-        let ac = *sample as i32 - mean;
-        *sample = ac
-            .saturating_mul(gain)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-    }
-}
-
-/// Integer square root (Newton), used by the capture-path level meter so the
-/// capture hot path does no floating-point work.
 fn integer_sqrt(value: u64) -> u64 {
     if value == 0 {
         return 0;
@@ -254,43 +157,10 @@ fn windowed_ac_level(len: usize, sample: impl Fn(usize) -> i32) -> u32 {
 /// of per-window AC RMS (see [`windowed_ac_level`]). Integer-only and linear,
 /// so a mic on its noise floor reads near zero while speech drives it up; the
 /// raw value is the number of `i16` counts, which the overlay maps to a bar.
-/// Tracks `ptt_gain`: the firmware computes it on the upload task from the
-/// samples `remove_dc_and_gain_samples` already processed, so a non-default
-/// diagnostic gain scales the meter exactly as it scales the streamed audio.
+/// The firmware computes it on the upload task from the samples it has already
+/// drained from the audio ring, never on the DMA capture path.
 pub fn ac_rms_level(samples: &[i16]) -> u32 {
     windowed_ac_level(samples.len(), |i| samples[i] as i32)
-}
-
-/// The same robust level for a raw `ptt_raw` chunk, measured over the driven
-/// (even-indexed/left-slot) words' sample field for the configured slot width -
-/// the exact bits [`extract_left_channel_pcm`] would extract - so the level
-/// meter and the streamed payload read the same field in both modes, and a
-/// narrow raw slot cannot meter zero while carrying signal.
-pub fn ac_rms_level_words(raw: &[u32], bits_per_channel_slot: u32) -> u32 {
-    let count = raw.len().div_ceil(2);
-    windowed_ac_level(count, |i| {
-        slot_sample(raw[2 * i], bits_per_channel_slot) as i32
-    })
-}
-
-/// Level-meter value for a raw `ptt_raw` chunk exactly as the audio ring holds
-/// it: one little-endian `u32` word written as two `i16` halves (low half
-/// first, per `AudioRing::write_u32_words`), so rebuild each word and meter the
-/// driven (even-indexed) slot's sample field like [`ac_rms_level_words`].
-///
-/// This is the raw-mode half of the meter the upload task computes from the
-/// samples it has already drained, which is what keeps all level-meter work off
-/// the DMA capture path. It assumes `pairs[0]` is the low half of a word:
-/// `AudioRing` writes whole raw words and drops them whole on overflow, so a
-/// drained stream never starts on a word's high half. A trailing half with no
-/// partner word is ignored.
-pub fn ac_rms_level_word_pairs(pairs: &[i16], bits_per_channel_slot: u32) -> u32 {
-    let count = (pairs.len() / 2).div_ceil(2);
-    windowed_ac_level(count, |i| {
-        let lo = pairs[i * 4] as u16 as u32;
-        let hi = pairs[i * 4 + 1] as u16 as u32;
-        slot_sample(lo | (hi << 16), bits_per_channel_slot) as i32
-    })
 }
 
 #[cfg(test)]
@@ -413,107 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn gain_of_one_is_a_byte_for_byte_no_op_on_words() {
-        let mut raw = [0xDEAD_BEEFu32, 0x0000_0000, 0x7FFF_FFFF];
-        let original = raw;
-        remove_dc_and_gain_words(&mut raw, 32, 1);
-        assert_eq!(raw, original);
-    }
-
-    #[test]
-    fn words_gain_removes_dc_then_amplifies_the_deviation() {
-        // The driven words sit at a big DC plateau (0xFFFF_F000) with a small
-        // AC part; 0xFFFF_F800 is +2048 above the mean, 0xFFFF_E800 is -2048.
-        // Odd (undriven) words must be left alone.
-        let mut raw = [
-            0xFFFF_F000u32,
-            0x0000_0000,
-            0xFFFF_F800u32,
-            0x0000_0000,
-            0xFFFF_E800u32,
-        ];
-        remove_dc_and_gain_words(&mut raw, 32, 16);
-        assert_eq!(raw[0], 0);
-        assert_eq!(raw[1], 0); // undriven slot untouched
-        assert_eq!(raw[2], (2048i32 * 16) as u32);
-        assert_eq!(raw[3], 0);
-        assert_eq!(raw[4], (-2048i32 * 16) as u32);
-    }
-
-    #[test]
-    fn words_gain_saturates_at_the_i32_limits_instead_of_wrapping() {
-        // Two driven words at the i32 extremes: the mean is 0, so each scales
-        // from its extreme and must clamp, not wrap into a plausible-looking
-        // but nonsense value. The undriven slot is untouched.
-        let mut raw = [0x7FFF_FFFFu32, 0x0000_0000, 0x8000_0000u32];
-        remove_dc_and_gain_words(&mut raw, 32, 4096);
-        assert_eq!(raw[0], i32::MAX as u32);
-        assert_eq!(raw[1], 0);
-        assert_eq!(raw[2], i32::MIN as u32);
-    }
-
-    #[test]
-    fn words_gain_sign_extends_the_configured_slot_width() {
-        // A 16-bit slot leaves its sample zero-extended in the low 16 bits, so
-        // the sign bit is bit 15, not bit 31. +100/-100/+400 must be centred
-        // and scaled around the field's true mean (133) - treating 0xFF9C as
-        // +65436 would centre on 21978 and produce a completely different
-        // payload.
-        let mut raw = [
-            0x0000_0064u32, // +100
-            0xFFFF_FFFFu32, // undriven sentinel
-            0x0000_FF9Cu32, // -100
-            0xFFFF_FFFFu32,
-            0x0000_0190u32, // +400
-        ];
-        remove_dc_and_gain_words(&mut raw, 16, 2);
-        assert_eq!(raw[0] as u16 as i16, -66); // (100 - 133) * 2
-        assert_eq!(raw[2] as u16 as i16, -466); // (-100 - 133) * 2
-        assert_eq!(raw[4] as u16 as i16, 534); // (400 - 133) * 2
-        // The undriven slots keep their original bytes.
-        assert_eq!(raw[1], 0xFFFF_FFFF);
-        assert_eq!(raw[3], 0xFFFF_FFFF);
-    }
-
-    #[test]
-    fn words_gain_clamps_to_the_narrow_field_range_instead_of_wrapping() {
-        // At the i16 extremes with x2 the mean is 0, so doubling each sample
-        // would overflow the 16-bit field; it must clamp to the field's rails
-        // rather than wrap (0x7FFE * 2 masked would read -2).
-        let mut raw = [0x0000_7FFFu32, 0x0000_0000, 0x0000_8000u32];
-        remove_dc_and_gain_words(&mut raw, 16, 2);
-        assert_eq!(raw[0] as u16 as i16, i16::MAX);
-        assert_eq!(raw[1], 0);
-        assert_eq!(raw[2] as u16 as i16, i16::MIN);
-    }
-
-    #[test]
-    fn samples_gain_is_a_no_op_for_one_and_removes_dc_otherwise() {
-        let mut unchanged = [100i16, -100, 50, -50];
-        let original = unchanged;
-        remove_dc_and_gain_samples(&mut unchanged, 1);
-        assert_eq!(unchanged, original);
-
-        // Mean is 0 here, so a x4 gain scales each sample exactly.
-        let mut pcm = [10i16, -10, 5, -5];
-        remove_dc_and_gain_samples(&mut pcm, 4);
-        assert_eq!(pcm, [40, -40, 20, -20]);
-
-        // A DC-offset chunk is centred first: all four samples share +1000,
-        // which must be removed rather than amplified into the rail.
-        let mut offset = [1001i16, 999, 1002, 998];
-        remove_dc_and_gain_samples(&mut offset, 4);
-        assert_eq!(offset, [4, -4, 8, -8]);
-    }
-
-    #[test]
-    fn samples_gain_clamps_instead_of_wrapping() {
-        let mut pcm = [i16::MAX, i16::MIN];
-        remove_dc_and_gain_samples(&mut pcm, 4096);
-        assert_eq!(pcm, [i16::MAX, i16::MIN]);
-    }
-
-    #[test]
     fn ac_level_ignores_dc_and_measures_the_deviation() {
         // A flat DC chunk is silence no matter how large the offset.
         assert_eq!(ac_rms_level(&[1234i16; 80]), 0);
@@ -546,124 +315,5 @@ mod tests {
             "sustained signal read too low: {}",
             ac_rms_level(&loud)
         );
-    }
-
-    #[test]
-    fn word_level_matches_the_pcm_level_on_the_driven_slot() {
-        // 16 driven words (even indices) alternating +/-100; the undriven odd
-        // words must be ignored entirely. The sample sits in the top 16 bits,
-        // matching what the PCM path extracts.
-        let mut raw = [0u32; 32];
-        for k in 0..16 {
-            let v: i32 = if k % 2 == 0 { 100 } else { -100 };
-            raw[2 * k] = (v << 16) as u32;
-        }
-        assert_eq!(ac_rms_level_words(&raw, 32), 100);
-        // A flat driven slot is silence.
-        let mut flat = [0u32; 32];
-        for k in 0..16 {
-            flat[2 * k] = (5000i32 << 16) as u32;
-        }
-        assert_eq!(ac_rms_level_words(&flat, 32), 0);
-    }
-
-    #[test]
-    fn pair_encoded_raw_words_meter_the_same_as_words() {
-        // The ring stores each raw word as its low i16 half then its high half,
-        // so metering the drained pairs must reproduce the word-based level -
-        // this is the upload task's raw-mode meter now that the meter is off
-        // the DMA capture path.
-        fn encode(words: &[u32]) -> [i16; 64] {
-            let mut pairs = [0i16; 64];
-            for (i, &word) in words.iter().enumerate() {
-                pairs[i * 2] = word as u16 as i16;
-                pairs[i * 2 + 1] = (word >> 16) as u16 as i16;
-            }
-            pairs
-        }
-        let mut raw = [0u32; 32];
-        for k in 0..16 {
-            let v: i32 = if k % 2 == 0 { 100 } else { -100 };
-            raw[2 * k] = (v << 16) as u32;
-        }
-        let pairs = encode(&raw);
-        assert_eq!(
-            ac_rms_level_word_pairs(&pairs, 32),
-            ac_rms_level_words(&raw, 32)
-        );
-        assert_eq!(ac_rms_level_word_pairs(&pairs, 32), 100);
-        // A flat driven slot is silence, and an odd trailing half is ignored
-        // rather than read out of bounds.
-        let mut flat = [0u32; 32];
-        for k in 0..16 {
-            flat[2 * k] = (5000i32 << 16) as u32;
-        }
-        let flat_pairs = encode(&flat);
-        assert_eq!(ac_rms_level_word_pairs(&flat_pairs, 32), 0);
-        assert_eq!(ac_rms_level_word_pairs(&flat_pairs[..63], 32), 0);
-    }
-
-    #[test]
-    fn word_level_reads_the_configured_slot_width_like_the_payload() {
-        // A 16-bit slot keeps its samples in the low 16 bits, so a meter that
-        // always read the top 16 would stay pinned at zero. The meter must
-        // follow the same field `extract_left_channel_pcm` puts on the wire.
-        let mut raw = [0u32; 32];
-        for k in 0..16 {
-            raw[2 * k] = if k % 2 == 0 { 100 } else { 0xFFFF_FF9C }; // +100 / -100
-        }
-        let mut pcm = [0i16; 16];
-        extract_left_channel_pcm(&raw, &mut pcm, 16);
-        assert_eq!(&pcm[..4], &[100, -100, 100, -100]);
-        assert_eq!(ac_rms_level_words(&raw, 16), ac_rms_level(&pcm));
-        assert_eq!(ac_rms_level_words(&raw, 16), 100);
-        // The same words through the 32-bit field are a plateau in the top 16
-        // bits, so this also proves the width argument changes what is read.
-        assert!(ac_rms_level_words(&raw, 32) < 100);
-    }
-
-    /// The raw meter pairs the drained `i16` halves back into `u32` words, so
-    /// it depends on the ring never splitting a word across its head. An odd
-    /// ring capacity is exactly where the old one-sample eviction left an odd
-    /// number of halves and shifted the pairing, making the meter read the
-    /// undriven slot (or a half-swapped mashup) instead of the driven one.
-    /// Here the drained stream must stay whole words and the meter must read
-    /// the driven slots' real level.
-    #[test]
-    fn raw_meter_stays_aligned_across_a_word_overflow() {
-        use crate::audio_ring::AudioRing;
-
-        // Alternating driven (+100/-100) and undriven (0) slots, as a chunk of
-        // a `ptt_raw` capture would carry at a 32-bit slot.
-        let words: [u32; 40] = core::array::from_fn(|i| {
-            if i % 2 == 0 {
-                let sample: i16 = if (i / 2) % 2 == 0 { 100 } else { -100 };
-                (sample as u16 as u32) << 16
-            } else {
-                0
-            }
-        });
-        // 65 samples holds 32 whole words; the odd capacity is what made the
-        // old one-sample-at-a-time eviction drop an odd number of halves.
-        let mut ring = AudioRing::<65>::new();
-        for &word in &words {
-            ring.write_u32_words(1, &[word]);
-        }
-
-        let mut pairs = [0i16; 64];
-        let n = ring.read(1, &mut pairs);
-        assert_eq!(n, 64, "the ring should hold 32 whole words");
-
-        // The drain must start on a word's low half, not a split high half.
-        let held: &[u32] = &words[words.len() - 32..];
-        assert_eq!(pairs[0] as u16, held[0] as u16);
-        assert_eq!(pairs[1] as u16, (held[0] >> 16) as u16);
-
-        let driven: [i16; 16] = core::array::from_fn(|k| slot_sample(held[2 * k], 32));
-        assert_eq!(
-            ac_rms_level_word_pairs(&pairs[..n], 32),
-            ac_rms_level(&driven)
-        );
-        assert_eq!(ac_rms_level_word_pairs(&pairs[..n], 32), 100);
     }
 }

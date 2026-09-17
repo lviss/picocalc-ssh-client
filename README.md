@@ -18,7 +18,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 *   **Local Shell**: Built-in commands for device management (WiFi config, battery status, backlight control).
 *   **Battery Overlay**: Short-press the power button at any time, even mid-SSH-session, for a brief on-screen battery readout that dismisses itself.
 *   **SD Card Key Backup**: Save the SSH private key to the SD card and restore it afterwards, so erasing flash (e.g. `flash_nuke.uf2`) doesn't cost you a freshly generated key and a re-authorisation on every server.
-*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a configurable network host (see below) for off-device transcription.
+*   **Push-to-Talk Voice Capture**: Hold a button to stream microphone audio to a server-side helper over the SSH session (which transcribes it with Whisper and types it into your tmux pane).
 *   **Hardware Accelerated**: Uses the RP2350's capabilities and the ILI9488 display for fast rendering.
 
 ## Hardware Requirements
@@ -331,16 +331,143 @@ entirely by the keyboard co-processor and doesn't involve this firmware.
 ### Push-to-Talk Voice Capture
 
 Hold `F1` (plain, no modifiers - see `src/keyboard.rs` if you want to rebind
-it to a different key) to capture microphone audio and stream it to a
-network host of your choice — for
-example, a companion process on your SSH server that runs speech-to-text and
-injects the resulting text into your session. Configure the destination
-before using it:
+it to a different key) and speak: the audio goes down a *second SSH channel* on
+the session you already have, a helper on the server transcribes it with
+Whisper, and the text is typed into your tmux session.
+
+Push-to-talk is an SSH feature: with no session up there is nowhere for the
+audio to go, so pressing `F1` shows `no ssh session: not recording` instead of
+recording.
+
+#### Transcribing into your tmux session
+
+While an SSH session is connected, `F1` opens a *second SSH channel* on that
+same connection and streams the audio down it:
+
+```
+PicoCalc --(ssh terminal channel)---------------------> your shell in tmux
+         --(ssh audio channel: the helper)--> whisper --> tmux send-keys
+```
+
+Nothing new listens on the server, and nothing new is authenticated: the audio
+rides the connection the device already has, and the helper runs as you, with
+your permissions, exactly as your shell does. A port forward was the
+alternative, but either direction needs a listening socket (on the server, or
+on the device), and this firmware's SSH stack (`sunset`) implements no
+forwarding at all - so a channel on the session is both the lighter change and
+the smaller security surface.
+
+**Setup is two things on the server: `python3`, and whisper.** Either
+`whisper-cli` (whisper.cpp) with a model, or `openai-whisper`. Nothing has to be
+copied, installed or placed on `PATH`: the device carries the helper
+(`tools/picocalc-ptt`) inside its firmware and sends it down the channel at the
+start of every session, and the helper configures itself:
+
+*   with `whisper-cli`, it uses the first model it finds - `$PICOCALC_PTT_MODEL`
+    if you set it, otherwise `~/models/ggml-base.en.bin`,
+    `~/models/ggml-base.bin`, `~/.cache/whisper/ggml-base.bin` and the other
+    usual locations, then any `~/models/ggml-*.bin`;
+*   with `openai-whisper`, it runs `whisper %wav --model base`, which downloads
+    the `base` model itself on first use;
+*   with neither, it says so on the device and names both options.
+
+The transcript goes to the active tmux pane (or `tmux_target` if you set one),
+with a trailing space so consecutive dictations do not run together, and no
+Enter unless you ask for one.
+
+`~/.config/picocalc-ptt.conf` is **optional**, for overriding the defaults:
+
+```ini
+# ~/.config/picocalc-ptt.conf
+whisper = whisper-cli -m ~/models/ggml-large-v3.bin -f %wav -nt -np
+tmux_target = work     # default: tmux's most recently used session
+tmux_socket = /run/user/1000/tmux-1000/default   # only if tmux's socket is not found
+enter = yes            # also press Enter after typing
+rate = 16000           # must match the device's ptt_rate
+```
+
+`%wav` is replaced by the capture's WAV path and `%dir` by a private working
+directory. The transcript is read from the command's standard output, or from
+`%dir/picocalc-ptt.txt` when it printed nothing there - which is what both
+whisper.cpp's `-of` and openai-whisper's `--output_dir` write.
+
+The helper talks to tmux on its own default socket, and finds a server started
+under a different `TMUX_TMPDIR` (the systemd runtime directory, for instance)
+by trying the usual places at startup. If it cannot reach your session it says
+so on the device, naming the socket it tried: set `tmux_socket` to the path from
+`tmux display-message -p '#{socket_path}'` run inside your session.
+
+##### Replacing the helper
+
+The device runs whatever `config set ptt_ssh_cmd` names, so you can point it at
+your own script instead of the built-in one:
 
 ```bash
-$ config set ptt_host mymachine.example.com
-$ config set ptt_port 9000
+$ config set ptt_ssh_cmd /home/me/bin/picocalc-ptt --tmux-target work
+$ config get ptt_ssh_cmd        # the command the next session will run
+$ config set ptt_ssh_cmd ""     # empty disables it (see below)
 ```
+
+`config get ptt_ssh_cmd` is the authoritative readout: it prints `(built-in
+helper)` when nothing is configured, your command when one is, and `(disabled)`
+when the stored value is empty. `config list` only dumps the stored keys (a
+32-entry map) without resolving this one, so `ptt_ssh_cmd` is absent from it
+until it has actually been set. The command is resolved once, when a session
+starts, so changing `ptt_ssh_cmd` does not affect a session that is already
+connected - log out and reconnect (or reboot) before testing a new value.
+
+The device's own command line is split on single spaces with no quote handling,
+so a custom command is set **unquoted**, word by word, and the value may be at
+most 128 bytes: quote characters would be stored literally and then reach the
+remote shell as literal quotes.
+
+Setting `ptt_ssh_cmd` to empty turns push-to-talk off: the device opens no
+channel, and pressing `F1` during a session shows `ptt unavailable: the
+session's audio channel is not running` (with no session at all, it shows
+`no ssh session: not recording` as always).
+
+If the helper cannot be started or it exits - a server without `python3` or
+whisper, a crashed helper - **only push-to-talk is affected: the SSH session
+itself keeps working normally**, and pressing `F1` shows `ptt unavailable: the
+session's audio channel is not running` for a couple of seconds. The rest of
+that utterance is dropped rather than silently queued.
+
+Push-to-talk's diagnostics go to the device's **log** (the USB serial console)
+rather than its screen while a session is up: the screen *is* the session's
+terminal, so writing diagnostic lines into it would corrupt or scroll whatever
+the server is printing, including the transcript being typed into tmux. With no
+session up they are printed on the device as usual. Run `tools/picocalc-ptt
+--help` for the helper's options and `python3 tools/test_picocalc_ptt.py` for
+its tests, which need neither whisper nor tmux.
+
+#### Microphone wiring
+
+Push-to-talk drives a digital I2S microphone from three expansion-header pins,
+and the firmware expects the mic's data and both clock lines on exactly these:
+
+| microphone pin | PicoCalc pin | direction |
+| --- | --- | --- |
+| `BCLK` (bit clock) | `GP2` | driven by the firmware |
+| `WS` / `LRCLK` (word select) | `GP3` | driven by the firmware |
+| `DOUT` / `SD` (serial data) | `GP21` | driven by the microphone |
+| `SEL` (channel select) | left-channel setting | wire it so the mic drives the *left* slot, which is the one the firmware extracts |
+| `3V` / `GND` | `3V3` / `GND` | power and ground |
+
+`GP2`, `GP3` and `GP21` are also wired to the PicoCalc's PSRAM chip (its
+`RAM_TX`/`RAM_RX`/`RAM_SCK` lines); that is safe here because this firmware
+only reaches PSRAM over the RP2350's internal QMI/XIP hardware path, which
+uses a separate, RP2350-internal chip-select pad rather than these pins - see
+`README-DEVICE.md` and `src/psram.rs`. If your mic
+is strapped to the right channel instead, the capture keeps the wrong I2S slot
+and records silence; `terminal_model::pcm_extract::extract_left_channel_pcm`
+documents the one-line change for that case.
+
+The firmware was brought up against an Adafruit SPH0645 breakout. That mic has
+a fixed 32-bit slot per channel, which is why the defaults (`ptt_bits=32`,
+`ptt_rate=16000`) clock it at 1.024 MHz - the bottom of its documented clock
+range. The settings below exist for bringing up a different microphone.
+
+#### Microphone bring-up and diagnostics
 
 For bringing up a new microphone there are also optional debug settings. They
 take effect on the *next* recording without a rebuild or reflash, and default to
@@ -350,32 +477,17 @@ the documented-correct values:
 $ config set ptt_bits 32     # I2S channel slot width in bits (default 32)
 $ config set ptt_rate 16000  # sample rate in Hz (default 16000)
 $ config set ptt_edge 1      # invert the BCLK sampling edge (default 0)
-$ config set ptt_raw 1       # stream raw FIFO words instead of PCM (default 0)
-$ config set ptt_gain 256    # x256 DC-removed capture gain, 1-4096 (default 1)
 ```
 
-`ptt_gain` is a diagnostic for a very quiet microphone: it subtracts each
-capture chunk's DC offset and then amplifies what is left (saturating, so it
-clips rather than wraps), in both the PCM and `ptt_raw` paths. A gain of `1`
-(the default) does no DC removal and no scaling, so an unconfigured device is
-byte-for-byte unchanged. It cannot conjure a signal that is not there - it only
-makes a faint one easier to see.
-
-The microphone has no hardware gain register (its `SEL` pin only selects the
-left/right slot), so `ptt_gain` is explicitly a **diagnostic**: real gain and
-normalization belong in the receiving/transcription pipeline, where the audio is
-consumed, and the device ships its native sample levels. While recording, the
-overlay also draws a realtime input meter under "recording..." - it shows a
-windowed DC-removed level (a median across the chunk's sub-windows), so a mic
-sitting on its noise floor reads empty and sustained speech fills the bar (it
-turns red if the input is pinned) - making "hold `F1` and speak" the quickest
-"is the mic hearing anything?" check. Note: a separate, real per-chunk capture
-glitch (a few extreme samples once per 25 ms DMA transfer) is still present in
-the streamed audio; the windowed median keeps it from dominating the meter,
-but it is a firmware/I2S-path defect that remains open. The mic's audio path
-is proven to carry real speech (verified against real captures independently
-transcribable by openai-whisper and whisper.cpp) - see `AGENTS.md` for the
-capture analysis and the still-open per-chunk glitch.
+These exist for a different microphone than the one this firmware was brought
+up against (an Adafruit SPH0645 breakout, whose fixed 32-bit slot at 16 kHz is
+the default). While recording, the overlay draws a realtime input meter under
+"recording..." - a windowed DC-removed level, so a mic sitting on its noise
+floor reads empty and sustained speech fills the bar (it turns red if the input
+is pinned) - making "hold `F1` and speak" the quickest "is the mic hearing
+anything?" check. The mic's audio path is proven to carry real speech
+(verified against real captures independently transcribable by openai-whisper
+and whisper.cpp); see `AGENTS.md` for the capture analysis.
 
 `ptt_bits`/`ptt_rate` must keep the resulting bit clock (`rate * bits * 2`)
 inside the SPH0645's documented 1.024-4.096 MHz window; an out-of-window pair is
@@ -390,14 +502,15 @@ store still holds, and a `config set` that would make that stale value effective
 again is refused rather than silently changing the reported setting.
 
 A small "recording..." overlay is shown while the button is held.
-Transcription itself is not implemented by this firmware — it only captures
-and streams raw audio; see AGENTS.md for the wire format a receiving process
-needs to speak, and README-DEVICE.md for the mic's I2S pin wiring.
+Transcription is not implemented by this firmware — it only captures and
+streams raw audio; see AGENTS.md for the wire format a receiving process
+needs to speak, README-DEVICE.md for the mic's I2S pin wiring, and
+`tools/picocalc-ptt` for the transcribing end of the SSH transport.
 
 > [!NOTE]
-> This requires a digital I2S microphone wired to the pins documented in
-> README-DEVICE.md. It streams audio unencrypted over a plain TCP
-> connection; only use it on a network you trust.
+> This requires a digital I2S microphone wired to the pins in the
+> [Microphone wiring](#microphone-wiring) section above. The audio never leaves
+> the SSH session, so it is encrypted end to end by the session itself.
 
 ### Local Commands
 

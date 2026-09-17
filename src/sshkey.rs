@@ -69,7 +69,9 @@ async fn write_public_key_to_sd(encoded: &heapless::String<96>) {
     let mut vol = match mgr.open_volume(VolumeIdx(0)) {
         Ok(vol) => vol,
         Err(err) => {
-            print!("Failed to open vol0: {err:?}; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n");
+            print!(
+                "Failed to open vol0: {err:?}; not mirroring the public key to {PUBLIC_KEY_FILE_NAME}.\r\n"
+            );
             return;
         }
     };

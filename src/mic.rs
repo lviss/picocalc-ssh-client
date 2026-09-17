@@ -1,45 +1,57 @@
 //! Push-to-talk voice capture: a PIO-driven I2S RX driver for a digital mic
 //! wired to the expansion-header pins freed by dropping the slow PSRAM path
 //! (see AGENTS.md and `psram.rs`), plus the task that streams captured audio
-//! to a configurable network host.
+//! down the SSH session's audio channel (see `crate::net`). With no session up
+//! there is nowhere to send audio, so the button says so instead of recording.
 //!
 //! Audio is staged between the capture and upload tasks in a fixed,
 //! allocation-free static ring buffer (`terminal_model::audio_ring`), not on
 //! the heap. Capture never blocks and never allocates; when the network side
-//! falls behind, the ring drops its oldest samples, so a slow or unreachable
-//! `ptt_host` can at worst lose audio, never stall the I2S clock or exhaust
-//! the firmware heap. This holds regardless of whether a PSRAM heap tier is
-//! present or working.
+//! falls behind, the ring drops its oldest samples, so a congested SSH session
+//! can at worst lose audio, never stall the I2S clock or exhaust the firmware
+//! heap. This holds regardless of whether a PSRAM heap tier is present or
+//! working.
 //!
-//! The I2S slot width, sample rate, bit-clock edge polarity, raw-passthrough
-//! mode and diagnostic capture gain are runtime settings read from the
-//! persisted config store (`ptt_bits`/`ptt_rate`/`ptt_edge`/`ptt_raw`/
-//! `ptt_gain`, see [`load_settings`]) at the start of every recording. The PIO
+//! The DMA side is decoupled from CPU timing the same way: the channel copies
+//! the PIO RX FIFO into its own circular buffer ([`DMA_RING`]) in the RP2350's
+//! endless transfer mode with the write address wrapped on the ring, and
+//! [`capture_task`] only drains that buffer every `DMA_POLL_INTERVAL`. Nothing
+//! about the microphone's bit clock depends on how quickly the CPU gets back to
+//! it - with a one-shot transfer per chunk, the eight-word FIFO filled while
+//! the next transfer was armed, the state machine stalled on `in`, and the
+//! clock stopped for as long as the CPU was late (which is what silenced
+//! captures under an SSH session's load, and what the old per-chunk
+//! plateau-and-glitch artifact was). Being late now only costs whatever audio
+//! the ring had to overwrite.
+//!
+//! The I2S slot width, sample rate and bit-clock edge polarity are runtime
+//! settings read from the persisted config store (`ptt_bits`/`ptt_rate`/
+//! `ptt_edge`, see [`load_settings`]) at the start of every recording. The PIO
 //! program is assembled on the device at that point rather than by `pio_asm!`,
 //! so a `config set` takes effect on the next utterance without a reflash or
 //! reboot. An out-of-window slot/rate pair is refused at the console and falls
 //! back to the default rather than silently mis-clocking the mic.
 //!
 //! Wire format: see AGENTS.md's push-to-talk entry for the authoritative
-//! framing contract a receiving process must speak (one TCP connection per
-//! utterance, opened on button press and closed on release; a 4-byte
-//! little-endian length prefix per frame, then mono PCM at `ptt_rate` - or the
-//! raw FIFO words under `ptt_raw=1`).
+//! framing contract a receiving process must speak, and
+//! [`terminal_model::ptt_frame`] for the encoder: a 4-byte little-endian
+//! length prefix per frame, then mono PCM at `ptt_rate`. The session's channel
+//! stays open, so an utterance ends with a zero-length frame rather than by
+//! closing a connection.
 
 use crate::Irqs;
 use crate::config::{CONFIG, Configuration, StrValue};
-use crate::net::stack;
 use crate::screen::SCREEN;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
-use embassy_net::IpEndpoint;
-use embassy_net::dns::{DnsQueryType, DnsSocket};
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::PeripheralRef;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel as _;
+use embassy_rp::pac::dma::vals::{DataSize, TransCountMode, TreqSel};
 use embassy_rp::peripherals::{DMA_CH4, PIN_2, PIN_3, PIN_21, PIO2};
 use embassy_rp::pio::{
     Config, Direction, FifoJoin, LoadedProgram, Pin, Pio, ShiftConfig, ShiftDirection,
@@ -47,20 +59,17 @@ use embassy_rp::pio::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, with_timeout};
-use embedded_io_async::Write as _;
+use embassy_time::{Duration, Instant, Ticker};
 use fixed::traits::ToFixed;
 use terminal_model::audio_ring::{AudioRing, utterance_ended};
 use terminal_model::i2s_program::build_i2s_rx_program;
 use terminal_model::mic_config::{
-    BITS_KEY, CHANNELS, DEFAULT_BITS, DEFAULT_RATE_HZ, EDGE_KEY, GAIN_KEY, MicSettings, RATE_KEY,
-    RAW_KEY, reconcile as reconcile_mic_settings, report_setting as report_mic_setting,
+    BITS_KEY, CHANNELS, DEFAULT_RATE_HZ, EDGE_KEY, MicSettings, RATE_KEY,
+    reconcile as reconcile_mic_settings, report_setting as report_mic_setting,
     validate_setting_with_store as validate_mic_setting,
 };
-use terminal_model::pcm_extract::{
-    ac_rms_level, ac_rms_level_word_pairs, bit_clock_hz, extract_left_channel_pcm,
-    remove_dc_and_gain_samples, remove_dc_and_gain_words,
-};
+use terminal_model::pcm_extract::{ac_rms_level, bit_clock_hz, extract_left_channel_pcm};
+use terminal_model::{dma_ring, ptt_frame};
 
 extern crate alloc;
 
@@ -68,9 +77,13 @@ extern crate alloc;
 /// 20-50 ms guidance. A chunk is a fixed number of samples, so a non-default
 /// `ptt_rate` changes its duration but not the buffer sizes.
 const SAMPLES_PER_CHUNK: usize = DEFAULT_RATE_HZ as usize / 40;
+/// Bytes of the wire frame one capture chunk is sent as: the length prefix plus
+/// the samples, per `terminal_model::ptt_frame`. The SSH session sizes its
+/// fixed audio queue with this, so the two cannot drift apart.
+pub const WIRE_FRAME_BYTES: usize = ptt_frame::frame_bytes(SAMPLES_PER_CHUNK);
 /// Capacity of the shared capture/upload ring, in `i16` samples: 2048 samples
-/// at 16 kHz is 128 ms of audio, enough to absorb ordinary connection-setup
-/// and scheduling jitter without being a meaningful memory cost. This buffer
+/// at 16 kHz is 128 ms of audio, enough to absorb ordinary scheduling jitter
+/// without being a meaningful memory cost. This buffer
 /// is a plain `static` compiled into `.bss`, so - unlike the heap-allocated
 /// per-chunk `Box`es it replaces - it does not draw on the 64 KiB `DualHeap`
 /// the WiFi/TCP/SSH stack and screen scrollback share, and therefore cannot
@@ -78,10 +91,6 @@ const SAMPLES_PER_CHUNK: usize = DEFAULT_RATE_HZ as usize / 40;
 /// samples instead). The behavior does not depend on a PSRAM heap tier
 /// existing or working.
 const RING_SAMPLES: usize = 2048;
-/// Upper bound on DNS + TCP connect for one utterance, so an unreachable
-/// `ptt_host` cannot leave that utterance's upload pending indefinitely
-/// (smoltcp's SYN retry backoff can otherwise run for a long time).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound on a single push-to-talk recording. A `Released` report is the
 /// normal way to end one, but the keyboard co-processor link can drop a
 /// transition (missed poll, I2C glitch) with no automatic recovery until some
@@ -89,6 +98,26 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// running, "recording..." overlay stuck) to a minute, far longer than any
 /// normal utterance.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(60);
+
+/// Words in the capture DMA's circular buffer: the DMA writes the PIO RX FIFO
+/// into it in hardware (endless transfer mode, write address wrapped on the
+/// ring) so the FIFO is drained with no CPU in the loop. Must be a power of two
+/// (the DMA wraps the address on a `1 << DMA_RING_BITS` byte boundary) and even
+/// (one L+R frame is two words, so an odd size would flip the left/right parity
+/// across a wrap). 2048 words is 1024 frames, i.e. 64 ms of mono audio at
+/// 32-bit slots - the slack the consumer gets before the DMA laps it.
+const DMA_RING_WORDS: usize = 2048;
+/// `log2` of the ring's size in bytes, which is what the DMA's RING_SIZE field
+/// wants (`DMA_RING_WORDS * 4 == 1 << DMA_RING_BITS`).
+const DMA_RING_BITS: u8 = 13;
+/// Words left unread behind the DMA's write head, so a read can never race the
+/// word being written right now. Even, which is what keeps a drained run whole
+/// L+R frames.
+const DMA_RING_MARGIN: usize = 2;
+/// How often the consumer drains the DMA ring while a recording runs: often
+/// enough to keep the ring nearly empty (it holds 64 ms), cheap enough to cost
+/// nothing next to the audio it moves.
+const DMA_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// A stored `ptt_*` key the final store state still does not resolve to its
 /// effective value, with the value the store holds.
@@ -141,14 +170,10 @@ async fn read_and_reconcile() -> StoreOutcome {
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
     let rate = config.fetch(RATE_KEY).await.ok().flatten();
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
-    let raw = config.fetch(RAW_KEY).await.ok().flatten();
-    let gain = config.fetch(GAIN_KEY).await.ok().flatten();
     let (_, fixes, clock_pair) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
-        raw.as_ref().map(|v| v.as_str()),
-        gain.as_ref().map(|v| v.as_str()),
     );
     let mut write_errors: Vec<(&'static str, String)> = Vec::new();
     if let Some(pair) = &clock_pair {
@@ -176,14 +201,10 @@ async fn read_and_reconcile() -> StoreOutcome {
     let bits = config.fetch(BITS_KEY).await.ok().flatten();
     let rate = config.fetch(RATE_KEY).await.ok().flatten();
     let edge = config.fetch(EDGE_KEY).await.ok().flatten();
-    let raw = config.fetch(RAW_KEY).await.ok().flatten();
-    let gain = config.fetch(GAIN_KEY).await.ok().flatten();
     let (resolved, remaining, remaining_pair) = reconcile_mic_settings(
         bits.as_ref().map(|v| v.as_str()),
         rate.as_ref().map(|v| v.as_str()),
         edge.as_ref().map(|v| v.as_str()),
-        raw.as_ref().map(|v| v.as_str()),
-        gain.as_ref().map(|v| v.as_str()),
     );
     let mut unreconciled: Vec<UnreconciledKey> = Vec::new();
     for fix in &remaining {
@@ -191,8 +212,6 @@ async fn read_and_reconcile() -> StoreOutcome {
             BITS_KEY => bits.as_ref(),
             RATE_KEY => rate.as_ref(),
             EDGE_KEY => edge.as_ref(),
-            RAW_KEY => raw.as_ref(),
-            GAIN_KEY => gain.as_ref(),
             _ => None,
         };
         unreconciled.push(UnreconciledKey {
@@ -221,14 +240,23 @@ async fn read_and_reconcile() -> StoreOutcome {
     drop(config);
     for failed in &unreconciled {
         match write_errors.iter().find(|(key, _)| *key == failed.key) {
-            Some((_, err)) => print!(
-                "ptt: failed to reconcile {} ({}) - store still holds {}; console reports flag it\r\n",
-                failed.key, err, failed.stored
-            ),
-            None => print!(
-                "ptt: {} store is unreconciled (still holds {}); console reports flag it\r\n",
-                failed.key, failed.stored
-            ),
+            Some((_, err)) => {
+                crate::net::ptt_note(&alloc::format!(
+                    "failed to reconcile {} ({}) - store still holds {}; console reports flag it",
+                    failed.key,
+                    err,
+                    failed.stored
+                ))
+                .await
+            }
+            None => {
+                crate::net::ptt_note(&alloc::format!(
+                    "{} store is unreconciled (still holds {}); console reports flag it",
+                    failed.key,
+                    failed.stored
+                ))
+                .await
+            }
         }
     }
     StoreOutcome {
@@ -247,7 +275,7 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
 pub async fn load_settings() -> MicSettings {
     let resolved = resolve_settings().await;
     if resolved.fell_back {
-        print!("ptt: stored mic clock settings out of range, using defaults\r\n");
+        crate::net::ptt_note("stored mic clock settings out of range, using defaults").await;
     }
     resolved.settings
 }
@@ -281,11 +309,10 @@ pub async fn effective_setting(key: &str) -> Option<String> {
 /// `static` (never heap-allocated, never resized), guarded by an
 /// `embassy_sync` mutex rather than held lock-free per `heap.rs`'s CAS
 /// caveat. Because `AudioRing::write` never blocks, `capture_task` can deposit
-/// samples cooperatively regardless of whether the upload task has connected
-/// yet, so there is no connect-vs-capture race to manage. Each sample carries
-/// the utterance generation that produced it, so overlapping utterances can
-/// share the buffer without one's audio (or end) leaking into the other's
-/// connection.
+/// samples cooperatively regardless of what the upload task is doing, so there
+/// is no upload-vs-capture race to manage. Each sample carries the utterance
+/// generation that produced it, so overlapping utterances can share the buffer
+/// without one's audio (or end) leaking into the other's upload.
 static PCM_RING: Mutex<CriticalSectionRawMutex, AudioRing<RING_SAMPLES>> =
     Mutex::new(AudioRing::new());
 
@@ -308,6 +335,12 @@ static OVERFLOW_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 /// Generation that hit `MAX_RECORDING_DURATION` and has not yet been reported,
 /// set for the same reason as `OVERFLOW_NOTICE_GEN`.
 static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
+/// Generation whose capture first outran the DMA ring (the consumer was late by
+/// more than the whole ring, so the DMA overwrote unread audio) and has not yet
+/// been reported, or 0. Recorded rather than printed for the same reason as
+/// `OVERFLOW_NOTICE_GEN`: printing here would take the screen lock on the
+/// capture path.
+static DMA_OVERRUN_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 
 /// Latest drained chunk's AC RMS level (in `i16` counts), for the on-screen
 /// level meter. Updated by `ptt_upload_task` from the samples it has just
@@ -319,16 +352,6 @@ static CAP_NOTICE_GEN: AtomicU32 = AtomicU32::new(0);
 /// painter polls this, so it never takes the capture path's lock either.
 static PTT_LEVEL: AtomicU32 = AtomicU32::new(0);
 
-/// Capture format of the recording the meter is currently reading: `true` while
-/// `capture_task` is running the `ptt_raw` passthrough, so the upload task knows
-/// whether a drained chunk holds PCM samples or the pair-encoded raw words
-/// [`ac_rms_level_word_pairs`] expects. Cosmetic state - at worst an
-/// overlapping utterance briefly meters in the other mode.
-static PTT_METER_RAW: AtomicBool = AtomicBool::new(false);
-/// Slot width of that recording, for the raw-word meter decode. Same cosmetic
-/// caveat as [`PTT_METER_RAW`].
-static PTT_METER_BITS: AtomicU32 = AtomicU32::new(DEFAULT_BITS);
-
 /// Current push-to-talk input level for the on-screen meter; 0 when idle.
 /// Deliberately the DC-removed (AC) level, so a mic sitting on its noise floor
 /// reads near zero instead of being pinned by its DC offset.
@@ -336,16 +359,11 @@ pub fn level() -> u32 {
     PTT_LEVEL.load(Ordering::Acquire)
 }
 
-/// Level-meter value for a chunk the upload task just drained from the ring, in
-/// whichever capture format `capture_task` is currently running. Called from the
-/// upload task only, so the cost (a windowed median of integer RMS values) stays
-/// off the DMA capture path.
+/// Level-meter value for a chunk the upload task just drained from the ring.
+/// Called from the upload task only, so the cost (a windowed median of integer
+/// RMS values) stays off the DMA capture path.
 fn meter_level(samples: &[i16]) -> u32 {
-    if PTT_METER_RAW.load(Ordering::Relaxed) {
-        ac_rms_level_word_pairs(samples, PTT_METER_BITS.load(Ordering::Relaxed))
-    } else {
-        ac_rms_level(samples)
-    }
+    ac_rms_level(samples)
 }
 
 static START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -362,18 +380,35 @@ static DATA_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static STREAM_ENDED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Separate from `START_SIGNAL` (each `Signal` has exactly one waiter:
 /// `capture_task` waits on `START_SIGNAL`, `ptt_upload_task` on this one) so
-/// the upload task can begin DNS/TCP connect as soon as a recording starts,
-/// while `capture_task` fills the static ring.
+/// the upload task can start serving an utterance as soon as a recording
+/// starts, while `capture_task` fills the static ring.
 static UPLOAD_START_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Begins push-to-talk capture; a no-op if already recording. Called from
 /// `keyboard.rs` on `(KeyState::Pressed, Key::F1)` (with no modifiers held).
 pub async fn start_recording() {
     if RECORDING.load(Ordering::Acquire) == 0 {
+        // Push-to-talk only exists on the SSH session's audio channel, so
+        // without it there is nowhere for the audio to go: say why instead of
+        // recording into the void (and without spinning up the microphone, the
+        // PIO clock or a ring full of samples nobody will read). The notice is
+        // an overlay - painted over the terminal for a couple of seconds,
+        // never written into its buffer - so it cannot corrupt the session's
+        // output, and the same reason goes to the log for the record.
+        if !crate::net::ssh_audio_available() {
+            let message = if crate::net::ssh_session_active() {
+                "ptt unavailable: the session\'s audio channel is not running"
+            } else {
+                "no ssh session: not recording"
+            };
+            crate::net::ptt_note(message).await;
+            SCREEN.get().lock().await.show_notice(String::from(message));
+            return;
+        }
         // A new generation identifies this utterance for the rest of its
         // life. The ring is deliberately *not* cleared here: a previous
-        // utterance's undrained audio must stay available to the connection
-        // that owns it, and the generation tags keep the two separate.
+        // utterance's undrained audio must stay available to its own upload,
+        // and the generation tags keep the two separate.
         let generation = CURRENT_GEN.fetch_add(1, Ordering::AcqRel) + 1;
         RECORDING.store(generation, Ordering::Release);
         SCREEN
@@ -424,17 +459,87 @@ struct Mic {
     loaded: Option<LoadedProgram<'static, PIO2>>,
 }
 
+/// The capture DMA's circular buffer, written by the DMA in hardware and read
+/// (volatile) by `capture_task`. Power-of-two sized and naturally aligned, so
+/// the DMA's write-address wrap covers exactly the buffer once per lap.
+#[repr(align(8192))]
+struct DmaRingStorage(UnsafeCell<[u32; DMA_RING_WORDS]>);
+
+// SAFETY: the only writer is the DMA channel, which runs only between
+// `start_capture_dma` and `stop_capture_dma` inside one recording; the CPU reads
+// the buffer through volatile loads and never keeps a reference across an
+// await.
+unsafe impl Sync for DmaRingStorage {}
+
+static DMA_RING: DmaRingStorage = DmaRingStorage(UnsafeCell::new([0; DMA_RING_WORDS]));
+
+/// Address of the DMA ring's first word.
+fn dma_ring_base() -> *mut u32 {
+    DMA_RING.0.get() as *mut u32
+}
+
+/// The DMA's live write position, in words into [`DMA_RING`].
+fn dma_write_index(channel: usize) -> usize {
+    let address = embassy_rp::pac::DMA.ch(channel).write_addr().read() as usize;
+    address.wrapping_sub(dma_ring_base() as usize) / 4 % DMA_RING_WORDS
+}
+
 impl Mic {
     fn set_enabled(&mut self, enabled: bool) {
         self.pio.sm0.set_enable(enabled);
     }
 
-    async fn capture(&mut self, buf: &mut [u32]) {
-        self.pio
-            .sm0
-            .rx()
-            .dma_pull(self.dma_ch.reborrow(), buf, false)
-            .await;
+    /// Starts the free-running capture DMA: this channel copies PIO SM0's RX
+    /// FIFO into [`DMA_RING`] until it is aborted, wrapping the write address on
+    /// the ring (endless transfer mode). With a one-shot transfer per chunk
+    /// instead, the eight-word FIFO fills while the next transfer is armed, the
+    /// state machine stalls on `in`, and the microphone's bit clock stops for as
+    /// long as the CPU was late - which is what silences a capture (and what the
+    /// old per-chunk plateau/glitch artifact was). Here the FIFO is drained in
+    /// hardware and the CPU only has to keep up with the buffer, not with the
+    /// clock.
+    ///
+    /// Returns the DMA channel number, which the consumer needs to read the
+    /// live write position back.
+    fn start_capture_dma(&mut self) -> usize {
+        let channel = self.dma_ch.number() as usize;
+        let ch = embassy_rp::pac::DMA.ch(channel);
+        ch.read_addr()
+            .write_value(embassy_rp::pac::PIO2.rxf(0).as_ptr() as u32);
+        ch.write_addr().write_value(dma_ring_base() as u32);
+        ch.trans_count().write(|w| {
+            w.set_count(DMA_RING_WORDS as u32);
+            // Endless: the count never decrements, so the channel runs until it
+            // is aborted, raising no interrupts and triggering no other channel.
+            w.set_mode(TransCountMode::ENDLESS);
+        });
+        ch.ctrl_trig().write(|w| {
+            w.set_treq_sel(TreqSel::PIO2_RX0);
+            w.set_data_size(DataSize::SIZE_WORD);
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            // Wrap the write address inside the ring rather than the read one.
+            w.set_ring_sel(true);
+            w.set_ring_size(DMA_RING_BITS);
+            // Chaining to itself is how the field disables chaining.
+            w.set_chain_to(channel as u8);
+            w.set_en(true);
+        });
+        channel
+    }
+
+    /// Aborts the free-running capture DMA, leaving the state machine and its
+    /// pins to `apply`/`set_enabled`.
+    fn stop_capture_dma(&mut self) {
+        let channel = self.dma_ch.number() as usize;
+        let ch = embassy_rp::pac::DMA.ch(channel);
+        embassy_rp::pac::DMA
+            .chan_abort()
+            .write(|w| w.set_chan_abort(1 << channel));
+        while ch.ctrl_trig().read().busy() {}
+        // A full write (not `modify`) so the read-only status bits cannot be
+        // written back, and without `en` so nothing is retriggered.
+        ch.ctrl_trig().write(|w| w.set_en(false));
     }
 
     /// (Re)configures the PIO program and clock for `settings`, freeing the
@@ -522,6 +627,9 @@ pub fn init_mic(
 
 #[embassy_executor::task]
 async fn capture_task(mut mic: Mic) {
+    // One wire chunk's worth of raw RX-FIFO words: one word per channel slot,
+    // two slots per L+R frame (see `SAMPLES_PER_CHUNK`).
+    let mut chunk = [0u32; SAMPLES_PER_CHUNK * 2];
     loop {
         START_SIGNAL.wait().await;
         let generation = CURRENT_GEN.load(Ordering::Acquire);
@@ -529,41 +637,76 @@ async fn capture_task(mut mic: Mic) {
         // clock starts, so a `config set ptt_*` affects this very utterance
         // (no rebuild, reflash or reboot).
         let settings = load_settings().await;
-        // Record the format the upload task's level meter must decode for this
-        // utterance. Two relaxed stores, no computation: the meter itself runs
-        // on the upload task so nothing heavy sits between DMA pulls.
-        PTT_METER_RAW.store(settings.raw, Ordering::Relaxed);
-        PTT_METER_BITS.store(settings.bits, Ordering::Relaxed);
         mic.apply(settings);
         mic.set_enabled(true);
+        let channel = mic.start_capture_dma();
+
         let started = Instant::now();
+        let mut read_index = 0usize;
+        let mut filled = 0usize;
+        let mut last_poll = Instant::now();
+        let mut overrun_noticed = false;
+        let mut ticker = Ticker::every(DMA_POLL_INTERVAL);
+        // The DMA writes two words per sample (one per channel slot), which is
+        // what tells a *late* poll (see the overrun check below) apart from a
+        // quick one: the ring holds `DMA_RING_WORDS / words_per_ms` milliseconds
+        // of audio.
+        let words_per_ms = ((settings.rate as usize) * 2 / 1000).max(1);
         // Ends when the button is released, when a newer recording supersedes
         // this one, or on the recording-duration cap below.
         while RECORDING.load(Ordering::Acquire) == generation
             && CURRENT_GEN.load(Ordering::Acquire) == generation
         {
+            let write_index = dma_write_index(channel);
+            // A poll that arrives more than a full ring late cannot tell how far
+            // the DMA wrapped, so resynchronise at the write head, drop the
+            // audio that was overwritten, and report it once for this recording.
+            if (Instant::now() - last_poll).as_millis() as usize * words_per_ms > DMA_RING_WORDS {
+                if !overrun_noticed {
+                    DMA_OVERRUN_NOTICE_GEN.store(generation, Ordering::Release);
+                    overrun_noticed = true;
+                }
+                // Even index on purpose: the DMA starts this recording at ring
+                // index 0 with a left-slot word, so even positions stay the
+                // driven (left) slot and the extraction's pairing holds.
+                read_index =
+                    ((write_index + DMA_RING_WORDS - DMA_RING_MARGIN) % DMA_RING_WORDS) & !1;
+                filled = 0;
+            }
+            last_poll = Instant::now();
+
             // One FIFO word is one channel slot (see `MicSettings::bits`), not
-            // a combined L+R pair: the PIO program pushes left, then right,
-            // alternating, so a chunk's worth of *mono* samples needs twice as
-            // many raw words.
-            let mut raw = [0u32; SAMPLES_PER_CHUNK * 2];
-            mic.capture(&mut raw).await;
-            if CURRENT_GEN.load(Ordering::Acquire) != generation {
-                continue;
+            // a combined L+R pair, and one wire chunk is
+            // `SAMPLES_PER_CHUNK` *frames*: two words each. Take whole frames
+            // only, so the left/right parity of the run never shifts, and leave
+            // the margin behind the write head untouched.
+            let available = dma_ring::available_words(write_index, read_index, DMA_RING_WORDS);
+            let take = available
+                .saturating_sub(DMA_RING_MARGIN)
+                .min(SAMPLES_PER_CHUNK * 2 - filled)
+                & !1;
+            if take > 0 {
+                let mut copied = 0usize;
+                for (start, len) in dma_ring::segments(read_index, take, DMA_RING_WORDS) {
+                    for offset in 0..len {
+                        // SAFETY: `start + offset` is inside the ring (see
+                        // `dma_ring::segments`'s bounds test) and the DMA owns
+                        // only the region at and beyond the write head.
+                        chunk[filled + copied + offset] = unsafe {
+                            core::ptr::read_volatile(dma_ring_base().add(start + offset))
+                        };
+                    }
+                    copied += len;
+                }
+                read_index = (read_index + take) % DMA_RING_WORDS;
+                filled += take;
             }
 
-            // Never blocks and never allocates: if the network side is
-            // behind, the ring drops its oldest samples instead of stalling
-            // the DMA pull that keeps the I2S clocks running.
-            let result = if settings.raw {
-                // `ptt_raw`: bypass extraction and hand the ring the raw FIFO
-                // words as little-endian i16 halves, so re-serializing them
-                // reproduces the exact unprocessed I2S word stream. The gain
-                // knob removes the driven slot's DC offset before amplifying,
-                // so it reveals signal rather than railing on the offset.
-                remove_dc_and_gain_words(&mut raw, settings.bits, settings.gain);
-                PCM_RING.lock().await.write_u32_words(generation, &raw)
-            } else {
+            if filled == chunk.len() {
+                // Never blocks and never allocates: if the network side is
+                // behind, the audio ring drops its oldest samples instead of
+                // stalling this task, which is what keeps the DMA (and with it
+                // the I2S clocks) running.
                 // Keep only the even-indexed (left-slot) words and drop the
                 // odd-indexed (right-slot) ones the mic never drives, matching
                 // this driver's left-slot pin/wiring contract in AGENTS.md
@@ -573,17 +716,14 @@ async fn capture_task(mut mic: Mic) {
                 // slot-width-aware 16-bit sample (see its doc for the exact
                 // shift).
                 let mut pcm = [0i16; SAMPLES_PER_CHUNK];
-                extract_left_channel_pcm(&raw, &mut pcm, settings.bits);
-                // `ptt_gain`: the captain's capture-time gain experiment,
-                // applied after DC removal so a useful gain reveals the AC
-                // signal instead of immediately railing on the offset.
-                remove_dc_and_gain_samples(&mut pcm, settings.gain);
-                PCM_RING.lock().await.write(generation, &pcm)
-            };
-            if result.first_drop {
-                OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
+                extract_left_channel_pcm(&chunk, &mut pcm, settings.bits);
+                let result = PCM_RING.lock().await.write(generation, &pcm);
+                if result.first_drop {
+                    OVERFLOW_NOTICE_GEN.store(generation, Ordering::Release);
+                }
+                DATA_READY.signal(());
+                filled = 0;
             }
-            DATA_READY.signal(());
 
             if started.elapsed() >= MAX_RECORDING_DURATION {
                 CAP_NOTICE_GEN.store(generation, Ordering::Release);
@@ -591,33 +731,14 @@ async fn capture_task(mut mic: Mic) {
                     RECORDING.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 break;
             }
+            ticker.next().await;
         }
         mic.set_enabled(false);
+        mic.stop_capture_dma();
         PTT_LEVEL.store(0, Ordering::Release);
         ENDED_GEN.fetch_max(generation, Ordering::AcqRel);
         STREAM_ENDED.signal(());
     }
-}
-
-/// Sends one wire frame: a 4-byte little-endian byte count, then the samples.
-/// Uses only fixed stack buffers (no heap) so the upload hot path cannot
-/// allocate.
-async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
-    const BATCH_SAMPLES: usize = 64;
-    let byte_len = (chunk.len() * 2) as u32;
-    if socket.write_all(&byte_len.to_le_bytes()).await.is_err() {
-        return false;
-    }
-    let mut bytes = [0u8; BATCH_SAMPLES * 2];
-    for batch in chunk.chunks(BATCH_SAMPLES) {
-        for (i, sample) in batch.iter().enumerate() {
-            bytes[i * 2..i * 2 + 2].copy_from_slice(&sample.to_le_bytes());
-        }
-        if socket.write_all(&bytes[..batch.len() * 2]).await.is_err() {
-            return false;
-        }
-    }
-    true
 }
 
 /// Emits any one-shot diagnostics that `capture_task` recorded and dismisses
@@ -626,11 +747,14 @@ async fn send_chunk(socket: &mut TcpSocket<'_>, chunk: &[i16]) -> bool {
 /// stalling the I2S clocks.
 async fn emit_pending_notices() {
     if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
-        print!("ptt: upload can't keep up, dropping oldest audio\r\n");
+        crate::net::ptt_note("upload can't keep up, dropping oldest audio").await;
+    }
+    if DMA_OVERRUN_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
+        crate::net::ptt_note("capture ring overran, dropping some audio").await;
     }
     let capped_generation = CAP_NOTICE_GEN.swap(0, Ordering::AcqRel);
     if capped_generation != 0 {
-        print!("ptt: recording exceeded 60s cap, stopping\r\n");
+        crate::net::ptt_note("recording exceeded 60s cap, stopping").await;
         let mut screen = SCREEN.get().lock().await;
         if CURRENT_GEN.load(Ordering::Acquire) == capped_generation {
             screen.clear_overlay();
@@ -638,30 +762,30 @@ async fn emit_pending_notices() {
     }
 }
 
-/// Sends one utterance's audio over its own connection: connect (bounded by
-/// `CONNECT_TIMEOUT`), drain every sample tagged `generation` until that
-/// generation ends, then close the connection. Samples belonging to any other
+/// Sends one utterance's audio down the session's audio channel: drain every
+/// sample tagged `generation` until that generation ends, then mark its end
+/// on the channel. Samples belonging to any other
 /// generation are left in the ring for their own upload, and the end
 /// condition is [`utterance_ended`] on the generation counters - never a
 /// shared signal - so a later recording can neither have its audio sent here
-/// nor be mistaken for this one's end. With no socket (connect failed or
-/// timed out) the samples are discarded instead, so the ring is still drained
-/// and the recording always terminates.
-async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) {
-    let mut socket = match with_timeout(CONNECT_TIMEOUT, connect_for_upload(tx_buf, rx_buf)).await {
-        Ok(socket) => socket,
-        Err(_) => {
-            print!("ptt: connect timed out, dropping recording\r\n");
-            None
-        }
-    };
+/// nor be mistaken for this one's end. When the channel is unavailable the
+/// samples are discarded instead, so the ring is still drained and the
+/// recording always terminates.
+///
+/// The destination is the SSH session's audio channel when it is up (see
+/// [`crate::net::ssh_audio_available`]); that is the transport that reaches a
+/// helper running on the machine the user is typing into. If that channel
+/// fails mid-recording the rest of the utterance is drained, so the recording
+/// still terminates.
+async fn serve_utterance(generation: u32) {
+    let mut ssh = crate::net::ssh_audio_available();
 
     let mut buf = [0i16; SAMPLES_PER_CHUNK];
     loop {
         emit_pending_notices().await;
         // Drain everything this generation has buffered so far. The static
         // ring absorbs (and, when full, drops the oldest of) whatever capture
-        // produces meanwhile, so a failed, slow, or congested connection only
+        // produces meanwhile, so a failed, slow, or congested session only
         // ever costs buffered audio - it never blocks `capture_task`.
         loop {
             let n = {
@@ -673,16 +797,19 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
             }
             // Meter the chunk here, on the upload task, from the samples just
             // drained - never in `capture_task`, where any per-chunk work
-            // between DMA pulls can starve the PIO RX FIFO and silence the
-            // capture (the confirmed regression). The meter therefore tracks
-            // what the connection is actually draining (post-`ptt_gain`), which
-            // is identical to the mic's own level at the default gain of 1.
+            // would delay the DMA ring and risk the microphone's clock (the
+            // confirmed regression).
             PTT_LEVEL.store(meter_level(&buf[..n]), Ordering::Release);
-            if let Some(sock) = socket.as_mut()
-                && !send_chunk(sock, &buf[..n]).await
-            {
-                print!("ptt: send failed, dropping rest of recording\r\n");
-                socket = None;
+            if ssh {
+                // The session's audio channel, carrying this utterance's
+                // frames on the connection the interactive session already
+                // has. `false` means it stopped taking them (the session ended
+                // or its helper went away), which also covers the channel
+                // becoming unavailable between chunks.
+                if !crate::net::ssh_audio_send(&buf[..n]).await {
+                    crate::net::ptt_note("ssh audio channel unavailable, dropping rest").await;
+                    ssh = false;
+                }
             }
         }
 
@@ -700,72 +827,31 @@ async fn serve_utterance(generation: u32, tx_buf: &mut [u8], rx_buf: &mut [u8]) 
     }
     emit_pending_notices().await;
 
-    // `socket` drops here, closing the TCP connection, which is this wire
-    // format's end-of-utterance signal to the receiver.
+    if ssh {
+        // The SSH channel stays open for the whole session, so the end of this
+        // utterance has to be marked in band (a zero-length frame) rather than
+        // by closing anything.
+        if !crate::net::ssh_audio_end_of_utterance().await {
+            crate::net::ptt_note("ssh audio channel unavailable, dropping utterance end").await;
+        }
+    }
 }
 
 #[embassy_executor::task]
 async fn ptt_upload_task() {
-    let mut tx_buf = [0u8; 2048];
-    let mut rx_buf = [0u8; 256];
     let mut next_generation: u32 = 1;
 
     loop {
         // Serve every utterance exactly once, in order. Generations are
         // contiguous, so once `CURRENT_GEN` has reached one it exists and must
-        // be served - even if it was superseded before its connect resolved.
+        // be served - even if it was superseded before its upload began.
+        // Whether the session's audio channel is up is decided per utterance
+        // in `serve_utterance`.
         while next_generation > CURRENT_GEN.load(Ordering::Acquire) {
             UPLOAD_START_SIGNAL.wait().await;
         }
         emit_pending_notices().await;
-        serve_utterance(next_generation, &mut tx_buf, &mut rx_buf).await;
+        serve_utterance(next_generation).await;
         next_generation += 1;
     }
-}
-
-/// Resolves and connects to the configured `ptt_host`/`ptt_port`, returning
-/// `None` (after logging why) on any failure. `serve_utterance` bounds this
-/// with `CONNECT_TIMEOUT`; while it runs, captured samples accumulate in the
-/// fixed static ring, which drops the oldest when full, so capture is never
-/// blocked by connection setup.
-async fn connect_for_upload<'a>(
-    tx_buf: &'a mut [u8],
-    rx_buf: &'a mut [u8],
-) -> Option<TcpSocket<'a>> {
-    let Some(stack) = stack().await else {
-        print!("ptt: network is offline, dropping recording\r\n");
-        return None;
-    };
-
-    let (host, port) = {
-        let mut config = CONFIG.get().lock().await;
-        (
-            config.fetch("ptt_host").await,
-            config.fetch("ptt_port").await,
-        )
-    };
-    let (Ok(Some(host)), Ok(Some(port))) = (host, port) else {
-        print!("ptt: set ptt_host and ptt_port to stream recordings\r\n");
-        return None;
-    };
-    let Ok(port) = port.as_str().parse::<u16>() else {
-        print!("ptt: invalid ptt_port `{port}`\r\n");
-        return None;
-    };
-
-    let dns_client = DnsSocket::new(stack);
-    let addr = match dns_client.query(host.as_str(), DnsQueryType::A).await {
-        Ok(addrs) if !addrs.is_empty() => addrs[0],
-        _ => {
-            print!("ptt: failed to resolve {host}\r\n");
-            return None;
-        }
-    };
-
-    let mut socket = TcpSocket::new(stack, tx_buf, rx_buf);
-    if let Err(err) = socket.connect(IpEndpoint { addr, port }).await {
-        print!("ptt: failed to connect to {host}:{port}: {err:?}\r\n");
-        return None;
-    }
-    Some(socket)
 }

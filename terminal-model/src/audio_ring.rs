@@ -11,12 +11,12 @@
 //!
 //! Every sample is tagged with the *generation* (utterance) that produced
 //! it. Utterances are serialized on the capture side, but a second recording
-//! can begin while the first one's connection is still being established, so
-//! their samples share this buffer. The generation tags let the upload task
-//! drain exactly the audio belonging to the connection it currently holds
-//! and never send a later utterance's audio (or consume its end) on an
-//! earlier utterance's socket. [`utterance_ended`] is the matching pure
-//! predicate for deciding when a generation has finished.
+//! can begin while the first one is still being uploaded, so their samples
+//! share this buffer. The generation tags let the upload task drain exactly
+//! the audio belonging to the utterance it is serving and never send a later
+//! utterance's audio (or consume its end) as an earlier utterance's.
+//! [`utterance_ended`] is the matching pure predicate for deciding when a
+//! generation has finished.
 //!
 //! Keeping this here (free of embassy/`crate` dependencies) lets host tests
 //! exercise the exact code the firmware runs, per AGENTS.md's
@@ -42,10 +42,6 @@ pub struct WriteResult {
 pub struct AudioRing<const N: usize> {
     samples: [i16; N],
     generations: [u32; N],
-    /// Whether the sample at the same index is the low `i16` half of a raw
-    /// `u32` word (`write_u32_words`); always `false` for plain PCM samples.
-    /// Eviction uses it to drop a raw word whole rather than splitting it.
-    low_half: [bool; N],
     /// Index of the oldest buffered sample.
     head: usize,
     /// Number of valid samples currently buffered (`<= N`).
@@ -63,7 +59,6 @@ impl<const N: usize> AudioRing<N> {
         Self {
             samples: [0; N],
             generations: [0; N],
-            low_half: [false; N],
             head: 0,
             len: 0,
             newest_generation: 0,
@@ -106,42 +101,13 @@ impl<const N: usize> AudioRing<N> {
     /// reader has moved on, and buffering it would only orphan samples ahead
     /// of live audio.
     pub fn write(&mut self, generation: u32, samples: &[i16]) -> WriteResult {
-        self.write_iter(generation, samples.iter().copied().map(|s| (s, false)))
-    }
-
-    /// Appends the little-endian 16-bit halves of each raw I2S FIFO word,
-    /// tagged with `generation`, exactly like [`Self::write`]. Each `u32`
-    /// becomes two `i16` samples low half first, so a later
-    /// little-endian `i16` serialization of the ring reproduces the original
-    /// `u32` bytes - this is how the `ptt_raw` diagnostic passthrough streams
-    /// unprocessed PIO words through the same allocation-free ring without a
-    /// second buffer. Stale-generation handling and overflow reporting match
-    /// [`Self::write`].
-    pub fn write_u32_words(&mut self, generation: u32, words: &[u32]) -> WriteResult {
-        if generation < self.newest_generation {
-            return WriteResult {
-                dropped: 0,
-                first_drop: false,
-            };
-        }
-        self.newest_generation = generation;
-        let mut dropped = 0;
-        for &word in words {
-            // Make room for a whole word before writing either of its halves,
-            // so overflow can never leave one half at the head without its
-            // partner. Reading such a split word would misalign the `ptt_raw`
-            // level meter, which pairs the drained halves back into words.
-            self.evict_until_room_for(2, &mut dropped);
-            self.push(word as u16 as i16, true, generation);
-            self.push((word >> 16) as u16 as i16, false, generation);
-        }
-        self.finish_write(generation, dropped)
+        self.write_iter(generation, samples.iter().copied())
     }
 
     fn write_iter(
         &mut self,
         generation: u32,
-        samples: impl IntoIterator<Item = (i16, bool)>,
+        samples: impl IntoIterator<Item = i16>,
     ) -> WriteResult {
         if generation < self.newest_generation {
             return WriteResult {
@@ -151,33 +117,26 @@ impl<const N: usize> AudioRing<N> {
         }
         self.newest_generation = generation;
         let mut dropped = 0;
-        for (sample, low_half) in samples {
+        for sample in samples {
             self.evict_until_room_for(1, &mut dropped);
-            self.push(sample, low_half, generation);
+            self.push(sample, generation);
         }
         self.finish_write(generation, dropped)
     }
 
-    /// Discards the oldest samples until at least `needed` more fit. A raw
-    /// word is dropped as a unit (both `i16` halves) whenever the head is one
-    /// of its halves, so a word's halves are never split across the head; a
-    /// non-word PCM sample is dropped singly.
+    /// Discards the oldest samples until at least `needed` more fit.
     fn evict_until_room_for(&mut self, needed: usize, dropped: &mut usize) {
         while self.len > 0 && self.len + needed > N {
-            let drop = if self.low_half[self.head] { 2 } else { 1 };
-            for _ in 0..drop.min(self.len) {
-                self.head = (self.head + 1) % N;
-                self.len -= 1;
-                *dropped += 1;
-            }
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+            *dropped += 1;
         }
     }
 
-    fn push(&mut self, sample: i16, low_half: bool, generation: u32) {
+    fn push(&mut self, sample: i16, generation: u32) {
         let tail = (self.head + self.len) % N;
         self.samples[tail] = sample;
         self.generations[tail] = generation;
-        self.low_half[tail] = low_half;
         self.len += 1;
     }
 
@@ -389,77 +348,6 @@ mod tests {
         assert!(ring.write(8, &[0; 20]).first_drop);
     }
 
-    /// The `ptt_raw` passthrough reinterprets each captured 32-bit word as
-    /// two little-endian `i16` samples, so that re-serializing the ring is
-    /// byte-for-byte identical to sending the original `u32` words.
-    #[test]
-    fn write_u32_words_reproduces_the_word_bytes_little_endian() {
-        let mut ring = AudioRing::<8>::new();
-        ring.write_u32_words(1, &[0x1234_5678u32, 0xABCD_0001u32]);
-
-        let mut out = [0i16; 8];
-        let n = ring.read(1, &mut out);
-        assert_eq!(n, 4);
-        let mut bytes = [0u8; 8];
-        for (i, sample) in out[..n].iter().enumerate() {
-            bytes[i * 2..i * 2 + 2].copy_from_slice(&sample.to_le_bytes());
-        }
-        assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0xCD, 0xAB]);
-    }
-
-    #[test]
-    fn write_u32_words_shares_stale_and_overflow_behavior() {
-        let mut ring = AudioRing::<2>::new();
-        // Two words is four samples against a capacity of two, so the two
-        // oldest samples are dropped, exactly as `write` would.
-        let result = ring.write_u32_words(1, &[0x0001_0002u32, 0x0003_0004u32]);
-        assert_eq!(result.dropped, 2);
-        assert!(result.first_drop);
-        // A superseded generation is ignored just like `write`.
-        let stale = ring.write_u32_words(0, &[0xDEAD_BEEFu32]);
-        assert_eq!(
-            stale,
-            WriteResult {
-                dropped: 0,
-                first_drop: false
-            }
-        );
-        let mut out = [0i16; 2];
-        assert_eq!(ring.read(1, &mut out), 2);
-        // Word order is low half then high half, so the two words buffered as
-        // [0x0002, 0x0001, 0x0004, 0x0003]; the oldest two are dropped.
-        assert_eq!(out[0], 0x0004u16 as i16);
-        assert_eq!(out[1], 0x0003u16 as i16);
-    }
-
-    /// An odd capacity makes the naive one-`i16`-at-a-time eviction drop an
-    /// odd number of halves, which would leave the head on a word's high half.
-    /// Raw-word overflow must instead drop whole words, so the drained stream
-    /// always pairs back into the original words (what the `ptt_raw` meter
-    /// relies on).
-    #[test]
-    fn word_overflow_never_leaves_a_split_word_at_the_head() {
-        let mut ring = AudioRing::<5>::new();
-        let words = [
-            0x1111_2222u32,
-            0x3333_4444u32,
-            0x5555_6666u32,
-            0x7777_8888u32,
-        ];
-        for &word in &words {
-            ring.write_u32_words(1, &[word]);
-        }
-
-        let mut out = [0i16; 8];
-        let n = ring.read(1, &mut out);
-        assert_eq!(n, 4);
-        let mut rebuilt = [0u32; 2];
-        for (i, word) in rebuilt.iter_mut().enumerate() {
-            *word = (out[2 * i] as u16 as u32) | ((out[2 * i + 1] as u16 as u32) << 16);
-        }
-        assert_eq!(rebuilt, [words[2], words[3]]);
-    }
-
     #[test]
     fn clear_empties_the_ring() {
         let mut ring = AudioRing::<4>::new();
@@ -509,7 +397,7 @@ mod tests {
 
     /// End-to-end model of the shared-ring lifecycle the firmware runs: a
     /// stalled first utterance (A) is superseded by a second (B) that starts
-    /// and finishes before A's connection resolves. A's uploader must stop at
+    /// and finishes before A's upload gets to it. A's uploader must stop at
     /// its own end without touching B's audio, and B's uploader must then get
     /// B's untouched audio and its own end.
     #[test]
@@ -518,11 +406,11 @@ mod tests {
         const B: u32 = 2;
         let mut ring = AudioRing::<32>::new();
 
-        // A captures, and ends while its upload is still connecting.
+        // A captures, and ends while its upload is still in progress.
         ring.write(A, &[10, 11, 12]);
 
-        // B starts and finishes before A's connect resolves, so at this point
-        // A has ended and B is both armed and finished.
+        // B starts and finishes before A's upload gets to it, so at this
+        // point A has ended and B is both armed and finished.
         ring.write(B, &[20, 21, 22]);
         let newest_armed = B;
         let newest_ended = B;
@@ -535,7 +423,7 @@ mod tests {
         assert!(utterance_ended(newest_armed, newest_ended, A));
 
         // B's uploader gets B's audio, untouched by A's upload, and its own
-        // end signal - so its connection eventually closes too.
+        // end signal - so its utterance is finished too.
         let mut b_out = [0i16; 8];
         let b_len = ring.read(B, &mut b_out);
         assert_eq!(&b_out[..b_len], [20, 21, 22]);
