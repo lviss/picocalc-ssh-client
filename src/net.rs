@@ -835,9 +835,8 @@ async fn ssh_session_task(
                                                 None => false,
                                             };
                                             if !sent {
-                                                print!(
-                                                    "ptt: could not start the ssh audio helper\r\n"
-                                                );
+                                                ptt_note("could not start the ssh audio helper")
+                                                    .await;
                                             }
                                             AUDIO_EXEC_SENT.signal(sent);
                                             continue;
