@@ -30,7 +30,7 @@ This project transforms your PicoCalc into a pocket-sized, WiFi-enabled terminal
 
 ## Installing the Released Firmware
 
-1. Download the latest firmware from the [releases](https://github.com/lviss/picocalc-ssh-client/releases) page. Each release has two `.uf2` assets, one per board — grab the one matching your board, e.g. [picocalc-ssh-client-pimoroni2w-v0.5.uf2](https://github.com/lviss/picocalc-ssh-client/releases/download/v0.5/picocalc-ssh-client-pimoroni2w-v0.5.uf2) or `picocalc-ssh-client-pico2w-v0.5.uf2`.
+1. Download the latest firmware from the [releases](https://github.com/lviss/picocalc-ssh-client/releases) page. Each release has two `.uf2` assets, one per board — grab the one matching your board: `picocalc-ssh-client-pico2w-<version>.uf2` or `picocalc-ssh-client-pimoroni2w-<version>.uf2`.
 2. Flash:
     * Hold the BOOTSEL button on your Pico 2 W while plugging it in.
     * Copy the downloaded `.uf2` file to the mounted RP2350 drive.
