@@ -90,10 +90,29 @@ pub fn encode_frame(out: &mut [u8], samples: &[i16]) -> Option<usize> {
 /// The command runs through the login shell, so the single-quoted `sh -c`
 /// argument keeps the device's own `$$`/`$TMPDIR` expansions off the remote
 /// shell and hands them to the inner one.
+///
+/// `python3 -I` (isolated mode) is load-bearing, not cosmetic: the helper is
+/// written to a shared temp directory under a PID-derived name
+/// (`$TMPDIR/picocalc-ptt.$$`), and Python's default behavior prepends a
+/// script's own directory to `sys.path` - so any unrelated file already
+/// sitting in that temp directory under a name that shadows a stdlib module
+/// (observed on real hardware: a stray `gettext.py` in `/tmp` broke the
+/// helper's `import argparse` before it ever reached config parsing or
+/// whisper) silently wins the import instead of the real stdlib module.
+/// `-I` implies `-P` (never prepend the script's directory, added in 3.11,
+/// too new to use alone given this project's Python 3.8+ floor), `-E`
+/// (ignore `PYTHON*` env vars, which the helper never sets or relies on -
+/// its own config knobs are plain `PICOCALC_PTT_*`/`XDG_*`/`HOME`/`TMUX*`
+/// names untouched by `-E`), and `-s` (skip the user site-packages
+/// directory, harmless here since the helper only shells out to
+/// `whisper-cli`/`whisper`/`tmux` via `PATH` and never imports a
+/// non-stdlib package itself). Together these make the run immune to any
+/// file that happens to exist in the script's temp directory, not just
+/// today's specific `gettext.py` collision.
 pub fn helper_exec_command(script_bytes: usize) -> String {
     format!(
         "sh -c 'f=\"${{TMPDIR:-/tmp}}/picocalc-ptt.$$\"; \
-         dd bs=1 count={script_bytes} of=\"$f\" 2>/dev/null && exec python3 \"$f\"'"
+         dd bs=1 count={script_bytes} of=\"$f\" 2>/dev/null && exec python3 -I \"$f\"'"
     )
 }
 
@@ -105,11 +124,12 @@ mod tests {
     fn helper_command_writes_and_runs_exactly_the_sent_script() {
         // The whole delivery contract in one string: run through `sh -c`, copy
         // exactly the script's byte count with byte-at-a-time `dd` (so no
-        // audio frame is ever consumed), then exec python3 on that file, which
-        // leaves the channel on python's stdin for the frames that follow.
+        // audio frame is ever consumed), then exec python3 -I on that file,
+        // which leaves the channel on python's stdin for the frames that
+        // follow.
         assert_eq!(
             helper_exec_command(21633),
-            "sh -c 'f=\"${TMPDIR:-/tmp}/picocalc-ptt.$$\"; dd bs=1 count=21633 of=\"$f\" 2>/dev/null && exec python3 \"$f\"'"
+            "sh -c 'f=\"${TMPDIR:-/tmp}/picocalc-ptt.$$\"; dd bs=1 count=21633 of=\"$f\" 2>/dev/null && exec python3 -I \"$f\"'"
         );
     }
 
@@ -121,8 +141,23 @@ mod tests {
             let command = helper_exec_command(len);
             assert!(command.contains(&format!("count={len} ")), "{command}");
             assert_eq!(command.matches("count=").count(), 1, "{command}");
-            assert!(command.ends_with("exec python3 \"$f\"'"), "{command}");
+            assert!(command.ends_with("exec python3 -I \"$f\"'"), "{command}");
         }
+    }
+
+    /// Regression test for a live device log: a stray `/tmp/gettext.py` on
+    /// the server shadowed the stdlib `gettext` module because Python by
+    /// default prepends the script's own directory to `sys.path`, crashing
+    /// the helper's `import argparse` before it ever reached config parsing
+    /// or whisper. `-I` (isolated mode, implying `-P`) is what prevents any
+    /// file sitting next to the script from shadowing a stdlib import.
+    #[test]
+    fn helper_command_runs_python_in_isolated_mode_to_avoid_tmp_shadowing() {
+        let command = helper_exec_command(24777);
+        assert!(
+            command.contains("exec python3 -I "),
+            "expected isolated-mode python3 invocation: {command}"
+        );
     }
 
     #[test]
