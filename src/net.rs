@@ -354,7 +354,7 @@ pub async fn ptt_note(message: &str) {
 /// in AGENTS.md), so this is safe even mid-session: it never touches the
 /// terminal buffer, so it cannot corrupt the remote output or the transcript
 /// the helper is typing into tmux.
-async fn ptt_fail(message: &str, notice: &str) {
+pub(crate) async fn ptt_fail(message: &str, notice: &str) {
     ptt_note(message).await;
     SCREEN.get().lock().await.show_notice(String::from(notice));
 }
