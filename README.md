@@ -254,11 +254,14 @@ otherwise. See `~/.config/picocalc-ptt.conf` (created by hand, optional) and
 `tools/picocalc-ptt --help` for tuning the target session, whisper command,
 and tmux socket.
 
-If the helper can't start (no `python3`/whisper on the server, or it
-crashes), only push-to-talk is affected — the SSH session itself keeps
-working — and `F1` shows `ptt unavailable`. You can also point the device at
-your own script with `config set ptt_ssh_cmd <command>` (empty value
-disables push-to-talk entirely); this takes effect on the next SSH session.
+If the helper can't start (no `python3`/whisper on the server) or it
+crashes — at session start or mid-recording — only push-to-talk is affected:
+the SSH session itself keeps working, and a short on-screen notice (e.g.
+`ptt: helper crashed: ...`) explains what happened without needing a debug
+console, alongside `F1` showing `ptt unavailable` on the next press. You can
+also point the device at your own script with `config set ptt_ssh_cmd
+<command>` (empty value disables push-to-talk entirely); this takes effect
+on the next SSH session.
 
 #### Microphone wiring
 

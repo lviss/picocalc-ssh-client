@@ -149,14 +149,89 @@ mod tests {
     /// the server shadowed the stdlib `gettext` module because Python by
     /// default prepends the script's own directory to `sys.path`, crashing
     /// the helper's `import argparse` before it ever reached config parsing
-    /// or whisper. `-I` (isolated mode, implying `-P`) is what prevents any
-    /// file sitting next to the script from shadowing a stdlib import.
+    /// or whisper.
+    ///
+    /// This runs the real [`helper_exec_command`] through a shell, exactly as
+    /// the server does, with the helper script *and* a colliding `gettext.py`
+    /// in the same `$TMPDIR`, and asserts the helper still gets past its
+    /// imports to its own startup. The second half re-runs the same setup with
+    /// the isolation flag stripped (`python3 "$f"`, the command before the
+    /// fix) and asserts the collision *does* reproduce there, so the passing
+    /// half can't be passing because the fixture never actually shadowed
+    /// anything.
+    #[cfg(unix)]
     #[test]
-    fn helper_command_runs_python_in_isolated_mode_to_avoid_tmp_shadowing() {
-        let command = helper_exec_command(24777);
+    fn helper_command_survives_a_stdlib_shadow_in_its_own_temp_dir() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        if Command::new("python3")
+            .args(["-E", "-c", "pass"])
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        }
+
+        // The exact bytes the firmware embeds and streams down the channel.
+        let script = include_bytes!("../../tools/picocalc-ptt");
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("picocalc-ptt-shadow-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).expect("create temp dir");
+        // The real collision: the helper's `import argparse` does
+        // `from gettext import gettext as _, ngettext`, and a file named
+        // `gettext.py` sitting in the script's own directory wins that import
+        // over the stdlib module and then dies on `sys.argv`.
+        std::fs::write(
+            dir.0.join("gettext.py"),
+            "import sys\n\
+             print('SHADOWED_GETTEXT_IMPORTED', file=sys.stderr, flush=True)\n\
+             host = sys.argv[1]; name = sys.argv[2]\n",
+        )
+        .expect("write shadow module");
+
+        let run = |command: &str| {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .env("TMPDIR", &dir.0)
+                // A config path that does not exist, so the helper's own
+                // startup is machine-independent: it reports what is missing
+                // or starts listening, but it must get that far.
+                .env("PICOCALC_PTT_CONFIG", dir.0.join("missing.conf"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the helper command");
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin.write_all(script).expect("stream the helper script");
+            drop(stdin);
+            let output = child.wait_with_output().expect("wait for the helper");
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+
+        let isolated = run(&helper_exec_command(script.len()));
         assert!(
-            command.contains("exec python3 -I "),
-            "expected isolated-mode python3 invocation: {command}"
+            !isolated.contains("SHADOWED_GETTEXT_IMPORTED") && !isolated.contains("Traceback"),
+            "the temp dir's gettext.py still shadowed a stdlib import: {isolated}"
+        );
+
+        // Control: the same fixture without `-I` is the command this fix
+        // replaced, and must still reproduce the reported crash.
+        let unisolated = helper_exec_command(script.len()).replace("python3 -I", "python3");
+        assert!(
+            run(&unisolated).contains("SHADOWED_GETTEXT_IMPORTED"),
+            "the shadowing fixture no longer reproduces the collision it exists for"
         );
     }
 
