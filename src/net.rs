@@ -631,6 +631,15 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
     // doc), so only this one trailing line, already logged in full via
     // `ptt_note` below, ever reaches the notice.
     let mut last_stderr_line = alloc::string::String::new();
+    // A line's bytes can straddle two 96-byte stderr reads (realistic for
+    // Python tracebacks), so the tail of a not-yet-newline-terminated line
+    // is carried here and prepended to the next read before re-scanning,
+    // instead of scanning each read in isolation. Capped so a line that
+    // never terminates (stalled/malicious peer) can't grow this without
+    // bound; the cap keeps the *tail* since that is where the informative
+    // part of a crash line (e.g. the exception message) tends to be.
+    let mut stderr_fragment = alloc::string::String::new();
+    const MAX_STDERR_FRAGMENT: usize = 200;
     loop {
         let read_stderr = async {
             if stderr_done {
@@ -674,14 +683,38 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
             Either3::Third(read) => match read {
                 // Either end of the helper's stderr means no more diagnostics
                 // from it; the channel itself can still be carrying audio.
-                Ok(0) | Err(_) => stderr_done = true,
+                Ok(0) | Err(_) => {
+                    stderr_done = true;
+                    // The final line may never have gotten a trailing
+                    // newline (the process just exited) - that's still the
+                    // last line the helper wrote, so flush it now.
+                    let trimmed = stderr_fragment.trim();
+                    if !trimmed.is_empty() {
+                        last_stderr_line.clear();
+                        last_stderr_line.push_str(trimmed);
+                    }
+                }
                 Ok(n) => {
                     let text = alloc::string::String::from_utf8_lossy(&err_buf[..n]);
-                    if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
-                        last_stderr_line.clear();
-                        last_stderr_line.push_str(line.trim());
-                    }
                     ptt_note(text.trim_end()).await;
+                    stderr_fragment.push_str(&text);
+                    if stderr_fragment.len() > MAX_STDERR_FRAGMENT {
+                        let excess = stderr_fragment.len() - MAX_STDERR_FRAGMENT;
+                        let cut = stderr_fragment
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .find(|&i| i >= excess)
+                            .unwrap_or(stderr_fragment.len());
+                        stderr_fragment.drain(..cut);
+                    }
+                    while let Some(pos) = stderr_fragment.find('\n') {
+                        let line = stderr_fragment[..pos].trim();
+                        if !line.is_empty() {
+                            last_stderr_line.clear();
+                            last_stderr_line.push_str(line);
+                        }
+                        stderr_fragment.drain(..=pos);
+                    }
                 }
             },
         }
