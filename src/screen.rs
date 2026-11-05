@@ -293,7 +293,7 @@ fn update_display(model: &mut ScreenModel, display: &mut PicoCalcDisplay) {
     // real, possibly-changed content underneath exactly as if the overlay had
     // never been shown.
     if let Some(text) = &model.overlay {
-        draw_overlay(model.font, text, display);
+        draw_overlay(model, text, display);
     }
 }
 
@@ -314,9 +314,11 @@ const LEVEL_METER_HEIGHT: u32 = 8;
 /// hardware despite carrying real, transcribable audio.
 const LEVEL_METER_FULL_SCALE: u32 = 150;
 
-fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut PicoCalcDisplay) {
+fn draw_overlay(model: &ScreenModel, text: &str, display: &mut PicoCalcDisplay) {
     const PADDING_X: i32 = 10;
     const PADDING_Y: i32 = 8;
+
+    let font = model.font;
 
     // While recording, reserve a strip under the text for the level meter. Any
     // other overlay (e.g. the battery readout) is unchanged.
@@ -327,15 +329,29 @@ fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut Pico
         0
     };
 
-    let char_count = text.chars().count() as u32;
-    let text_width = char_count * (font.character_size.width + font.character_spacing);
-    let text_height = font.character_size.height;
+    // Wrap to fit within the screen rather than painting the whole string as
+    // one line: an unwrapped long notice (e.g. "ptt unavailable: the
+    // session's audio channel is not running") centered a box wider than the
+    // display, and embedded-graphics simply drops pixels outside the display
+    // bounds - clipping both edges and leaving only the middle readable. The
+    // max width here is the screen minus the box's own horizontal padding, so
+    // every wrapped line's box fits on screen without further clamping.
+    let max_text_width_px = (SCREEN_WIDTH as u32).saturating_sub((PADDING_X as u32) * 2);
+    let lines = model.wrap_overlay_text(text, max_text_width_px.max(1));
 
-    let box_w = text_width + (PADDING_X as u32) * 2;
-    let box_h = text_height + (PADDING_Y as u32) * 2 + meter_space as u32;
+    let char_width = font.character_size.width + font.character_spacing;
+    let text_height = font.character_size.height;
+    let widest_line_chars = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as u32;
+
+    let box_w = widest_line_chars * char_width + (PADDING_X as u32) * 2;
+    let box_h = text_height * lines.len() as u32 + (PADDING_Y as u32) * 2 + meter_space as u32;
 
     let x = (SCREEN_WIDTH as i32 - box_w as i32) / 2;
-    let y = (SCREEN_HEIGHT as i32 - box_h as i32) / 2;
+    let y = ((SCREEN_HEIGHT as i32 - box_h as i32) / 2).max(0);
 
     let bg = Rgb565::CSS_DARK_SLATE_GRAY;
     let fg = Rgb565::WHITE;
@@ -352,19 +368,24 @@ fn draw_overlay(font: &'static MonoFont<'static>, text: &str, display: &mut Pico
     .ok();
 
     let style = text_style(font, fg, bg);
-    Text::new(
-        text,
-        Point::new(x + PADDING_X, y + PADDING_Y + font.baseline as i32),
-        style,
-    )
-    .draw(display)
-    .ok();
+    for (i, line) in lines.iter().enumerate() {
+        Text::new(
+            line,
+            Point::new(
+                x + PADDING_X,
+                y + PADDING_Y + font.baseline as i32 + (i as u32 * text_height) as i32,
+            ),
+            style,
+        )
+        .draw(display)
+        .ok();
+    }
 
     if recording {
         draw_level_meter(
             display,
             x + PADDING_X,
-            y + PADDING_Y + text_height as i32 + 6,
+            y + PADDING_Y + (text_height * lines.len() as u32) as i32 + 6,
             box_w - (PADDING_X as u32) * 2,
             LEVEL_METER_HEIGHT,
             crate::mic::level(),

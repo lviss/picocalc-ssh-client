@@ -360,7 +360,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `python3` and whisper: at session start the device streams the script down the audio channel
   (`AudioCommand::Embedded`, streamed in `PTT_SCRIPT_CHUNK_BYTES` writes) and the exec'd command
   (`terminal_model::ptt_frame::helper_exec_command`, host-tested) copies exactly that many bytes
-  into `$TMPDIR/picocalc-ptt.<pid>` with `dd bs=1` and execs python on it, which leaves the
+  into `$TMPDIR/picocalc-ptt.<pid>` with `dd bs=1` and execs `python3 -I` (isolated mode - see that
+  function's doc for why: it keeps a stray file already sitting in the shared temp directory, e.g.
+  the real `/tmp/gettext.py` collision that shadowed the stdlib module and crashed the helper on
+  real hardware, from ever shadowing a stdlib import) on it, which leaves the
   channel on python's stdin for the frames that follow - `dd`'s byte-at-a-time reads are what keep
   the script/audio boundary exact. A user-supplied `config set ptt_ssh_cmd <command>` still runs
   instead (nothing is streamed then), and an empty value disables the transport. Its protocol is

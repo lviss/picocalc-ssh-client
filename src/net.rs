@@ -343,6 +343,22 @@ pub async fn ptt_note(message: &str) {
     }
 }
 
+/// Reports a push-to-talk failure that would otherwise be invisible to the
+/// user at the keyboard: logs `message` exactly like [`ptt_note`], and also
+/// shows `notice` as a `Screen::show_notice` overlay so the captain learns
+/// push-to-talk is broken without a UART/serial debug session. `notice` is
+/// deliberately a short, separate string from the (possibly longer,
+/// `{err:?}`-bearing) log message - callers summarize rather than pass the
+/// same text to both, consistent with "never dump a raw traceback onto the
+/// small screen." The overlay is paint-time-only (see `ScreenModel::overlay`
+/// in AGENTS.md), so this is safe even mid-session: it never touches the
+/// terminal buffer, so it cannot corrupt the remote output or the transcript
+/// the helper is typing into tmux.
+pub(crate) async fn ptt_fail(message: &str, notice: &str) {
+    ptt_note(message).await;
+    SCREEN.get().lock().await.show_notice(String::from(notice));
+}
+
 /// Whether push-to-talk can send audio right now, i.e. whether the session's
 /// audio channel is open and the server has been asked to run the helper.
 /// `crate::mic` asks this when the button is pressed: without it there is
@@ -547,9 +563,10 @@ async fn open_audio_channel<'g, 'a>(
     let (channel, stderr) = match ssh_client.open_session_nopty().await {
         Ok(channel) => channel,
         Err(err) => {
-            ptt_note(&alloc::format!(
-                "could not open the ssh audio channel: {err:?}"
-            ))
+            ptt_fail(
+                &alloc::format!("could not open the ssh audio channel: {err:?}"),
+                "ptt: audio channel failed to open (see device log)",
+            )
             .await;
             return None;
         }
@@ -560,9 +577,10 @@ async fn open_audio_channel<'g, 'a>(
     // session-open event; waiting for its result keeps audio from being
     // written before the helper is running, which would only be discarded.
     if !AUDIO_EXEC_SENT.wait().await {
-        ptt_note(&alloc::format!(
-            "could not start the ssh audio helper `{described}`"
-        ))
+        ptt_fail(
+            &alloc::format!("could not start the ssh audio helper `{described}`"),
+            "ptt: helper failed to start (see device log)",
+        )
         .await;
         return None;
     }
@@ -575,9 +593,10 @@ async fn open_audio_channel<'g, 'a>(
         while sent < PTT_HELPER_SCRIPT.len() {
             let end = (sent + PTT_SCRIPT_CHUNK_BYTES).min(PTT_HELPER_SCRIPT.len());
             if let Err(err) = channel.write_all(&PTT_HELPER_SCRIPT[sent..end]).await {
-                ptt_note(&alloc::format!(
-                    "could not send the ssh audio helper ({err:?})"
-                ))
+                ptt_fail(
+                    &alloc::format!("could not send the ssh audio helper ({err:?})"),
+                    "ptt: failed to send the helper script (see device log)",
+                )
                 .await;
                 return None;
             }
@@ -605,6 +624,22 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
     let mut err_buf = [0u8; 96];
     let mut out_buf = [0u8; 96];
     let mut stderr_done = false;
+    // Last non-empty line seen on the helper's stderr - e.g. a Python
+    // exception's final line - kept only to build a short on-screen crash
+    // summary if the channel then closes. Never shown raw: a multi-line
+    // traceback must not be dumped onto the small screen (see `ptt_fail`'s
+    // doc), so only this one trailing line, already logged in full via
+    // `ptt_note` below, ever reaches the notice.
+    let mut last_stderr_line = alloc::string::String::new();
+    // A line's bytes can straddle two 96-byte stderr reads (realistic for
+    // Python tracebacks), so the tail of a not-yet-newline-terminated line
+    // is carried here and prepended to the next read before re-scanning,
+    // instead of scanning each read in isolation. Capped so a line that
+    // never terminates (stalled/malicious peer) can't grow this without
+    // bound; the cap keeps the *tail* since that is where the informative
+    // part of a crash line (e.g. the exception message) tends to be.
+    let mut stderr_fragment = alloc::string::String::new();
+    const MAX_STDERR_FRAGMENT: usize = 200;
     loop {
         let read_stderr = async {
             if stderr_done {
@@ -622,9 +657,10 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
         {
             Either3::First(frame) => {
                 if let Err(err) = channel.write_all(&frame.bytes[..frame.len as usize]).await {
-                    ptt_note(&alloc::format!(
-                        "ssh audio helper stopped reading ({err:?})"
-                    ))
+                    ptt_fail(
+                        &alloc::format!("ssh audio helper stopped reading ({err:?})"),
+                        &helper_crash_notice(&last_stderr_line),
+                    )
                     .await;
                     return;
                 }
@@ -635,7 +671,11 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
                 // `picocalc-ptt` makes the shell report a failure and exit
                 // immediately).
                 Ok(0) | Err(_) => {
-                    ptt_note("ssh audio helper exited").await;
+                    ptt_fail(
+                        "ssh audio helper exited",
+                        &helper_crash_notice(&last_stderr_line),
+                    )
+                    .await;
                     return;
                 }
                 Ok(_) => {}
@@ -643,13 +683,53 @@ async fn pump_audio(mut channel: ChanInOut<'_, '_>, mut stderr: ChanIn<'_, '_>) 
             Either3::Third(read) => match read {
                 // Either end of the helper's stderr means no more diagnostics
                 // from it; the channel itself can still be carrying audio.
-                Ok(0) | Err(_) => stderr_done = true,
+                Ok(0) | Err(_) => {
+                    stderr_done = true;
+                    // The final line may never have gotten a trailing
+                    // newline (the process just exited) - that's still the
+                    // last line the helper wrote, so flush it now.
+                    let trimmed = stderr_fragment.trim();
+                    if !trimmed.is_empty() {
+                        last_stderr_line.clear();
+                        last_stderr_line.push_str(trimmed);
+                    }
+                }
                 Ok(n) => {
                     let text = alloc::string::String::from_utf8_lossy(&err_buf[..n]);
                     ptt_note(text.trim_end()).await;
+                    stderr_fragment.push_str(&text);
+                    if stderr_fragment.len() > MAX_STDERR_FRAGMENT {
+                        let excess = stderr_fragment.len() - MAX_STDERR_FRAGMENT;
+                        let cut = stderr_fragment
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .find(|&i| i >= excess)
+                            .unwrap_or(stderr_fragment.len());
+                        stderr_fragment.drain(..cut);
+                    }
+                    while let Some(pos) = stderr_fragment.find('\n') {
+                        let line = stderr_fragment[..pos].trim();
+                        if !line.is_empty() {
+                            last_stderr_line.clear();
+                            last_stderr_line.push_str(line);
+                        }
+                        stderr_fragment.drain(..=pos);
+                    }
                 }
             },
         }
+    }
+}
+
+/// A short, screen-safe summary for a helper crash/exit: the exception's
+/// final line when stderr carried one, or a generic fallback otherwise,
+/// always pointing at the device log for the full detail (never the raw
+/// multi-line traceback itself - see `ptt_fail`'s doc).
+fn helper_crash_notice(last_stderr_line: &str) -> alloc::string::String {
+    if last_stderr_line.is_empty() {
+        alloc::string::String::from("ptt: helper exited unexpectedly (see device log)")
+    } else {
+        alloc::format!("ptt: helper crashed: {last_stderr_line} (see device log)")
     }
 }
 
@@ -841,8 +921,11 @@ async fn ssh_session_task(
                                                 None => false,
                                             };
                                             if !sent {
-                                                ptt_note("could not start the ssh audio helper")
-                                                    .await;
+                                                ptt_fail(
+                                                    "could not start the ssh audio helper",
+                                                    "ptt: helper failed to start (see device log)",
+                                                )
+                                                .await;
                                             }
                                             AUDIO_EXEC_SENT.signal(sent);
                                             continue;

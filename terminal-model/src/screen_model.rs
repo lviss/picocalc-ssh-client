@@ -400,6 +400,19 @@ impl ScreenModel {
         }
     }
 
+    /// Wraps `self.overlay`/`show_notice` text into lines that each fit within
+    /// `max_width_px` pixels, using this model's own font metrics (the same
+    /// monospace per-character advance `cols` is computed from). The painter
+    /// (`src/screen.rs`'s `draw_overlay`) sizes the overlay box from the
+    /// returned lines instead of the raw string, which is the actual fix for
+    /// the clipped on-screen notice: the previous code painted the whole
+    /// string as one `Text::new` line with no width limit at all, so a notice
+    /// longer than the screen centered a box wider than the display and both
+    /// edges fell outside the drawable area (only the middle stayed visible).
+    pub fn wrap_overlay_text(&self, text: &str, max_width_px: u32) -> Vec<String> {
+        wrap_text_to_width(text, self.font, max_width_px)
+    }
+
     /// Sets the scrollback cap, silently clamped to [`Self::max_safe_scrollback`]
     /// so no caller - the `scroll` config command, a stale value loaded from
     /// flash at boot, or any future code - can push the screen's logical
@@ -442,6 +455,58 @@ impl ScreenModel {
         let scrollback_budget = SCREEN_HEAP_BUDGET_BYTES.saturating_sub(visible_budget);
         (scrollback_budget / per_line).max(1)
     }
+}
+
+/// Splits `s` after its `n`th character (not byte), for breaking a word that
+/// is itself wider than one wrapped line without landing mid-UTF-8-sequence.
+fn split_at_chars(s: &str, n: usize) -> (&str, &str) {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => (&s[..idx], &s[idx..]),
+        None => (s, ""),
+    }
+}
+
+/// Greedily word-wraps `text` so each returned line fits within
+/// `max_width_px` pixels of `font` (a monospace per-character advance, the
+/// same `character_size.width + character_spacing` `cols` is computed from).
+/// A word on its own wider than `max_width_px` is hard-broken mid-word rather
+/// than left to overflow one line, so no input text can ever produce a line
+/// wider than the limit the caller sized the overlay box for. Existing `\n`
+/// in `text` forces a line break (so a caller that already composed a
+/// multi-line message, e.g. a reason plus a pointer to the log, keeps that
+/// structure rather than having it folded into the greedy fill).
+fn wrap_text_to_width(text: &str, font: &MonoFont, max_width_px: u32) -> Vec<String> {
+    let char_width = (font.character_size.width + font.character_spacing).max(1);
+    let max_chars = ((max_width_px / char_width) as usize).max(1);
+
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if word.chars().count() > max_chars {
+                if !current.is_empty() {
+                    lines.push(core::mem::take(&mut current));
+                }
+                let mut remaining = word;
+                while remaining.chars().count() > max_chars {
+                    let (chunk, rest) = split_at_chars(remaining, max_chars);
+                    lines.push(String::from(chunk));
+                    remaining = rest;
+                }
+                current.push_str(remaining);
+                continue;
+            }
+            let extra = if current.is_empty() { 0 } else { 1 };
+            if current.chars().count() + extra + word.chars().count() > max_chars {
+                lines.push(core::mem::take(&mut current));
+            } else if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        lines.push(current);
+    }
+    lines
 }
 
 // vte always pushes a parameter slot on CSI dispatch, even when the sequence had no
@@ -802,6 +867,89 @@ mod tests {
 
         assert!(model.overlay.is_none());
         assert!(!model.full_repaint);
+    }
+
+    /// Per-character advance of the default font, matching how `max_chars` is
+    /// derived inside `wrap_text_to_width`/`cols`.
+    fn default_char_width() -> u32 {
+        let model = ScreenModel::default();
+        model.font.character_size.width + model.font.character_spacing
+    }
+
+    #[test]
+    fn wrap_overlay_text_leaves_short_text_on_one_line() {
+        let model = ScreenModel::default();
+        let max_width_px = default_char_width() * 40;
+
+        assert_eq!(
+            model.wrap_overlay_text("short notice", max_width_px),
+            alloc::vec![alloc::string::String::from("short notice")]
+        );
+    }
+
+    // Reproduces the captain's exact symptom: this literal (61 chars) is
+    // longer than fits on one line within any sane overlay width, and the old
+    // unwrapped `Text::new` painted it as one line regardless, centering a
+    // box wider than the screen whose edges fell outside the drawable area -
+    // "only the middle of the message was readable". Every wrapped line here
+    // must fit within `max_width_px`.
+    #[test]
+    fn wrap_overlay_text_fits_the_real_clipped_notice_within_the_box_width() {
+        let model = ScreenModel::default();
+        let char_width = default_char_width();
+        let max_chars = 24usize;
+        let max_width_px = char_width * max_chars as u32;
+
+        let message = "ptt unavailable: the session's audio channel is not running";
+        let lines = model.wrap_overlay_text(message, max_width_px);
+
+        assert!(lines.len() > 1, "expected wrapping, got {lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= max_chars,
+                "line {line:?} exceeds {max_chars} chars"
+            );
+        }
+        // No word is lost or reordered by wrapping.
+        let rejoined = lines.join(" ");
+        assert_eq!(
+            rejoined.split_whitespace().collect::<alloc::vec::Vec<_>>(),
+            message.split_whitespace().collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_overlay_text_hard_breaks_a_single_word_wider_than_the_box() {
+        let model = ScreenModel::default();
+        let char_width = default_char_width();
+        let max_chars = 10usize;
+        let max_width_px = char_width * max_chars as u32;
+
+        // No spaces at all: wrapping can only proceed by breaking the word
+        // itself, never by overflowing a line past `max_width_px`.
+        let lines = model.wrap_overlay_text("abcdefghijklmnopqrstuvwxyz", max_width_px);
+
+        assert!(lines.len() > 1, "expected a hard break, got {lines:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= max_chars, "line {line:?} too wide");
+        }
+        assert_eq!(lines.concat(), "abcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn wrap_overlay_text_preserves_explicit_newlines() {
+        let model = ScreenModel::default();
+        let max_width_px = default_char_width() * 40;
+
+        let lines = model.wrap_overlay_text("helper crashed\nsee device log", max_width_px);
+
+        assert_eq!(
+            lines,
+            alloc::vec![
+                alloc::string::String::from("helper crashed"),
+                alloc::string::String::from("see device log"),
+            ]
+        );
     }
 
     // Recording-then-battery ordering: a power-button battery readout taken

@@ -239,25 +239,20 @@ async fn read_and_reconcile() -> StoreOutcome {
     }
     drop(config);
     for failed in &unreconciled {
-        match write_errors.iter().find(|(key, _)| *key == failed.key) {
-            Some((_, err)) => {
-                crate::net::ptt_note(&alloc::format!(
-                    "failed to reconcile {} ({}) - store still holds {}; console reports flag it",
-                    failed.key,
-                    err,
-                    failed.stored
-                ))
-                .await
-            }
-            None => {
-                crate::net::ptt_note(&alloc::format!(
-                    "{} store is unreconciled (still holds {}); console reports flag it",
-                    failed.key,
-                    failed.stored
-                ))
-                .await
-            }
-        }
+        let message = match write_errors.iter().find(|(key, _)| *key == failed.key) {
+            Some((_, err)) => alloc::format!(
+                "failed to reconcile {} ({}) - store still holds {}; console reports flag it",
+                failed.key,
+                err,
+                failed.stored
+            ),
+            None => alloc::format!(
+                "{} store is unreconciled (still holds {}); console reports flag it",
+                failed.key,
+                failed.stored
+            ),
+        };
+        crate::net::ptt_fail(&message, &message).await;
     }
     StoreOutcome {
         stored: resolved.raw,
@@ -275,7 +270,8 @@ async fn resolve_settings() -> terminal_model::mic_config::ResolvedSettings {
 pub async fn load_settings() -> MicSettings {
     let resolved = resolve_settings().await;
     if resolved.fell_back {
-        crate::net::ptt_note("stored mic clock settings out of range, using defaults").await;
+        let message = "stored mic clock settings out of range, using defaults";
+        crate::net::ptt_fail(message, message).await;
     }
     resolved.settings
 }
@@ -747,17 +743,25 @@ async fn capture_task(mut mic: Mic) {
 /// stalling the I2S clocks.
 async fn emit_pending_notices() {
     if OVERFLOW_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
-        crate::net::ptt_note("upload can't keep up, dropping oldest audio").await;
+        let message = "upload can't keep up, dropping oldest audio";
+        crate::net::ptt_fail(message, message).await;
     }
     if DMA_OVERRUN_NOTICE_GEN.swap(0, Ordering::AcqRel) != 0 {
-        crate::net::ptt_note("capture ring overran, dropping some audio").await;
+        let message = "capture ring overran, dropping some audio";
+        crate::net::ptt_fail(message, message).await;
     }
     let capped_generation = CAP_NOTICE_GEN.swap(0, Ordering::AcqRel);
     if capped_generation != 0 {
-        crate::net::ptt_note("recording exceeded 60s cap, stopping").await;
+        let message = "recording exceeded 60s cap, stopping";
+        crate::net::ptt_note(message).await;
         let mut screen = SCREEN.get().lock().await;
         if CURRENT_GEN.load(Ordering::Acquire) == capped_generation {
+            // Clear first so the timed notice's dismissal has nothing
+            // persistent to restore - the recording this notice is about
+            // has already stopped, so falling back to the "recording..."
+            // indicator afterward would leave a stale one on screen.
             screen.clear_overlay();
+            screen.show_notice(String::from(message));
         }
     }
 }
@@ -807,7 +811,8 @@ async fn serve_utterance(generation: u32) {
                 // or its helper went away), which also covers the channel
                 // becoming unavailable between chunks.
                 if !crate::net::ssh_audio_send(&buf[..n]).await {
-                    crate::net::ptt_note("ssh audio channel unavailable, dropping rest").await;
+                    let message = "ssh audio channel unavailable, dropping rest";
+                    crate::net::ptt_fail(message, message).await;
                     ssh = false;
                 }
             }
@@ -832,7 +837,8 @@ async fn serve_utterance(generation: u32) {
         // utterance has to be marked in band (a zero-length frame) rather than
         // by closing anything.
         if !crate::net::ssh_audio_end_of_utterance().await {
-            crate::net::ptt_note("ssh audio channel unavailable, dropping utterance end").await;
+            let message = "ssh audio channel unavailable, dropping utterance end";
+            crate::net::ptt_fail(message, message).await;
         }
     }
 }
