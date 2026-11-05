@@ -805,17 +805,17 @@ mod tests {
     #[test]
     fn erase_character_leaves_stale_tail_from_a_longer_prior_frame() {
         let mut model = ScreenModel::default();
-        feed(&mut model, b"\x1b[12;3Hpath, since no single host knows theZZZZZZZ");
+        feed(
+            &mut model,
+            b"\x1b[12;3Hpath, since no single host knows theZZZZZZZ",
+        );
         feed(
             &mut model,
             b"\x1b[12;3Hpath, since no single h\x1b[Cst knows the\x1b[7X\x1b[13;3Hc\x1b[Cpacity of",
         );
 
         let row11: alloc::string::String = model.lines[11].chars[2..45].iter().collect();
-        assert_eq!(
-            &row11[0..36],
-            "path, since no single host knows the"
-        );
+        assert_eq!(&row11[0..36], "path, since no single host knows the");
         assert_eq!(&row11[36..43], "       ", "ECH should blank the stale tail");
     }
 
