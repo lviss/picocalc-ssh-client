@@ -194,6 +194,12 @@ pub struct ScreenModel {
     pub font: &'static MonoFont<'static>,
     pub rows: usize,
     cols: usize,
+    /// Top/bottom rows (0-based, inclusive) of the DECSTBM scrolling region,
+    /// set by the `'r'` csi_dispatch arm. Defaults to the full screen. Only
+    /// `'S'` (Scroll Up) respects this; LF-triggered scrolling (`scroll_up`)
+    /// always scrolls the whole screen, matching the report's scope.
+    scroll_top: usize,
+    scroll_bottom: usize,
     pub full_repaint: bool,
     /// Transient text shown on top of the terminal contents (e.g. the battery
     /// overlay). Never mutates `lines`/`scrollback` - the painter composites it
@@ -252,6 +258,8 @@ impl Default for ScreenModel {
             font,
             rows,
             cols,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             full_repaint: true,
             overlay: None,
             overlay_restore: None,
@@ -277,6 +285,7 @@ impl ScreenModel {
         }
         self.cursor_x = 0;
         self.cursor_y = 0;
+        self.viewport_offset = 0;
         self.full_repaint = true;
     }
 
@@ -303,6 +312,42 @@ impl ScreenModel {
                 self.scroll_up_calls += 1;
             }
         }
+    }
+
+    /// Scrolls the DECSTBM region (`scroll_top`..=`scroll_bottom`) up by `n`
+    /// lines: each iteration removes the region's current top line and
+    /// inserts a fresh blank line at its bottom, which - because removal
+    /// shifts every later index down by one before the insert - shifts
+    /// exactly the rows inside the region and leaves rows outside it alone,
+    /// regardless of where the region sits on screen. When the region's top
+    /// is row 0, the removed line is pushed into `scrollback` first (capped
+    /// the same way `scroll_up` already caps it), matching a real terminal's
+    /// scroll-up semantics; a region that doesn't start at row 0 (e.g. a
+    /// multiplexer's status-line-exempt region) discards the scrolled-off
+    /// line instead, since it was never part of the live-at-top screen.
+    fn scroll_region_up(&mut self, n: usize) {
+        let top = self.scroll_top.min(self.rows.saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if top >= bottom {
+            return;
+        }
+        let region_height = bottom - top + 1;
+        let n = n.min(region_height);
+        for _ in 0..n {
+            let line = self.lines.remove(top);
+            if top == 0 {
+                self.scrollback.push(line);
+                if self.scrollback.len() > self.max_scrollback {
+                    self.scrollback.remove(0);
+                }
+                #[cfg(test)]
+                {
+                    self.scroll_up_calls += 1;
+                }
+            }
+            self.lines.insert(bottom, ScreenLine::new(self.cols));
+        }
+        self.full_repaint = true;
     }
 
     /// Test-only accessor for [`Self::scroll_up_calls`] - see its doc comment
@@ -593,6 +638,39 @@ impl Perform for ScreenModel {
                 }
                 line.dirty = true;
             }
+            'X' => {
+                // Erase Character (ECH): blank n cells at the cursor without
+                // moving it.
+                let n = cursor_move_count(params);
+                let attrs = self.current_attrs;
+                let line = &mut self.lines[self.cursor_y];
+                let end = (self.cursor_x + n).min(line.chars.len());
+                line.erase(self.cursor_x, end, attrs);
+            }
+            'r' => {
+                // DECSTBM: Set Top and Bottom Margins (scrolling region).
+                // Params are 1-based; top defaults to 1 and bottom to the
+                // last row when absent/zero. An invalid (top >= bottom)
+                // request is ignored, leaving the current region unchanged.
+                let mut iter = params.iter();
+                let top = iter.next().map(|p| p[0]).unwrap_or(0).max(1) as usize - 1;
+                let bottom_raw = iter.next().map(|p| p[0]).unwrap_or(0);
+                let bottom = if bottom_raw == 0 {
+                    self.rows - 1
+                } else {
+                    (bottom_raw as usize - 1).min(self.rows - 1)
+                };
+                let top = top.min(self.rows - 1);
+                if top < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                }
+            }
+            'S' => {
+                // Scroll Up (SU): shift the scrolling region's lines up by n.
+                let n = cursor_move_count(params);
+                self.scroll_region_up(n);
+            }
             'm' => {
                 // SGR
                 for param in params.iter() {
@@ -713,6 +791,67 @@ mod tests {
 
         feed(&mut model, b"\x1b[0C");
         assert_eq!(model.cursor_x, 2);
+    }
+
+    // Regression test for the ghost-character symptom from
+    // /ai/firstmate/data/picocalc-clear-and-ghost-chars-2/report.md: Ink (the
+    // claude-code CLI's renderer) uses `CSI Pn X` (Erase Character) to blank a
+    // line's stale trailing characters left over from an earlier, longer
+    // frame of that same line. The first `feed` seeds a synthetic-but-
+    // representative stale 7-character tail standing in for whatever an
+    // earlier, longer frame left behind; the second `feed` is verbatim from
+    // the report's live capture of a real claude-code 2.1.223 session inside
+    // tmux. With the `'X'` csi_dispatch arm in place, the tail is blanked.
+    #[test]
+    fn erase_character_leaves_stale_tail_from_a_longer_prior_frame() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"\x1b[12;3Hpath, since no single host knows theZZZZZZZ");
+        feed(
+            &mut model,
+            b"\x1b[12;3Hpath, since no single h\x1b[Cst knows the\x1b[7X\x1b[13;3Hc\x1b[Cpacity of",
+        );
+
+        let row11: alloc::string::String = model.lines[11].chars[2..45].iter().collect();
+        assert_eq!(
+            &row11[0..36],
+            "path, since no single host knows the"
+        );
+        assert_eq!(&row11[36..43], "       ", "ECH should blank the stale tail");
+    }
+
+    // Regression test for the "clear doesn't clear" symptom from
+    // /ai/firstmate/data/picocalc-clear-and-ghost-chars-2/report.md: tmux
+    // re-encodes a pane-wide `clear` as a DECSTBM (`CSI r`) + Scroll Up
+    // (`CSI S`) idiom instead of sending a literal `CSI 2J`. Bytes are
+    // verbatim from the report's live capture of `tmux 3.6a` (`TERM=xterm`).
+    // With `'r'`/`'S'` csi_dispatch arms in place, the region is genuinely
+    // scrolled blank and the screen ends up cleared, matching a real
+    // terminal's behavior.
+    #[test]
+    fn tmux_clear_idiom_scroll_region_and_scroll_up_leaves_screen_uncleared() {
+        let mut model = ScreenModel::default();
+        feed(&mut model, b"line1\r\nline2\r\nhello world\r\n");
+        feed(
+            &mut model,
+            b"clear\r\n\x1b[1;23r\x1b[1;1H\x1b[2;23r\x1b[22S\x1b[1;1H\x1b[K\x1b[1;24r\x1b[1;1H\r\n",
+        );
+
+        for (i, line) in model.lines.iter().take(23).enumerate() {
+            let text: alloc::string::String = line.chars.iter().collect();
+            assert!(
+                text.trim_end().is_empty(),
+                "row {i} should be blank after the tmux clear idiom, got {text:?}"
+            );
+        }
+
+        // The idiom's trailing \r\n leaves the cursor on row 1 (row 0 was
+        // separately blanked by the CSI K above).
+        feed(&mut model, b"XY");
+        let row_after: alloc::string::String = model.lines[1].chars[0..2].iter().collect();
+        assert_eq!(
+            row_after, "XY",
+            "new output should land on a blank screen, not overwrite old content"
+        );
     }
 
     #[test]
