@@ -131,7 +131,9 @@ $ wifi save guest "Coffee Shop Guest" "a password with spaces"
 
 Switching with `wifi use` takes effect right away: it disconnects from the
 current network (if any) and joins the selected one, negotiating a fresh DHCP
-lease. It also remembers the choice for the next boot.
+lease. It also remembers the choice for the next boot - but only once the
+join succeeds; a failed attempt (bad password, typo'd name) reports the
+failure and leaves the previously active network selected.
 
 A device upgrading from an older firmware version that stored a single
 network under `wifi_ssid`/`wifi_pw` has that network migrated automatically

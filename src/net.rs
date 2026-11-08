@@ -344,11 +344,12 @@ async fn list_wifi_networks() {
     }
 }
 
-/// Switches to a previously saved network: disassociates from whatever
-/// network is currently joined (if any), joins the new one (forcing a fresh
-/// DHCP lease rather than keeping the old network's stale address), and only
-/// then marks it active. A failed join leaves the previously active network
-/// recorded in the config store untouched, so a bad password or typo'd name
+/// Switches to a previously saved network: joins the new one directly
+/// (`join_wifi` re-associates on its own, same as boot; no explicit
+/// disassociate step), forcing a fresh DHCP lease rather than keeping the
+/// old network's stale address, and only then marks it active. A failed
+/// join leaves the previously active network recorded in the config store
+/// untouched, so a bad password or typo'd name
 /// can't strand the device on a broken network across a reboot.
 async fn use_wifi_network(name: &str) {
     let Some(key) = wifi_network_key_or_report(name).await else {
