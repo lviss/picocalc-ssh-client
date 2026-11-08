@@ -344,10 +344,12 @@ async fn list_wifi_networks() {
     }
 }
 
-/// Switches to a previously saved network: marks it active, then
-/// disassociates from whatever network is currently joined (if any) and
-/// joins the new one, forcing a fresh DHCP lease rather than keeping the
-/// old network's stale address.
+/// Switches to a previously saved network: disassociates from whatever
+/// network is currently joined (if any), joins the new one (forcing a fresh
+/// DHCP lease rather than keeping the old network's stale address), and only
+/// then marks it active. A failed join leaves the previously active network
+/// recorded in the config store untouched, so a bad password or typo'd name
+/// can't strand the device on a broken network across a reboot.
 async fn use_wifi_network(name: &str) {
     let Some(key) = wifi_network_key_or_report(name).await else {
         return;
@@ -373,20 +375,13 @@ async fn use_wifi_network(name: &str) {
         }
     };
 
-    {
-        let active_value: StrValue = match name.try_into() {
-            Ok(v) => v,
-            Err(err) => {
-                print!("value `{name}`: {err:?}\r\n");
-                return;
-            }
-        };
-        let mut config = CONFIG.get().lock().await;
-        if let Err(err) = config.store(wifi_config::ACTIVE_KEY, active_value).await {
-            print!("{err:?}\r\n");
+    let active_value: StrValue = match name.try_into() {
+        Ok(v) => v,
+        Err(err) => {
+            print!("value `{name}`: {err:?}\r\n");
             return;
         }
-    }
+    };
 
     let mut control_guard = WIFI_CONTROL.get().lock().await;
     let Some(control) = control_guard.as_mut() else {
@@ -413,9 +408,18 @@ async fn use_wifi_network(name: &str) {
     if let Some(stack) = stack {
         stack.set_config_v4(embassy_net::ConfigV4::Dhcp(Default::default()));
     }
-    if join_wifi(control, &ssid, &password).await
-        && let Some(stack) = stack
-    {
+    if !join_wifi(control, &ssid, &password).await {
+        print!("Failed to switch to '{name}'; keeping the previously active network\r\n");
+        return;
+    }
+
+    let mut config = CONFIG.get().lock().await;
+    if let Err(err) = config.store(wifi_config::ACTIVE_KEY, active_value).await {
+        print!("joined '{name}' but failed to save it as active: {err:?}\r\n");
+    }
+    drop(config);
+
+    if let Some(stack) = stack {
         // `time_sync` (spawned once, at boot) keeps running and will pick up
         // the new network on its own; it just won't announce the sync it
         // gets from it, since it only ever prints once per boot. Re-arm that
