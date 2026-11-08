@@ -92,17 +92,47 @@ On first boot, you need to configure your WiFi credentials. The device includes 
 # Format the config storage (only needed once)
 $ config format
 
-# Set WiFi credentials
-$ config set wifi_ssid MyNetwork
-$ config set wifi_pw MyPassword
+# Save a network (password is optional; omit it for an open network)
+$ wifi save home MyNetwork MyPassword
 
-# Reboot to apply
-$ reboot
+# Select it
+$ wifi use home
 ```
+
+`wifi use` connects immediately, so no reboot is needed - though the network
+you last selected is also the one joined automatically on every boot.
 
 > [!CAUTION]
 > Credentials (and the SSH private key, if you generate one) are stored
 > unencrypted in the device's flash memory.
+
+### Managing WiFi Networks
+
+Several networks can be saved at once, so switching doesn't mean retyping
+credentials:
+
+```bash
+# Save additional networks
+$ wifi save work OfficeWiFi officepassword
+$ wifi save cafe OpenCafeWiFi
+
+# List saved networks (* marks the active one)
+$ wifi list
+
+# Switch to a saved network
+$ wifi use work
+
+# Remove one
+$ wifi forget cafe
+```
+
+Switching with `wifi use` takes effect right away: it disconnects from the
+current network (if any) and joins the selected one, negotiating a fresh DHCP
+lease. It also remembers the choice for the next boot.
+
+A device upgrading from an older firmware version that stored a single
+network under `wifi_ssid`/`wifi_pw` has that network migrated automatically
+into the new list (named `default`) the first time it boots this version.
 
 ### Connecting via SSH
 

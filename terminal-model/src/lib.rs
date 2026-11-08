@@ -12,3 +12,4 @@ pub mod mic_config;
 pub mod pcm_extract;
 pub mod ptt_frame;
 pub mod screen_model;
+pub mod wifi_config;
