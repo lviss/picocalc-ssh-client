@@ -395,14 +395,33 @@ async fn use_wifi_network(name: &str) {
     };
     let stack = STACK.get().lock().await.as_ref().copied();
 
-    control.leave().await;
+    // Reset the DHCP state *before* joining, not after. cyw43's `Control`
+    // only ever reports the link as "up" (a successful join always marks it
+    // so, even when it already was), never "down" - so embassy-net's own
+    // link-transition DHCP reset in its poll loop never fires for us, and
+    // the only reliable wake that follows a config reset is the one a
+    // successful join always raises (`set_link_state` wakes the net task
+    // unconditionally). Resetting first means that wake - the same
+    // mechanism the proven boot-time connect in `setup_wifi` relies on -
+    // is the one that picks up a DHCP client already armed to retry
+    // immediately, instead of racing a reset issued after the join's wake
+    // has already been spent. Deliberately no explicit `control.leave()`
+    // beforehand either: `join_wifi` (shared with boot) sets a new SSID
+    // directly, which re-associates on its own exactly like the boot path
+    // already does, so the live-switch path re-drives the identical
+    // join/DHCP sequence instead of adding an untested disassociate step.
+    if let Some(stack) = stack {
+        stack.set_config_v4(embassy_net::ConfigV4::Dhcp(Default::default()));
+    }
     if join_wifi(control, &ssid, &password).await
         && let Some(stack) = stack
     {
-        // The link may already have been considered "up" from the previous
-        // network, so force a fresh DHCP negotiation rather than trusting a
-        // stale lease from the network just left.
-        stack.set_config_v4(embassy_net::ConfigV4::Dhcp(Default::default()));
+        // `time_sync` (spawned once, at boot) keeps running and will pick up
+        // the new network on its own; it just won't announce the sync it
+        // gets from it, since it only ever prints once per boot. Re-arm that
+        // announcement so switching networks live still confirms a working
+        // clock, the same way booting does.
+        crate::time::request_time_announcement();
         wait_for_network_up(stack).await;
     }
 }
