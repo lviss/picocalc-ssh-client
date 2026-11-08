@@ -173,7 +173,7 @@ impl LocalShell {
             "reboot" => crate::keyboard::reboot(),
             "ssh" => crate::net::ssh_command(&argv).await,
             "time" => crate::time::time_command(&argv).await,
-            "wifi" => crate::net::wifi_command(&argv).await,
+            "wifi" => crate::net::wifi_command(command).await,
             _ => {
                 let mut screen = SCREEN.get().lock().await;
                 write!(screen, "Unknown command: {arg0}\r\n").ok();

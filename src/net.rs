@@ -8,6 +8,7 @@ use crate::screen::{SCREEN, SCREEN_HEIGHT, SCREEN_WIDTH, Screen};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyw43::Control;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
@@ -406,8 +407,10 @@ async fn use_wifi_network(name: &str) {
     }
 }
 
-pub async fn wifi_command(args: &[&str]) {
-    match args {
+pub async fn wifi_command(command: &str) {
+    let tokens = wifi_config::tokenize_command(command);
+    let args: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    match args.as_slice() {
         ["wifi", "save", name, ssid, rest @ ..] => {
             save_wifi_network(name, ssid, &rest.join(" ")).await;
         }

@@ -124,6 +124,9 @@ $ wifi use work
 
 # Remove one
 $ wifi forget cafe
+
+# Quote an SSID or password that contains spaces
+$ wifi save guest "Coffee Shop Guest" "a password with spaces"
 ```
 
 Switching with `wifi use` takes effect right away: it disconnects from the

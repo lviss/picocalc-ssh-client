@@ -22,6 +22,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Config key holding the name of the network to use.
 pub const ACTIVE_KEY: &str = "wifi_active";
@@ -73,6 +74,51 @@ pub fn decode_network(value: &str) -> Option<(&str, &str)> {
     value.split_once(FIELD_SEP)
 }
 
+/// Splits a `wifi` console command line into tokens. `src/process.rs`
+/// tokenizes every other command with a plain `str::split(' ')`, which has
+/// no way to put a space inside a single argument - fatal for `wifi save
+/// <name> <ssid> [password]`, since real-world SSIDs and passwords commonly
+/// contain spaces. This tokenizer keeps the same unquoted behavior (runs of
+/// spaces separate tokens) but additionally treats a `"..."` run as a single
+/// token, spaces and all, with the quotes stripped - e.g. `save home "Pizza
+/// Palace Guest" "my pass"` yields `["save", "home", "Pizza Palace Guest",
+/// "my pass"]`. An unterminated trailing quote takes the rest of the line
+/// as that token's content rather than erroring. Scoped to the `wifi`
+/// command only; every other command keeps using the shared unquoted
+/// tokenizer.
+pub fn tokenize_command(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    while chars.peek().is_some() {
+        while chars.peek() == Some(&' ') {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut token = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c == '"' {
+                    break;
+                }
+                token.push(c);
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                token.push(c);
+                chars.next();
+            }
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
 /// What to do, if anything, with a device's config store the first time it
 /// boots a firmware version that understands a network list.
 #[derive(Debug, PartialEq, Eq)]
@@ -114,6 +160,54 @@ pub fn plan_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenize_command_splits_plain_unquoted_words() {
+        assert_eq!(
+            tokenize_command("wifi save home myssid mypassword"),
+            ["wifi", "save", "home", "myssid", "mypassword"]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_keeps_a_quoted_ssid_with_spaces_as_one_token() {
+        assert_eq!(
+            tokenize_command(r#"wifi save cafe "Pizza Palace Guest" mypassword"#),
+            ["wifi", "save", "cafe", "Pizza Palace Guest", "mypassword"]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_keeps_a_quoted_password_with_spaces_as_one_token() {
+        assert_eq!(
+            tokenize_command(r#"wifi save cafe "Pizza Palace Guest" "my pass""#),
+            ["wifi", "save", "cafe", "Pizza Palace Guest", "my pass"]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_treats_empty_quotes_as_an_empty_token() {
+        assert_eq!(
+            tokenize_command(r#"wifi save cafe "Pizza Palace Guest" """#),
+            ["wifi", "save", "cafe", "Pizza Palace Guest", ""]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_takes_rest_of_line_for_an_unterminated_quote() {
+        assert_eq!(
+            tokenize_command(r#"wifi save cafe "Pizza Palace Guest"#),
+            ["wifi", "save", "cafe", "Pizza Palace Guest"]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_collapses_runs_of_spaces() {
+        assert_eq!(
+            tokenize_command("wifi  save   home"),
+            ["wifi", "save", "home"]
+        );
+    }
 
     #[test]
     fn network_key_round_trips_the_name() {
