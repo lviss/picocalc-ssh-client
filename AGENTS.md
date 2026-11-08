@@ -20,8 +20,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (`audio_ring.rs`), the free-running capture DMA ring's wrap arithmetic (`dma_ring.rs`), the I2S
   bit-clock/PCM-extraction arithmetic (`pcm_extract.rs`), the mic
   runtime-settings resolution and console-validation decision table (`mic_config.rs`) and the
-  runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, and the SD-card
-  SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`. It depends only on
+  runtime PIO I2S RX program assembly (`i2s_program.rs`) from `src/mic.rs`, the SD-card
+  SSH-key backup text codec (`keyfile.rs`) from `src/sshkey.rs`, and the saved-WiFi-network key
+  encoding, quoted-argument tokenizing, and legacy-credential migration decision table
+  (`wifi_config.rs`) from `src/net.rs`. It depends only on
   `vte`, `embedded-graphics`, `pio`, and `profont` — all host-buildable — so it's the place for
   real, runnable unit tests. Run them with
   `cargo test -p terminal-model --target x86_64-unknown-linux-gnu` (must override the default

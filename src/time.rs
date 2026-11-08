@@ -1,5 +1,6 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use core::net::{IpAddr, SocketAddr};
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -8,6 +9,20 @@ use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use sntpc::{NtpContext, NtpResult, NtpTimestampGenerator, get_time};
+
+/// Whether the next successful NTP sync should print "The time is ...".
+/// `time_sync` is spawned once at boot and otherwise only announces its
+/// very first sync, so without this a live network switch (`wifi use`)
+/// would resync time in the background with no visible confirmation.
+static ANNOUNCE_NEXT_SYNC: AtomicBool = AtomicBool::new(true);
+
+/// Arms the next successful NTP sync to print "The time is ..." again, even
+/// though the long-running `time_sync` task already did so once since boot.
+/// Call this when a live network switch should get the same boot-time time
+/// confirmation.
+pub fn request_time_announcement() {
+    ANNOUNCE_NEXT_SYNC.store(true, Ordering::Relaxed);
+}
 
 // This module keeps track of the wall clock time.
 // The rp2350 has an AON time source that can be used
@@ -188,8 +203,6 @@ pub async fn time_sync(stack: Stack<'static>) {
 
     let context = NtpContext::new(Timestamp::default());
 
-    let mut first = true;
-
     loop {
         let ntp_addrs = match stack.dns_query(NTP_SERVER, DnsQueryType::A).await {
             Ok(ntp_addrs) => ntp_addrs,
@@ -222,8 +235,7 @@ pub async fn time_sync(stack: Stack<'static>) {
                         let rfc3339 = current_rfc3339();
 
                         let offset = Duration::from_micros(time.offset.unsigned_abs());
-                        if first {
-                            first = false;
+                        if ANNOUNCE_NEXT_SYNC.swap(false, Ordering::Relaxed) {
                             print!("The time is {rfc3339}\r\n");
                         }
 

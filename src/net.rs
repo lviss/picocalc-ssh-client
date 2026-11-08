@@ -8,6 +8,7 @@ use crate::screen::{SCREEN, SCREEN_HEIGHT, SCREEN_WIDTH, Screen};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyw43::Control;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
@@ -30,7 +31,7 @@ use rand_core::RngCore;
 use static_cell::StaticCell;
 use sunset::{CliEvent, SessionCommand, SignKey};
 use sunset_embassy::{ChanIn, ChanInOut, ProgressHolder, SSHClient};
-use terminal_model::ptt_frame;
+use terminal_model::{ptt_frame, wifi_config};
 
 extern crate alloc;
 
@@ -105,55 +106,75 @@ pub async fn setup_wifi(
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
-    let (ssid, wifi_pw) = {
-        let mut config = CONFIG.get().lock().await;
-        let ssid = config.fetch("wifi_ssid").await;
-        let wifi_pw = config.fetch("wifi_pw").await;
-        (ssid, wifi_pw)
-    };
-    match (ssid, wifi_pw) {
-        (Ok(Some(ssid)), Ok(Some(wifi_pw))) => {
-            if !ssid.is_empty() {
-                print!("Connecting to \u{1b}[1m{ssid}\u{1b}[0m...\r\n");
-                const JOIN_ATTEMPTS: u32 = 5;
-                const JOIN_RETRY_DELAY: Duration = Duration::from_millis(500);
-                let mut last_err = None;
-                for attempt in 1..=JOIN_ATTEMPTS {
-                    match control
-                        .join(&ssid, cyw43::JoinOptions::new(wifi_pw.as_bytes()))
-                        .await
-                    {
-                        Ok(_) => {
-                            last_err = None;
-                            break;
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "join attempt {attempt}/{JOIN_ATTEMPTS} failed with status={}",
-                                err.status
-                            );
-                            last_err = Some(err);
-                            if attempt < JOIN_ATTEMPTS {
-                                Timer::after(JOIN_RETRY_DELAY).await;
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = last_err {
-                    log::error!(
-                        "join failed with status={} after {JOIN_ATTEMPTS} attempts",
-                        err.status
-                    );
-                    print!("Failed with status {}\r\n", err.status);
-                }
-            }
+    migrate_legacy_wifi_config().await;
+    match active_network().await {
+        Some((ssid, password)) => {
+            join_wifi(&mut control, &ssid, &password).await;
         }
-        _ => {
-            print!("wifi_ssid and/or wifi_pw are not set\r\n");
+        None => {
+            print!(
+                "No WiFi network selected. Use `wifi save <name> <ssid> [password]` then `wifi use <name>`.\r\n"
+            );
         }
     }
     WIFI_CONTROL.get().lock().await.replace(control);
 
+    wait_for_network_up(stack).await;
+
+    spawner.must_spawn(crate::time::time_sync(stack));
+    STACK.get().lock().await.replace(stack);
+}
+
+/// Joins `ssid` (an empty `password` means an open network), retrying a few
+/// times before giving up. Returns whether the join succeeded. Used both for
+/// the initial boot-time connect and for `wifi use` switching networks at
+/// runtime, so both paths report failures the same way.
+async fn join_wifi(control: &mut Control<'static>, ssid: &str, password: &str) -> bool {
+    if ssid.is_empty() {
+        return false;
+    }
+    print!("Connecting to \u{1b}[1m{ssid}\u{1b}[0m...\r\n");
+    const JOIN_ATTEMPTS: u32 = 5;
+    const JOIN_RETRY_DELAY: Duration = Duration::from_millis(500);
+    let join_options = if password.is_empty() {
+        cyw43::JoinOptions::new_open()
+    } else {
+        cyw43::JoinOptions::new(password.as_bytes())
+    };
+    let mut last_err = None;
+    for attempt in 1..=JOIN_ATTEMPTS {
+        match control.join(ssid, join_options.clone()).await {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(err) => {
+                log::warn!(
+                    "join attempt {attempt}/{JOIN_ATTEMPTS} failed with status={}",
+                    err.status
+                );
+                last_err = Some(err);
+                if attempt < JOIN_ATTEMPTS {
+                    Timer::after(JOIN_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        log::error!(
+            "join failed with status={} after {JOIN_ATTEMPTS} attempts",
+            err.status
+        );
+        print!("Failed with status {}\r\n", err.status);
+        return false;
+    }
+    true
+}
+
+/// Waits (with a timeout) for the stack to obtain an IP configuration and
+/// prints it, exactly as the boot-time connect has always done. Also used by
+/// `wifi use` after switching networks at runtime.
+async fn wait_for_network_up(stack: Stack<'static>) {
     log::info!("waiting for TCP to be up...");
     const CONFIG_UP_TIMEOUT: Duration = Duration::from_secs(30);
     match with_timeout(CONFIG_UP_TIMEOUT, stack.wait_config_up()).await {
@@ -167,9 +188,281 @@ pub async fn setup_wifi(
         log::info!("{v4:?}");
         print!("IP Address {}\r\n", v4.address);
     }
+}
 
-    spawner.must_spawn(crate::time::time_sync(stack));
-    STACK.get().lock().await.replace(stack);
+/// One-time migration of a pre-existing `wifi_ssid`/`wifi_pw` pair (the only
+/// way earlier firmware versions stored WiFi credentials) into the new
+/// saved-network list, so upgrading a device never silently drops its
+/// configured network. See `terminal_model::wifi_config` for the decision
+/// table this drives.
+async fn migrate_legacy_wifi_config() {
+    let mut config = CONFIG.get().lock().await;
+    let has_active = matches!(config.fetch(wifi_config::ACTIVE_KEY).await, Ok(Some(_)));
+    let has_any_saved_network = match config.get_all().await {
+        Ok(map) => map
+            .iter()
+            .any(|(k, _)| wifi_config::network_name(k.as_str()).is_some()),
+        Err(_) => false,
+    };
+    let legacy_ssid = config
+        .fetch(wifi_config::LEGACY_SSID_KEY)
+        .await
+        .ok()
+        .flatten();
+    let legacy_password = config
+        .fetch(wifi_config::LEGACY_PASSWORD_KEY)
+        .await
+        .ok()
+        .flatten();
+    let plan = wifi_config::plan_migration(
+        has_active,
+        has_any_saved_network,
+        legacy_ssid.as_ref().map(|s| s.as_str()),
+        legacy_password.as_ref().map(|s| s.as_str()),
+    );
+    let wifi_config::Migration::Migrate { ssid, password } = plan else {
+        return;
+    };
+    let name = wifi_config::MIGRATED_NAME;
+    let Some(key) = wifi_config::network_key(name) else {
+        return;
+    };
+    let Ok(network_value): Result<StrValue, _> = wifi_config::encode_network(&ssid, &password)
+        .as_str()
+        .try_into()
+    else {
+        return;
+    };
+    if config.store(&key, network_value).await.is_err() {
+        return;
+    }
+    let Ok(active_value): Result<StrValue, _> = name.try_into() else {
+        return;
+    };
+    if config
+        .store(wifi_config::ACTIVE_KEY, active_value)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = config.remove(wifi_config::LEGACY_SSID_KEY).await;
+    let _ = config.remove(wifi_config::LEGACY_PASSWORD_KEY).await;
+    log::info!("migrated legacy wifi_ssid/wifi_pw into saved network '{name}'");
+}
+
+/// Resolves the active saved network (if any) to its `(ssid, password)`.
+async fn active_network() -> Option<(String, String)> {
+    let mut config = CONFIG.get().lock().await;
+    let name = config.fetch(wifi_config::ACTIVE_KEY).await.ok().flatten()?;
+    let key = wifi_config::network_key(name.as_str())?;
+    let value = config.fetch(&key).await.ok().flatten()?;
+    let (ssid, password) = wifi_config::decode_network(value.as_str())?;
+    Some((ssid.to_string(), password.to_string()))
+}
+
+/// Like [`wifi_config::network_key`], but reports the "name is too long"
+/// error itself when the name doesn't fit, so callers only need to handle
+/// the `None` case.
+async fn wifi_network_key_or_report(name: &str) -> Option<String> {
+    let key = wifi_config::network_key(name);
+    if key.is_none() {
+        print!("network name is too long\r\n");
+    }
+    key
+}
+
+async fn save_wifi_network(name: &str, ssid: &str, password: &str) {
+    if ssid.is_empty() {
+        print!("ssid must not be empty\r\n");
+        return;
+    }
+    let Some(key) = wifi_network_key_or_report(name).await else {
+        return;
+    };
+    let encoded = wifi_config::encode_network(ssid, password);
+    let value: StrValue = match encoded.as_str().try_into() {
+        Ok(v) => v,
+        Err(err) => {
+            print!("ssid/password too long: {err:?}\r\n");
+            return;
+        }
+    };
+    let mut config = CONFIG.get().lock().await;
+    match config.store(&key, value).await {
+        Ok(()) => print!("Saved '{name}' (ssid '{ssid}')\r\n"),
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
+async fn forget_wifi_network(name: &str) {
+    let Some(key) = wifi_network_key_or_report(name).await else {
+        return;
+    };
+    let mut config = CONFIG.get().lock().await;
+    match config.remove(&key).await {
+        Ok(()) => {
+            print!("Forgot '{name}'\r\n");
+            // Don't leave `wifi_active` pointing at a network that no longer
+            // exists.
+            if let Ok(Some(active)) = config.fetch(wifi_config::ACTIVE_KEY).await
+                && active.as_str() == name
+            {
+                let _ = config.remove(wifi_config::ACTIVE_KEY).await;
+            }
+        }
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
+async fn list_wifi_networks() {
+    let mut config = CONFIG.get().lock().await;
+    let active = config.fetch(wifi_config::ACTIVE_KEY).await.ok().flatten();
+    match config.get_all().await {
+        Ok(map) => {
+            let mut any = false;
+            for (k, v) in &map {
+                let Some(name) = wifi_config::network_name(k.as_str()) else {
+                    continue;
+                };
+                let marker = if active.as_ref().is_some_and(|a| a.as_str() == name) {
+                    "*"
+                } else {
+                    " "
+                };
+                let ssid = wifi_config::decode_network(v.as_str())
+                    .map(|(ssid, _)| ssid)
+                    .unwrap_or("?");
+                print!("{marker} {name} -> {ssid}\r\n");
+                any = true;
+            }
+            if !any {
+                print!("No saved networks. Use `wifi save <name> <ssid> [password]`.\r\n");
+            }
+        }
+        Err(err) => print!("{err:?}\r\n"),
+    }
+}
+
+/// Switches to a previously saved network: joins the new one directly
+/// (`join_wifi` re-associates on its own, same as boot; no explicit
+/// disassociate step), forcing a fresh DHCP lease rather than keeping the
+/// old network's stale address, and only then marks it active. A failed
+/// join leaves the previously active network recorded in the config store
+/// untouched, so a bad password or typo'd name
+/// can't strand the device on a broken network across a reboot.
+async fn use_wifi_network(name: &str) {
+    let Some(key) = wifi_network_key_or_report(name).await else {
+        return;
+    };
+    let (ssid, password) = {
+        let mut config = CONFIG.get().lock().await;
+        match config.fetch(&key).await {
+            Ok(Some(value)) => match wifi_config::decode_network(value.as_str()) {
+                Some((ssid, password)) => (ssid.to_string(), password.to_string()),
+                None => {
+                    print!("saved network '{name}' is corrupt\r\n");
+                    return;
+                }
+            },
+            Ok(None) => {
+                print!("no saved network named '{name}'. Use `wifi list`.\r\n");
+                return;
+            }
+            Err(err) => {
+                print!("{err:?}\r\n");
+                return;
+            }
+        }
+    };
+
+    let active_value: StrValue = match name.try_into() {
+        Ok(v) => v,
+        Err(err) => {
+            print!("value `{name}`: {err:?}\r\n");
+            return;
+        }
+    };
+
+    let mut control_guard = WIFI_CONTROL.get().lock().await;
+    let Some(control) = control_guard.as_mut() else {
+        print!("WiFi hardware is not ready yet\r\n");
+        return;
+    };
+    let stack = STACK.get().lock().await.as_ref().copied();
+
+    // Reset the DHCP state *before* joining, not after. cyw43's `Control`
+    // only ever reports the link as "up" (a successful join always marks it
+    // so, even when it already was), never "down" - so embassy-net's own
+    // link-transition DHCP reset in its poll loop never fires for us, and
+    // the only reliable wake that follows a config reset is the one a
+    // successful join always raises (`set_link_state` wakes the net task
+    // unconditionally). Resetting first means that wake - the same
+    // mechanism the proven boot-time connect in `setup_wifi` relies on -
+    // is the one that picks up a DHCP client already armed to retry
+    // immediately, instead of racing a reset issued after the join's wake
+    // has already been spent. Deliberately no explicit `control.leave()`
+    // beforehand either: `join_wifi` (shared with boot) sets a new SSID
+    // directly, which re-associates on its own exactly like the boot path
+    // already does, so the live-switch path re-drives the identical
+    // join/DHCP sequence instead of adding an untested disassociate step.
+    if let Some(stack) = stack {
+        stack.set_config_v4(embassy_net::ConfigV4::Dhcp(Default::default()));
+    }
+    if !join_wifi(control, &ssid, &password).await {
+        print!("Failed to switch to '{name}'; keeping the previously active network\r\n");
+        return;
+    }
+
+    let mut config = CONFIG.get().lock().await;
+    if let Err(err) = config.store(wifi_config::ACTIVE_KEY, active_value).await {
+        print!("joined '{name}' but failed to save it as active: {err:?}\r\n");
+    }
+    drop(config);
+
+    if let Some(stack) = stack {
+        // `time_sync` (spawned once, at boot) keeps running and will pick up
+        // the new network on its own; it just won't announce the sync it
+        // gets from it, since it only ever prints once per boot. Re-arm that
+        // announcement so switching networks live still confirms a working
+        // clock, the same way booting does.
+        crate::time::request_time_announcement();
+        wait_for_network_up(stack).await;
+    }
+}
+
+pub async fn wifi_command(command: &str) {
+    let tokens = wifi_config::tokenize_command(command);
+    let args: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["wifi", "save", name, ssid, rest @ ..] => {
+            save_wifi_network(name, ssid, &rest.join(" ")).await;
+        }
+        ["wifi", "save", ..] => {
+            print!("Usage: wifi save <name> <ssid> [password]\r\n");
+        }
+        ["wifi", "forget", name] => {
+            forget_wifi_network(name).await;
+        }
+        ["wifi", "forget", ..] => {
+            print!("Usage: wifi forget <name>\r\n");
+        }
+        ["wifi", "list"] => {
+            list_wifi_networks().await;
+        }
+        ["wifi", "use", name] => {
+            use_wifi_network(name).await;
+        }
+        ["wifi", "use", ..] => {
+            print!("Usage: wifi use <name>\r\n");
+        }
+        _ => {
+            print!("Usage: wifi save <name> <ssid> [password]\r\n");
+            print!("       wifi list\r\n");
+            print!("       wifi use <name>\r\n");
+            print!("       wifi forget <name>\r\n");
+        }
+    }
 }
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
